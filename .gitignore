@@ -61,3 +61,6 @@ test/sqlite-load-output/
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+.codex/*
+.agents/*
