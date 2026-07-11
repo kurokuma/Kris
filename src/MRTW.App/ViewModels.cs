@@ -140,6 +140,14 @@ public sealed class MainViewModel : INotifyPropertyChanged
         }
     }
 
+    public string CollectionQualityStatus => CurrentCase.Quality?.OverallStatus ?? "not recorded";
+
+    public string CollectionQualitySummary => CurrentCase.Quality is null
+        ? "Collector health metadata is not available for this case."
+        : string.Join(" | ", CurrentCase.Quality.Collectors.Select(c =>
+            $"{c.Collector}: {c.Status} ({c.EventsReceived} events, {c.EventsDropped} dropped)")) +
+          $" | Network: {CurrentCase.Quality.NetworkContainment}";
+
     public ExportSettings ExportSettings
     {
         get => _exportSettings;
@@ -463,6 +471,8 @@ public sealed class MainViewModel : INotifyPropertyChanged
         _runClock.Stop();
         UpdateRunDuration();
         OnPropertyChanged(nameof(AnalysisSummary));
+        OnPropertyChanged(nameof(CollectionQualityStatus));
+        OnPropertyChanged(nameof(CollectionQualitySummary));
     }
 
     public void MarkStopping()

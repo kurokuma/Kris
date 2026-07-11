@@ -23,13 +23,20 @@ public sealed class RuntimeCaseCollector
 
     public CaseData Collect(ExecutionProfile profile, StaticAnalysisResult? staticAnalysis, CancellationToken cancellationToken, Action<TimelineEvent>? onEvent)
     {
-        string caseId = "case-" + Guid.NewGuid().ToString("N");
-        var started = DateTimeOffset.Now;
+        return Collect(profile, staticAnalysis, cancellationToken, onEvent, null);
+    }
+
+    public CaseData Collect(ExecutionProfile profile, StaticAnalysisResult? staticAnalysis, CancellationToken cancellationToken, Action<TimelineEvent>? onEvent, CollectionRunContext? runContext)
+    {
+        runContext ??= CollectionRunContext.Create();
+        string caseId = runContext.CaseId;
+        var started = runContext.StartedAtUtc;
         var events = new List<TimelineEvent>();
         var processes = new List<ProcessNode>();
         var networks = new List<NetworkSession>();
         int nextId = 1;
         HookPipeServer? hookPipe = null;
+        int callbackFailures = 0;
 
         SnapshotData before = profile.SnapshotBefore ? _snapshot.Capture(profile) : EmptySnapshot();
         var seenTcpConnections = before.TcpConnections.ToHashSet(StringComparer.OrdinalIgnoreCase);
@@ -43,7 +50,14 @@ public sealed class RuntimeCaseCollector
         void Add(TimelineEvent timelineEvent)
         {
             events.Add(timelineEvent);
-            onEvent?.Invoke(timelineEvent);
+            try
+            {
+                onEvent?.Invoke(timelineEvent);
+            }
+            catch
+            {
+                callbackFailures++;
+            }
         }
 
         void AddMany(IEnumerable<TimelineEvent> timelineEvents)
@@ -298,6 +312,14 @@ public sealed class RuntimeCaseCollector
                 process?.Dispose();
                 if (hookPipe is not null)
                 {
+                    AddMany(hookPipe.DrainEvents(started, ref nextId));
+                    long transportFailures = hookPipe.ParseFailures + hookPipe.ConnectionFailures;
+                    Add(Event(nextId++, DateTimeOffset.UtcNow - started, "hook", pid ?? 0, EventCategory.Api,
+                        "Hook Transport Summary",
+                        $"received={hookPipe.ReceivedLines};parse_failures={hookPipe.ParseFailures};connection_failures={hookPipe.ConnectionFailures}",
+                        transportFailures == 0 ? "Hook pipe transport completed without observed loss." : "Hook pipe transport reported failures; the case may be incomplete.",
+                        transportFailures == 0 ? EventSeverity.Informational : EventSeverity.High,
+                        "Hook"));
                     hookPipe.DisposeAsync().AsTask().GetAwaiter().GetResult();
                 }
             }
@@ -311,6 +333,11 @@ public sealed class RuntimeCaseCollector
         SnapshotDiff diff = _snapshot.Diff(before, after);
         AddSnapshotEvents(Add, diff, started, ref nextId);
         AddNetworkEvents(Add, networks, diff, seenTcpConnections, started, ref nextId);
+        if (callbackFailures > 0)
+        {
+            events.Add(Event(nextId++, DateTimeOffset.UtcNow - started, "collector", 0, EventCategory.Api,
+                "Live Callback Failures", callbackFailures.ToString(), "One or more live UI callbacks failed; persisted collection continued.", EventSeverity.Medium, "Runtime"));
+        }
 
         processes.AddRange(BuildProcessNodes(caseId, events, profile, pid ?? 0, processStarted ?? started, processExited));
         events = AttachProcessGuids(events, processes, caseId, started);
@@ -954,7 +981,8 @@ public sealed class RuntimeCaseCollector
             source
         }, JsonDefaults.Options);
 
-        return new TimelineEvent(id, time < TimeSpan.Zero ? TimeSpan.Zero : time, process, pid, category, action, obj, summary, severity, source, raw);
+        var normalizedTime = time < TimeSpan.Zero ? TimeSpan.Zero : time;
+        return new TimelineEvent(id, normalizedTime, process, pid, category, action, obj, summary, severity, source, raw, CapturedAtUtc: DateTimeOffset.UtcNow);
     }
 
     private static SnapshotData EmptySnapshot() => new(DateTimeOffset.UtcNow, Array.Empty<FileSnapshotEntry>(), Array.Empty<RegistrySnapshotEntry>(), Array.Empty<string>());

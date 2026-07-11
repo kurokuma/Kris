@@ -96,7 +96,7 @@ public sealed class CaseService
 
     private static CaseData LoadSqlite(string sqlitePath)
     {
-        using var connection = new SqliteConnection($"Data Source={sqlitePath};Mode=ReadOnly");
+        using var connection = new SqliteConnection($"Data Source={sqlitePath};Mode=ReadOnly;Pooling=False");
         connection.Open();
 
         using var caseCommand = connection.CreateCommand();
@@ -122,6 +122,7 @@ public sealed class CaseService
         var artifacts = ReadArtifacts(connection).ToArray();
         var network = ReadNetworkSessions(connection).ToArray();
         var staticAnalysis = ReadStaticAnalysis(connection);
+        var quality = ReadQuality(connection);
 
         return new CaseData(
             caseId,
@@ -136,7 +137,27 @@ public sealed class CaseService
             events,
             artifacts,
             network,
-            analystNotes);
+            analystNotes,
+            quality);
+    }
+
+    private static CaseQuality? ReadQuality(SqliteConnection connection)
+    {
+        if (!HasTable(connection, "case_quality"))
+        {
+            return null;
+        }
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT json FROM case_quality LIMIT 1";
+        object? value = command.ExecuteScalar();
+        try
+        {
+            return value is string json ? JsonSerializer.Deserialize<CaseQuality>(json, JsonDefaults.Options) : null;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private static StaticAnalysisResult? ReadStaticAnalysis(SqliteConnection connection)
@@ -190,8 +211,11 @@ public sealed class CaseService
     private static IEnumerable<TimelineEvent> ReadEvents(SqliteConnection connection, string caseId, DateTimeOffset startedAt, IReadOnlyList<ProcessNode> processes)
     {
         bool hasProcessGuid = HasColumn(connection, "events", "process_guid");
+        bool hasCapturedAtUtc = HasColumn(connection, "events", "captured_at_utc");
         using var command = connection.CreateCommand();
-        command.CommandText = hasProcessGuid
+        command.CommandText = hasProcessGuid && hasCapturedAtUtc
+            ? "SELECT id, time, process, pid, process_guid, category, action, object_value, summary, technique_id, technique_name, confidence, severity, source, raw_json, captured_at_utc FROM events ORDER BY id"
+            : hasProcessGuid
             ? "SELECT id, time, process, pid, process_guid, category, action, object_value, summary, technique_id, technique_name, confidence, severity, source, raw_json FROM events ORDER BY id"
             : "SELECT id, time, process, pid, category, action, object_value, summary, technique_id, technique_name, confidence, severity, source, raw_json FROM events ORDER BY id";
         using var reader = command.ExecuteReader();
@@ -218,7 +242,8 @@ public sealed class CaseService
                 reader.IsDBNull(8 + shift) ? string.Empty : reader.GetString(8 + shift),
                 reader.IsDBNull(9 + shift) ? string.Empty : reader.GetString(9 + shift),
                 reader.IsDBNull(10 + shift) ? string.Empty : reader.GetString(10 + shift),
-                processGuid);
+                processGuid,
+                hasCapturedAtUtc && !reader.IsDBNull(15) && DateTimeOffset.TryParse(reader.GetString(15), out var captured) ? captured : startedAt.Add(time));
         }
     }
 

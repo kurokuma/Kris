@@ -57,7 +57,24 @@ public sealed record TimelineEvent(
     string TechniqueId = "",
     string TechniqueName = "",
     string Confidence = "",
-    string ProcessGuid = "");
+    string ProcessGuid = "",
+    DateTimeOffset? CapturedAtUtc = null);
+
+public sealed record CollectorHealth(
+    string Collector,
+    string Status,
+    DateTimeOffset StartedAtUtc,
+    DateTimeOffset EndedAtUtc,
+    long EventsReceived,
+    long EventsDropped,
+    string Message = "");
+
+public sealed record CaseQuality(
+    string OverallStatus,
+    IReadOnlyList<CollectorHealth> Collectors,
+    string NetworkContainment,
+    bool ProcessTreeFollowed,
+    string ClockSource = "UTC+Stopwatch");
 
 public sealed record ArtifactItem(
     string Type,
@@ -120,7 +137,8 @@ public sealed record CaseData(
     IReadOnlyList<TimelineEvent> Events,
     IReadOnlyList<ArtifactItem> Artifacts,
     IReadOnlyList<NetworkSession> NetworkSessions,
-    string AnalystNotes)
+    string AnalystNotes,
+    CaseQuality? Quality = null)
 {
     [JsonIgnore]
     public int HighCount => Events.Count(e => e.Severity is EventSeverity.Critical or EventSeverity.High);
@@ -203,3 +221,8 @@ public sealed record ExecutionProfile(
     bool KillTree = true,
     string TimeoutAction = "kill",
     bool ExecuteTarget = true);
+
+public sealed record CollectionRunContext(string CaseId, DateTimeOffset StartedAtUtc)
+{
+    public static CollectionRunContext Create() => new("case-" + Guid.NewGuid().ToString("N"), DateTimeOffset.UtcNow);
+}

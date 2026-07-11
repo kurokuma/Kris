@@ -89,42 +89,18 @@ public partial class MainWindow : Window
             var profile = _viewModel.PrepareRun();
             _viewModel.BeginLiveRun(profile);
             _runCancellation = new CancellationTokenSource();
-            Task<EtwCollectionResult>? etwTask = null;
-            bool etwStarted = false;
             _runTimer.Start();
-            _runTask = Task.Run(() => new RuntimeCaseCollector().Collect(
+            _runTask = Task.Run(() => new AnalysisOrchestrator().Collect(
                 profile,
                 _viewModel.StaticAnalysis,
                 _runCancellation.Token,
                 timelineEvent => Dispatcher.Invoke(() =>
                 {
                     _viewModel.AppendLiveEvent(timelineEvent);
-                    if (profile.EnableEtw && !etwStarted && timelineEvent.Pid > 0)
-                    {
-                        etwStarted = true;
-                        int targetPid = timelineEvent.Pid;
-                        TimeSpan? etwDuration = profile.DurationSeconds is int seconds ? TimeSpan.FromSeconds(Math.Max(1, seconds)) : null;
-                        etwTask = Task.Run(() => new TraceEventEtwCollector().Collect(
-                            new EtwCollectorOptions(targetPid, etwDuration),
-                            _runCancellation.Token,
-                            etwEvent => Dispatcher.BeginInvoke(() =>
-                            {
-                                _viewModel.AppendLiveEvent(etwEvent);
-                                ScrollTimelineToEnd();
-                            }),
-                            session => Dispatcher.BeginInvoke(() => _viewModel.AppendLiveNetworkSession(session))));
-                    }
                     ScrollTimelineToEnd();
-                })));
+                }),
+                session => Dispatcher.BeginInvoke(() => _viewModel.AppendLiveNetworkSession(session))));
             var data = await (Task<CaseData>)_runTask;
-            if (etwTask is not null)
-            {
-                var etw = await etwTask;
-                if (etw.Events.Count > 0 || etw.NetworkSessions.Count > 0)
-                {
-                    data = MergeEtw(data, etw);
-                }
-            }
             _runTimer.Stop();
             _viewModel.CompleteRun(data, _runCancellation.IsCancellationRequested);
             ScrollTimelineToEnd();
@@ -242,44 +218,4 @@ public partial class MainWindow : Window
         }, DispatcherPriority.Background);
     }
 
-    private static CaseData MergeEtw(CaseData data, EtwCollectionResult etw)
-    {
-        var processGuids = data.Processes
-            .GroupBy(p => ProcessLookupKey(p.Pid, p.Name))
-            .ToDictionary(g => g.Key, g => g.First().ProcessGuid, StringComparer.OrdinalIgnoreCase);
-        var uniqueProcessGuids = data.Processes
-            .Where(p => p.Pid > 0)
-            .GroupBy(p => p.Pid)
-            .Where(g => g.Count() == 1)
-            .ToDictionary(g => g.Key, g => g.First().ProcessGuid);
-        var events = data.Events
-            .Concat(etw.Events)
-            .OrderBy(e => e.Time)
-            .Select((e, index) => e with
-            {
-                Id = index + 1,
-                ProcessGuid = string.IsNullOrWhiteSpace(e.ProcessGuid) && processGuids.TryGetValue(ProcessLookupKey(e.Pid, e.Process), out string? processGuid)
-                    ? processGuid
-                    : string.IsNullOrWhiteSpace(e.ProcessGuid)
-                        ? e.Pid > 0 && uniqueProcessGuids.TryGetValue(e.Pid, out processGuid)
-                            ? processGuid
-                            : StableProcessGuid(data.CaseId, e.Pid, data.StartedAt.Add(e.Time))
-                        : e.ProcessGuid
-            })
-            .ToArray();
-
-        var network = data.NetworkSessions.Concat(etw.NetworkSessions).ToArray();
-        return data with
-        {
-            Events = events,
-            NetworkSessions = network,
-            AnalystNotes = data.AnalystNotes + (etw.Started ? " ETW process, image-load, TCP, and DNS telemetry was merged into the timeline." : $" ETW collection was unavailable: {etw.ErrorMessage}")
-        };
-    }
-
-    private static string StableProcessGuid(string caseId, int pid, DateTimeOffset start) =>
-        $"{caseId}:{pid}:{start.UtcTicks}";
-
-    private static string ProcessLookupKey(int pid, string process) =>
-        $"{pid}:{process}";
 }

@@ -6,4 +6,6 @@ public sealed record EtwCollectorOptions(
     bool ProcessEvents = true,
     bool NetworkEvents = true,
     bool DnsEvents = true,
-    bool ImageLoadEvents = true);
+    bool ImageLoadEvents = true,
+    bool FollowDescendants = true,
+    DateTimeOffset? CaseStartedAtUtc = null);

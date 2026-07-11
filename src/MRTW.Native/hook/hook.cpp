@@ -5,6 +5,7 @@
 #include <windows.h>
 
 #include <memory>
+#include <sstream>
 #include <string>
 
 namespace
@@ -93,29 +94,53 @@ namespace mrtw
         extern bool install_environment_hooks();
         extern bool install_evasion_extra_hooks();
 
-        install_file_hooks();
-        install_registry_hooks();
-        install_process_hooks();
-        install_network_hooks();
-        install_credential_hooks();
-        install_anti_analysis_hooks();
-        install_module_hooks();
-        install_discovery_hooks();
-        install_token_hooks();
-        install_impact_hooks();
-        install_stealer_hooks();
-        install_tamper_hooks();
-        install_ipc_hooks();
-        install_com_wmi_hooks();
-        install_service_system_hooks();
-        install_environment_hooks();
-        install_evasion_extra_hooks();
+        int adapters_total = 0;
+        int adapters_healthy = 0;
+        auto install = [&](const char* name, bool (*installer)())
+        {
+            ++adapters_total;
+            bool installed = installer();
+            if (installed)
+            {
+                ++adapters_healthy;
+            }
+            std::ostringstream status;
+            status << R"({"source":"hook","category":"Api","action":"Hook Adapter Status","adapter":")"
+                   << name << R"(","status":")" << (installed ? "healthy" : "failed") << R"("})";
+            g_pipe.write_jsonl(status.str());
+        };
+
+        install("file", install_file_hooks);
+        install("registry", install_registry_hooks);
+        install("process", install_process_hooks);
+        install("network", install_network_hooks);
+        install("credential", install_credential_hooks);
+        install("anti_analysis", install_anti_analysis_hooks);
+        install("module", install_module_hooks);
+        install("discovery", install_discovery_hooks);
+        install("token", install_token_hooks);
+        install("impact", install_impact_hooks);
+        install("stealer", install_stealer_hooks);
+        install("tamper", install_tamper_hooks);
+        install("ipc", install_ipc_hooks);
+        install("com_wmi", install_com_wmi_hooks);
+        install("service_system", install_service_system_hooks);
+        install("environment", install_environment_hooks);
+        install("evasion_extra", install_evasion_extra_hooks);
 
         if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK)
         {
             g_pipe.write_jsonl(R"({"source":"hook","event":"enable_hooks_failed"})");
             return false;
         }
+
+        std::ostringstream summary;
+        summary << R"({"source":"hook","category":"Api","action":"Hook Install Summary","status":")"
+                << (adapters_healthy == adapters_total ? "healthy" : "degraded")
+                << R"(","adapters_total":)" << adapters_total
+                << R"(,"adapters_healthy":)" << adapters_healthy
+                << R"(,"adapters_failed":)" << (adapters_total - adapters_healthy) << "}";
+        g_pipe.write_jsonl(summary.str());
 
         g_initialized = true;
         g_pipe.write_jsonl(R"({"source":"hook","event":"initialized"})");

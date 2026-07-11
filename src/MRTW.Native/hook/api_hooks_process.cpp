@@ -99,15 +99,22 @@ namespace
         }
 
         mrtw::HookGuard guard;
-        BOOL result = real_CreateProcessW(application, command_line, process_attributes, thread_attributes, inherit_handles, creation_flags, environment, current_directory, startup, process_information);
+        bool caller_requested_suspended = (creation_flags & CREATE_SUSPENDED) != 0;
+        DWORD effective_flags = creation_flags | CREATE_SUSPENDED;
+        BOOL result = real_CreateProcessW(application, command_line, process_attributes, thread_attributes, inherit_handles, effective_flags, environment, current_directory, startup, process_information);
         DWORD child_pid = result && process_information != nullptr ? process_information->dwProcessId : 0;
         bool injected = result && process_information != nullptr && inject_hook_into_child(process_information->hProcess);
+        if (result && process_information != nullptr && !caller_requested_suspended)
+        {
+            (real_ResumeThread != nullptr ? real_ResumeThread : ResumeThread)(process_information->hThread);
+        }
         std::ostringstream json;
         json << R"({"source":"hook","category":"Process","action":"CreateProcessW","pid":)" << mrtw::current_pid()
              << R"(,"application":)" << mrtw::q(mrtw::narrow(application))
              << R"(,"command_line":)" << mrtw::q(mrtw::narrow(command_line))
              << R"(,"current_directory":)" << mrtw::q(mrtw::narrow(current_directory))
              << R"(,"creation_flags":)" << creation_flags
+             << R"(,"mrtw_forced_suspended":)" << (!caller_requested_suspended ? "true" : "false")
              << R"(,"child_pid":)" << child_pid
              << R"(,"hook_injected":)" << (injected ? "true" : "false")
              << R"(,"result":)" << (result ? "true" : "false")
@@ -129,15 +136,22 @@ namespace
         }
 
         mrtw::HookGuard guard;
-        BOOL result = real_CreateProcessA(application, command_line, process_attributes, thread_attributes, inherit_handles, creation_flags, environment, current_directory, startup, process_information);
+        bool caller_requested_suspended = (creation_flags & CREATE_SUSPENDED) != 0;
+        DWORD effective_flags = creation_flags | CREATE_SUSPENDED;
+        BOOL result = real_CreateProcessA(application, command_line, process_attributes, thread_attributes, inherit_handles, effective_flags, environment, current_directory, startup, process_information);
         DWORD child_pid = result && process_information != nullptr ? process_information->dwProcessId : 0;
         bool injected = result && process_information != nullptr && inject_hook_into_child(process_information->hProcess);
+        if (result && process_information != nullptr && !caller_requested_suspended)
+        {
+            (real_ResumeThread != nullptr ? real_ResumeThread : ResumeThread)(process_information->hThread);
+        }
         std::ostringstream json;
         json << R"({"source":"hook","category":"Process","action":"CreateProcessA","pid":)" << mrtw::current_pid()
              << R"(,"application":)" << mrtw::q(application == nullptr ? std::string{} : std::string(application))
              << R"(,"command_line":)" << mrtw::q(command_line == nullptr ? std::string{} : std::string(command_line))
              << R"(,"current_directory":)" << mrtw::q(current_directory == nullptr ? std::string{} : std::string(current_directory))
              << R"(,"creation_flags":)" << creation_flags
+             << R"(,"mrtw_forced_suspended":)" << (!caller_requested_suspended ? "true" : "false")
              << R"(,"child_pid":)" << child_pid
              << R"(,"hook_injected":)" << (injected ? "true" : "false")
              << R"(,"result":)" << (result ? "true" : "false")

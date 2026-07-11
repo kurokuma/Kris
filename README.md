@@ -18,11 +18,15 @@ MRTW は Windows の EXE/DLL を静的・動的に観測し、プロセス、API
 ### 動的解析
 
 - 対象プロセスの起動、終了、タイムアウト、プロセスツリー制御
-- ETW（TraceEvent）によるプロセス・ネットワークイベント収集
+- GUI/CLI共通の収集オーケストレーター
+- ETW（TraceEvent）による対象プロセスと子孫プロセスのProcess・ImageLoad・TCP・DNSイベント収集
 - 実行前後のファイル、レジストリ、TCP接続スナップショット差分
 - x64 Native Hookによるファイル、レジストリ、プロセス、ネットワーク、認証情報、回避・探索系APIなどの観測
 - Named Pipe経由のHookイベント取り込み
-- 収集イベントの正規化、Process GUID付与、重要度分類、Behavior相関
+- Hookアダプタ単位の初期化結果、Pipe受信数、Parse/接続失敗の自己診断
+- UTC取得時刻による収集イベントの正規化、Process GUID付与、重要度分類、Behavior相関
+- Runtime / Hook / ETWごとの収集状態、イベント数、欠落数、エラーを含むCollection Quality
+- Windows Firewallによる `observe` / `block` / `isolated` ネットワークモード
 - EXE、DLL（既定では `rundll32`）、任意コマンドラインの実行
 - `--execute off` による非実行分析
 
@@ -38,6 +42,9 @@ Native Hookバイナリが存在しない場合、対応外の対象の場合、
 - Behaviorイベントと根拠イベントの関連表示
 - `case.json` / `case.sqlite` の読み込みと最近のケース一覧
 - HTML / CSV / JSON / JSONL / SQLite / ZIPエクスポート、Privacy Mode
+- GUI、HTMLレポート、JSON、SQLiteでのCollection Quality表示・保存
+
+GUIとCLIは同じ `AnalysisOrchestrator` を使用します。CLIの `--etw on` も通常のケース収集へ統合され、GUIだけにETWイベントが存在する差異はありません。
 
 ## 必要環境
 
@@ -152,6 +159,7 @@ dotnet run --project src\MRTW.Cli -- run `
 | `--execute on\|off` | 対象を実行するかどうか |
 | `--etw on\|off` / `--hook on\|off` | 収集方式の切り替え |
 | `--snapshot-before on\|off` / `--snapshot-after on\|off` | スナップショット取得 |
+| `--network observe\|block\|isolated` | 通信監視、対象ホスト送信遮断、または解析中のマシン全体の送受信遮断 |
 | `--timeout-action kill\|stop` | タイムアウト時の処理 |
 | `--kill-tree` | 終了時にプロセスツリーを対象にする |
 | `--format <list>` | `html,csv,json,jsonl,sqlite,zip` または `all` |
@@ -163,6 +171,14 @@ dotnet run --project src\MRTW.Cli -- run `
 | `--overwrite` / `--auto-suffix` | 出力先衝突時の挙動 |
 | `--config <path>` | 設定ファイルを指定 |
 | `--log-format json` | CLIログをJSONで出力 |
+
+ネットワークモード:
+
+- `observe`: 通信を変更せず観測します。既定値です。
+- `block`: EXEでは対象EXE、DLLでは `rundll32.exe`、任意コマンドでは `cmd.exe` の送信を一時的なWindows Firewallルールで遮断します。
+- `isolated`: 解析中にマシン全体の送受信を一時的なWindows Firewallルールで遮断します。専用VMで使用してください。
+
+`block` と `isolated` は管理者権限を必要とします。ルールを作成できない場合は、通信可能な状態で処理を続行せず、検体の実行を拒否します。通常終了、タイムアウト、ユーザー停止、例外のいずれでも一時ルールの削除を試みます。
 
 ### ケース操作と診断
 
@@ -250,6 +266,17 @@ verbose: false
 
 詳細は [`test/README.md`](test/README.md) を参照してください。
 
+### P0回帰テスト
+
+外部テストフレームワークに依存しない回帰テストを実行できます。
+
+```powershell
+$env:DOTNET_CLI_HOME = "$PWD\.dotnet-home"
+dotnet run --project test\MRTW.RegressionTests -c Release
+```
+
+現在のテストはネットワークモードのfail-closed設定、共通オーケストレーターの品質情報、UTC取得時刻、SQLiteの往復、Behavior相関の決定性を検証します。
+
 ## リポジトリ構成
 
 ```text
@@ -275,7 +302,8 @@ test/                   安全な検証用プロジェクトとテスト資産
 
 - Windows専用です。
 - Native Hook/Injectorはx64のみです。
-- カーネルドライバー、完全なOS隔離、HTTPS復号、メモリダンプ解析、外部IOC照合は実装していません。
+- カーネルドライバー、VMの作成・スナップショット復元、HTTPS復号、メモリダンプ解析、YARA/capa、外部IOC照合は実装していません。
+- `isolated` はWindows Firewallによる解析中のマシン全体の通信遮断です。VMそのものの作成、ホストからの分離、解析後のロールバックは行いません。
 - ETWやHookで得られる範囲は権限、対象アーキテクチャ、プロセス保護、Windowsの構成に依存します。
 - Behavior/Technique分類は調査支援用であり、悪性判定を保証するものではありません。
 - Snapshotは対象の作業ディレクトリ、TEMP、AppDataなどを上限付きで走査するため、完全なファイルシステム差分ではありません。
@@ -284,6 +312,6 @@ test/                   安全な検証用プロジェクトとテスト資産
 
 - 検体は専用VMへコピーし、実行前にスナップショットを取得してください。
 - 共有フォルダー、クリップボード同期、ホストへのドライブ割り当てを無効化してください。
-- ネットワークは遮断するか、INetSim等の管理された疑似環境へ限定してください。
+- ネットワークは `--network isolated` で遮断するか、`observe` を使用する場合はINetSim等の管理された疑似環境へ限定してください。
 - 実行後は生成ケースだけを退避し、VMをスナップショットへ戻してください。
 - エクスポートにはホスト名、ユーザー名、パス、接続先、場合によっては検体が含まれ得ます。外部共有前に確認してください。

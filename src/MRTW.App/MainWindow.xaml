@@ -511,7 +511,10 @@
                                     <TextBlock Text="{Binding FileEventCount}" />
                                     <TextBlock Style="{StaticResource Muted}" Text="Registry events" />
                                     <TextBlock Text="{Binding RegistryEventCount}" />
+                                    <TextBlock Style="{StaticResource Muted}" Text="Collection quality" />
+                                    <TextBlock Text="{Binding CollectionQualityStatus}" Foreground="{StaticResource AccentBlue}" />
                                 </UniformGrid>
+                                <TextBlock Text="{Binding CollectionQualitySummary}" TextWrapping="Wrap" Foreground="{StaticResource TextSecondary}" Margin="0,0,0,8" />
                                 <Separator Background="#26384F" Margin="0,12" />
                                 <TextBlock Text="NOTES" FontWeight="Bold" Margin="0,0,0,5" />
                                 <TextBlock Text="{Binding CurrentCase.AnalystNotes}" TextWrapping="Wrap" Foreground="{StaticResource TextPrimary}" />

@@ -18,6 +18,13 @@ This folder contains benign validation helpers for MRTW.
 - `SyntheticBehaviorCase`: generates a MRTW `case.json` with synthetic events for dangerous behaviors without executing those behaviors.
 - `StaticAnalysisProbe`: a harmless executable that embeds static-analysis markers such as URLs, domains, registry paths, file paths, command strings, and export-like names without executing them.
 - `NativeExportProbe`: a harmless DLL that exports `DllRegisterServer`, `Start`, and `Run` for validating PE export table parsing and rundll32 export selection.
+- `MRTW.RegressionTests`: a dependency-free executable regression suite for P0 orchestration, containment-mode validation, UTC event timestamps, SQLite quality round-trips, and deterministic behavior correlation.
 
 Use `SafeRuntimeProbe` as a real target for hook/ETW smoke tests. Use `SyntheticBehaviorCase` for UI, filtering, and behavior-correlation validation.
 Use `StaticAnalysisProbe` as a stable target for `mrtw static` and string/classification checks. For this .NET sample, point static analysis at `bin\Release\net9.0\StaticAnalysisProbe.dll`; the generated `.exe` is the .NET apphost and mostly contains host/runtime strings.
+
+Run the regression suite with:
+
+```powershell
+dotnet run --project test\MRTW.RegressionTests -c Release
+```

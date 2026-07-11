@@ -33,7 +33,12 @@ public sealed class TraceEventEtwCollector
         var events = new ConcurrentQueue<TimelineEvent>();
         var sessions = new ConcurrentQueue<NetworkSession>();
         var processNames = new ConcurrentDictionary<int, string>();
-        var startedAt = DateTimeOffset.Now;
+        var trackedPids = new ConcurrentDictionary<int, byte>();
+        if (options.TargetPid is int targetPid)
+        {
+            trackedPids[targetPid] = 0;
+        }
+        var startedAt = options.CaseStartedAtUtc ?? DateTimeOffset.UtcNow;
         int nextId = 1;
         string sessionName = "MRTW-" + Guid.NewGuid().ToString("N");
 
@@ -72,7 +77,12 @@ public sealed class TraceEventEtwCollector
 
             session.Source.Kernel.ProcessStart += data =>
             {
-                if (!PidMatches(options.TargetPid, data.ProcessID))
+                bool parentTracked = options.FollowDescendants && trackedPids.ContainsKey(data.ParentID);
+                if (parentTracked)
+                {
+                    trackedPids[data.ProcessID] = 0;
+                }
+                if (!PidMatches(options.TargetPid, trackedPids, data.ProcessID))
                 {
                     return;
                 }
@@ -94,7 +104,7 @@ public sealed class TraceEventEtwCollector
 
             session.Source.Kernel.ProcessStop += data =>
             {
-                if (!PidMatches(options.TargetPid, data.ProcessID))
+                if (!PidMatches(options.TargetPid, trackedPids, data.ProcessID))
                 {
                     return;
                 }
@@ -116,7 +126,7 @@ public sealed class TraceEventEtwCollector
 
             session.Source.Kernel.ImageLoad += data =>
             {
-                if (!PidMatches(options.TargetPid, data.ProcessID))
+                if (!PidMatches(options.TargetPid, trackedPids, data.ProcessID))
                 {
                     return;
                 }
@@ -138,7 +148,7 @@ public sealed class TraceEventEtwCollector
 
             session.Source.Kernel.TcpIpConnect += data =>
             {
-                if (!PidMatches(options.TargetPid, data.ProcessID))
+                if (!PidMatches(options.TargetPid, trackedPids, data.ProcessID))
                 {
                     return;
                 }
@@ -170,7 +180,7 @@ public sealed class TraceEventEtwCollector
                     }
 
                     int pid = data.ProcessID;
-                    if (!PidMatches(options.TargetPid, pid))
+                    if (!PidMatches(options.TargetPid, trackedPids, pid))
                     {
                         return;
                     }
@@ -203,7 +213,8 @@ public sealed class TraceEventEtwCollector
         }
     }
 
-    private static bool PidMatches(int? targetPid, int observedPid) => !targetPid.HasValue || targetPid.Value == observedPid;
+    private static bool PidMatches(int? targetPid, ConcurrentDictionary<int, byte> trackedPids, int observedPid) =>
+        !targetPid.HasValue || trackedPids.ContainsKey(observedPid);
 
     private static void EnqueueEvent(ConcurrentQueue<TimelineEvent> events, Action<TimelineEvent>? onEvent, TimelineEvent timelineEvent)
     {
@@ -309,6 +320,6 @@ public sealed class TraceEventEtwCollector
             rawJson = JsonSerializer.Serialize(new { source, category = category.ToString(), action, obj, summary }, JsonDefaults.Options);
         }
 
-        return new TimelineEvent(id, time < TimeSpan.Zero ? TimeSpan.Zero : time, process, pid, category, action, obj, summary, severity, source, rawJson);
+        return new TimelineEvent(id, time < TimeSpan.Zero ? TimeSpan.Zero : time, process, pid, category, action, obj, summary, severity, source, rawJson, CapturedAtUtc: DateTimeOffset.UtcNow);
     }
 }

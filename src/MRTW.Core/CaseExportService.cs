@@ -123,10 +123,10 @@ public sealed class CaseExportService
 
     private static string ToCsv(IEnumerable<TimelineEvent> events)
     {
-        var sb = new StringBuilder("time,process,process_guid,category,action,object,summary,technique_id,technique_name,confidence,severity,source\r\n");
+        var sb = new StringBuilder("time,captured_at_utc,process,process_guid,category,action,object,summary,technique_id,technique_name,confidence,severity,source\r\n");
         foreach (var e in events)
         {
-            sb.AppendLine(string.Join(',', Csv(e.Time.ToString(@"hh\:mm\:ss\.fff")), Csv(e.Process), Csv(e.ProcessGuid), e.Category, Csv(e.Action), Csv(e.ObjectValue), Csv(e.Summary), Csv(e.TechniqueId), Csv(e.TechniqueName), Csv(e.Confidence), e.Severity, e.Source));
+            sb.AppendLine(string.Join(',', Csv(e.Time.ToString(@"hh\:mm\:ss\.fff")), Csv(e.CapturedAtUtc?.ToString("O")), Csv(e.Process), Csv(e.ProcessGuid), e.Category, Csv(e.Action), Csv(e.ObjectValue), Csv(e.Summary), Csv(e.TechniqueId), Csv(e.TechniqueName), Csv(e.Confidence), e.Severity, e.Source));
         }
         return sb.ToString();
     }
@@ -173,6 +173,8 @@ public sealed class CaseExportService
             $"<tr><td>{e.Time:hh\\:mm\\:ss\\.fff}</td><td>{H(e.Process)}</td><td>{e.Category}</td><td>{H(e.Action)}</td><td>{H(e.ObjectValue)}</td><td>{H(e.Summary)}</td><td>{H(e.TechniqueId)}</td><td class='{e.Severity.ToString().ToLowerInvariant()}'>{e.Severity}</td></tr>"));
         string artifactRows = string.Join(Environment.NewLine, data.Artifacts.Select(a =>
             $"<tr><td>{H(a.Type)}</td><td>{H(a.Value)}</td><td>{a.EventCount}</td><td>{a.Severity}</td></tr>"));
+        string qualityRows = string.Join(Environment.NewLine, (data.Quality?.Collectors ?? [])
+            .Select(c => $"<tr><td>{H(c.Collector)}</td><td>{H(c.Status)}</td><td>{c.EventsReceived}</td><td>{c.EventsDropped}</td><td>{H(c.Message)}</td></tr>"));
 
         return $$"""
 <!doctype html>
@@ -205,6 +207,9 @@ th,td{padding:9px 10px;border-bottom:1px solid #1f3044;text-align:left}th{backgr
 <table><thead><tr><th>Time</th><th>Process</th><th>Category</th><th>Action</th><th>Object</th><th>Summary</th><th>Technique</th><th>Severity</th></tr></thead><tbody>{{rows}}</tbody></table>
 <h2>Artifacts</h2>
 <table><thead><tr><th>Type</th><th>Value</th><th>Count</th><th>Severity</th></tr></thead><tbody>{{artifactRows}}</tbody></table>
+<h2>Collection Quality</h2>
+<p>Overall: {{H(data.Quality?.OverallStatus ?? "not recorded")}} | Network: {{H(data.Quality?.NetworkContainment ?? "not recorded")}}</p>
+<table><thead><tr><th>Collector</th><th>Status</th><th>Events</th><th>Dropped</th><th>Message</th></tr></thead><tbody>{{qualityRows}}</tbody></table>
 <h2>Analyst Notes</h2><p>{{H(data.AnalystNotes)}}</p>
 </main>
 </body>
@@ -228,9 +233,10 @@ th,td{padding:9px 10px;border-bottom:1px solid #1f3044;text-align:left}th{backgr
 CREATE TABLE cases(case_id TEXT PRIMARY KEY, case_name TEXT, sample_name TEXT, sample_path TEXT, sha256 TEXT, started_at TEXT, duration_seconds REAL, analyst_notes TEXT);
 CREATE TABLE static_analysis(json TEXT);
 CREATE TABLE processes(pid INTEGER, parent_pid INTEGER, name TEXT, process_guid TEXT, command_line TEXT, image_path TEXT, start_time TEXT, end_time TEXT, event_count INTEGER, network_count INTEGER, file_count INTEGER, registry_count INTEGER);
-CREATE TABLE events(id INTEGER PRIMARY KEY, time TEXT, process TEXT, pid INTEGER, process_guid TEXT, category TEXT, action TEXT, object_value TEXT, summary TEXT, technique_id TEXT, technique_name TEXT, confidence TEXT, severity TEXT, source TEXT, raw_json TEXT);
+CREATE TABLE events(id INTEGER PRIMARY KEY, time TEXT, captured_at_utc TEXT, process TEXT, pid INTEGER, process_guid TEXT, category TEXT, action TEXT, object_value TEXT, summary TEXT, technique_id TEXT, technique_name TEXT, confidence TEXT, severity TEXT, source TEXT, raw_json TEXT);
 CREATE TABLE artifacts(type TEXT, value TEXT, first_seen TEXT, last_seen TEXT, event_count INTEGER, related_processes TEXT, severity TEXT);
 CREATE TABLE network_sessions(process TEXT, domain TEXT, resolved_ip TEXT, remote_ip TEXT, port INTEGER, protocol TEXT, first_seen TEXT, bytes_sent INTEGER, bytes_received INTEGER, user_agent TEXT, sni TEXT);
+CREATE TABLE case_quality(json TEXT);
 CREATE INDEX ix_events_time ON events(time);
 CREATE INDEX ix_events_process ON events(process);
 CREATE INDEX ix_events_category ON events(category);
@@ -252,6 +258,11 @@ CREATE INDEX ix_events_category ON events(category);
                 Execute(connection, transaction,
                     "INSERT INTO static_analysis VALUES($json)",
                     ("$json", JsonSerializer.Serialize(data.StaticAnalysis, JsonDefaults.Options)));
+            }
+            if (data.Quality is not null)
+            {
+                Execute(connection, transaction, "INSERT INTO case_quality VALUES($json)",
+                    ("$json", JsonSerializer.Serialize(data.Quality, JsonDefaults.Options)));
             }
 
             foreach (var p in data.Processes)
@@ -275,9 +286,10 @@ CREATE INDEX ix_events_category ON events(category);
             foreach (var e in data.Events)
             {
                 Execute(connection, transaction,
-                    "INSERT INTO events VALUES($id,$time,$process,$pid,$process_guid,$category,$action,$object_value,$summary,$technique_id,$technique_name,$confidence,$severity,$source,$raw_json)",
+                    "INSERT INTO events VALUES($id,$time,$captured_at_utc,$process,$pid,$process_guid,$category,$action,$object_value,$summary,$technique_id,$technique_name,$confidence,$severity,$source,$raw_json)",
                     ("$id", e.Id),
                     ("$time", e.Time.ToString(@"hh\:mm\:ss\.fff")),
+                    ("$captured_at_utc", e.CapturedAtUtc?.ToString("O")),
                     ("$process", e.Process),
                     ("$pid", e.Pid),
                     ("$process_guid", e.ProcessGuid),
@@ -366,7 +378,7 @@ CREATE INDEX ix_events_category ON events(category);
         var manifest = new
         {
             tool_version = "1.0.0-preview",
-            schema_version = 1,
+            schema_version = 2,
             created_at_utc = DateTimeOffset.UtcNow,
             files
         };

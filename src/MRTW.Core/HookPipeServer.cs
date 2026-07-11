@@ -11,10 +11,17 @@ public sealed class HookPipeServer : IAsyncDisposable
     private readonly CancellationTokenSource _cancellation = new();
     private readonly ConcurrentQueue<string> _rawLines = new();
     private Task? _serverTask;
+    private long _receivedLines;
+    private long _parseFailures;
+    private long _connectionFailures;
 
     public string PipeName { get; } = "mrtw-hook-" + Guid.NewGuid().ToString("N");
 
     public string FullPipeName => @"\\.\pipe\" + PipeName;
+
+    public long ReceivedLines => Interlocked.Read(ref _receivedLines);
+    public long ParseFailures => Interlocked.Read(ref _parseFailures);
+    public long ConnectionFailures => Interlocked.Read(ref _connectionFailures);
 
     public void Start()
     {
@@ -68,6 +75,7 @@ public sealed class HookPipeServer : IAsyncDisposable
                     }
 
                     _rawLines.Enqueue(line);
+                    Interlocked.Increment(ref _receivedLines);
                 }
             }
             catch (OperationCanceledException)
@@ -76,12 +84,13 @@ public sealed class HookPipeServer : IAsyncDisposable
             }
             catch
             {
+                Interlocked.Increment(ref _connectionFailures);
                 await Task.Delay(100, _cancellation.Token).ContinueWith(_ => { });
             }
         }
     }
 
-    private static TimelineEvent ToTimelineEvent(string raw, DateTimeOffset startedAt, int id)
+    private TimelineEvent ToTimelineEvent(string raw, DateTimeOffset startedAt, int id)
     {
         try
         {
@@ -95,12 +104,19 @@ public sealed class HookPipeServer : IAsyncDisposable
             string summary = $"{action} {obj}".Trim();
             EventCategory category = Enum.TryParse<EventCategory>(categoryText, true, out var parsed) ? parsed : EventCategory.Api;
             EventSeverity severity = category is EventCategory.Credential or EventCategory.Registry ? EventSeverity.High : EventSeverity.Medium;
+            string status = GetString(root, "status", string.Empty);
             var technique = MapTechnique(category, action, obj, root);
-            return new TimelineEvent(id, DateTimeOffset.Now - startedAt, process, pid, category, action, obj, summary, severity, "Hook", raw, technique.Id, technique.Name, technique.Confidence);
+            if (action.Contains("failed", StringComparison.OrdinalIgnoreCase) || action.Contains("failure", StringComparison.OrdinalIgnoreCase) ||
+                status is "failed" or "degraded")
+            {
+                severity = EventSeverity.High;
+            }
+            return new TimelineEvent(id, DateTimeOffset.UtcNow - startedAt, process, pid, category, action, obj, summary, severity, "Hook", raw, technique.Id, technique.Name, technique.Confidence, CapturedAtUtc: DateTimeOffset.UtcNow);
         }
         catch
         {
-            return new TimelineEvent(id, DateTimeOffset.Now - startedAt, "hook", 0, EventCategory.Api, "Hook Event", raw, raw, EventSeverity.Low, "Hook", raw);
+            Interlocked.Increment(ref _parseFailures);
+            return new TimelineEvent(id, DateTimeOffset.UtcNow - startedAt, "hook", 0, EventCategory.Api, "Hook Parse Failure", raw, raw, EventSeverity.High, "Hook", raw, CapturedAtUtc: DateTimeOffset.UtcNow);
         }
     }
 

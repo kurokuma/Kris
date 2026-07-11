@@ -1,0 +1,199 @@
+using System.Collections.Concurrent;
+using MRTW.Core;
+
+namespace MRTW.Collectors.Etw;
+
+public sealed class AnalysisOrchestrator
+{
+    private readonly RuntimeCaseCollector _runtime = new();
+
+    public CaseData Collect(
+        ExecutionProfile profile,
+        StaticAnalysisResult? staticAnalysis,
+        CancellationToken cancellationToken = default,
+        Action<TimelineEvent>? onEvent = null,
+        Action<NetworkSession>? onNetworkSession = null)
+    {
+        return CollectAsync(profile, staticAnalysis, cancellationToken, onEvent, onNetworkSession).GetAwaiter().GetResult();
+    }
+
+    public async Task<CaseData> CollectAsync(
+        ExecutionProfile profile,
+        StaticAnalysisResult? staticAnalysis,
+        CancellationToken cancellationToken = default,
+        Action<TimelineEvent>? onEvent = null,
+        Action<NetworkSession>? onNetworkSession = null)
+    {
+        var context = CollectionRunContext.Create();
+        DateTimeOffset orchestrationStarted = DateTimeOffset.UtcNow;
+        using var containment = NetworkContainmentService.Apply(profile);
+        var rootPid = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var liveEventKeys = new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
+
+        void Publish(TimelineEvent item)
+        {
+            liveEventKeys.TryAdd(EventKey(item), 0);
+            onEvent?.Invoke(item);
+            if (item.Pid > 0 && item.Category == EventCategory.Process &&
+                item.Action is "Process Start" or "Process Attached" or "Hooked Process Start")
+            {
+                rootPid.TrySetResult(item.Pid);
+            }
+        }
+
+        Task<CaseData> runtimeTask = Task.Run(
+            () => _runtime.Collect(profile, staticAnalysis, cancellationToken, Publish, context),
+            CancellationToken.None);
+
+        Task completed = await Task.WhenAny(rootPid.Task, runtimeTask).ConfigureAwait(false);
+        Task<EtwCollectionResult>? etwTask = null;
+        using var etwStop = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        DateTimeOffset etwStarted = DateTimeOffset.UtcNow;
+        if (profile.EnableEtw && completed == rootPid.Task && rootPid.Task.IsCompletedSuccessfully)
+        {
+            int pid = await rootPid.Task.ConfigureAwait(false);
+            TimeSpan? duration = profile.DurationSeconds is int seconds ? TimeSpan.FromSeconds(Math.Max(1, seconds)) : null;
+            etwTask = Task.Run(() => new TraceEventEtwCollector().Collect(
+                new EtwCollectorOptions(pid, duration, FollowDescendants: true, CaseStartedAtUtc: context.StartedAtUtc),
+                etwStop.Token,
+                item =>
+                {
+                    if (liveEventKeys.TryAdd(EventKey(item), 0))
+                    {
+                        onEvent?.Invoke(item);
+                    }
+                },
+                onNetworkSession), CancellationToken.None);
+        }
+
+        CaseData data = await runtimeTask.ConfigureAwait(false);
+        etwStop.Cancel();
+        EtwCollectionResult? etw = etwTask is null ? null : await etwTask.ConfigureAwait(false);
+        DateTimeOffset ended = DateTimeOffset.UtcNow;
+        return FinalizeCase(data, etw, profile, containment, orchestrationStarted, etwStarted, ended);
+    }
+
+    private static CaseData FinalizeCase(
+        CaseData data,
+        EtwCollectionResult? etw,
+        ExecutionProfile profile,
+        NetworkContainmentLease containment,
+        DateTimeOffset runtimeStarted,
+        DateTimeOffset etwStarted,
+        DateTimeOffset ended)
+    {
+        var combined = data.Events
+            .Concat(etw?.Events ?? [])
+            .Where(e => e.Category != EventCategory.Behavior)
+            .GroupBy(EventKey, StringComparer.Ordinal)
+            .Select(g => g.First())
+            .OrderBy(e => e.CapturedAtUtc ?? data.StartedAt.Add(e.Time))
+            .ThenBy(e => e.Id)
+            .Select((e, index) => e with
+            {
+                Id = index + 1,
+                Time = (e.CapturedAtUtc ?? data.StartedAt.Add(e.Time)) - data.StartedAt
+            })
+            .ToArray();
+
+        var processes = MergeProcessNodes(data, combined);
+        combined = AttachProcessGuids(combined, processes, data).ToArray();
+        combined = BehaviorCorrelator.Correlate(combined).ToArray();
+        var artifacts = BuildArtifacts(combined, processes, data.StartedAt);
+        var network = data.NetworkSessions
+            .Concat(etw?.NetworkSessions ?? [])
+            .GroupBy(n => $"{n.Process}|{n.RemoteIp}|{n.Port}|{n.FirstSeen.TotalMilliseconds:F0}", StringComparer.OrdinalIgnoreCase)
+            .Select(g => g.First())
+            .ToArray();
+
+        bool hookRequested = profile.EnableHook;
+        bool hookFailed = combined.Any(e => e.Source.Equals("Hook", StringComparison.OrdinalIgnoreCase) &&
+            (e.Action.Contains("failed", StringComparison.OrdinalIgnoreCase) || e.Action.Contains("failure", StringComparison.OrdinalIgnoreCase) ||
+             e.RawJson.Contains("\"status\":\"failed\"", StringComparison.OrdinalIgnoreCase) ||
+             e.RawJson.Contains("\"status\":\"degraded\"", StringComparison.OrdinalIgnoreCase))) ||
+            combined.Any(e => e.Action is "Hook Injection Failed" or "Hook Injection Timeout" or "Hook Unavailable");
+        bool hookObserved = combined.Any(e => e.Source.Equals("Hook", StringComparison.OrdinalIgnoreCase));
+        string hookStatus = !hookRequested ? "disabled" : !profile.ExecuteTarget ? "skipped" : hookFailed ? "degraded" : hookObserved ? "healthy" : "unavailable";
+        string etwStatus = !profile.EnableEtw ? "disabled" : !profile.ExecuteTarget ? "skipped" : etw is null ? "unavailable" : etw.Started && etw.Completed ? "healthy" : "degraded";
+        bool runtimeFailed = combined.Any(e => e.Action is "Execution Failed" or "Live Callback Failures");
+        var collectors = new List<CollectorHealth>
+        {
+            new("Runtime", runtimeFailed ? "degraded" : "healthy", runtimeStarted, ended, data.Events.Count,
+                combined.Where(e => e.Action == "Live Callback Failures").Sum(e => long.TryParse(e.ObjectValue, out long count) ? count : 0),
+                runtimeFailed ? "Runtime execution or live delivery reported a failure." : ""),
+            new("Hook", hookStatus, runtimeStarted, ended, combined.Count(e => e.Source.Equals("Hook", StringComparison.OrdinalIgnoreCase)), combined.Count(e => e.Action == "Hook Parse Failure"),
+                hookFailed ? "One or more hook adapters or injection operations failed." : ""),
+            new("ETW", etwStatus, etwStarted, ended, etw?.Events.Count ?? 0, 0, etw?.ErrorMessage ?? "")
+        };
+        string overall = collectors.Any(c => c.Status == "degraded" || c.Status == "unavailable" && c.Collector != "Hook")
+            ? "degraded"
+            : "healthy";
+
+        return data with
+        {
+            Events = combined,
+            Processes = processes,
+            Artifacts = artifacts,
+            NetworkSessions = network,
+            Duration = ended - data.StartedAt,
+            AnalystNotes = data.AnalystNotes + $" Collection quality: {overall}. Network containment: {containment.Message}",
+            Quality = new CaseQuality(overall, collectors, containment.Message, true)
+        };
+    }
+
+    private static IReadOnlyList<ProcessNode> MergeProcessNodes(CaseData data, IReadOnlyList<TimelineEvent> events)
+    {
+        var nodes = data.Processes.ToDictionary(p => p.Pid, p => p);
+        foreach (var group in events.Where(e => e.Pid > 0).GroupBy(e => e.Pid))
+        {
+            if (nodes.ContainsKey(group.Key))
+            {
+                ProcessNode old = nodes[group.Key];
+                nodes[group.Key] = old with
+                {
+                    EventCount = group.Count(),
+                    NetworkCount = group.Count(e => e.Category == EventCategory.Network),
+                    FileCount = group.Count(e => e.Category == EventCategory.File),
+                    RegistryCount = group.Count(e => e.Category == EventCategory.Registry)
+                };
+                continue;
+            }
+            TimelineEvent first = group.OrderBy(e => e.Time).First();
+            DateTimeOffset start = first.CapturedAtUtc ?? data.StartedAt.Add(first.Time);
+            nodes[group.Key] = new ProcessNode(first.Process, group.Key, null,
+                $"{data.CaseId}:{group.Key}:{start.UtcTicks}", "", "", start, null,
+                group.Count(), group.Count(e => e.Category == EventCategory.Network),
+                group.Count(e => e.Category == EventCategory.File), group.Count(e => e.Category == EventCategory.Registry));
+        }
+        return nodes.Values.OrderBy(p => p.StartTime).ToArray();
+    }
+
+    private static IEnumerable<TimelineEvent> AttachProcessGuids(IEnumerable<TimelineEvent> events, IReadOnlyList<ProcessNode> processes, CaseData data)
+    {
+        var byPid = processes.GroupBy(p => p.Pid).ToDictionary(g => g.Key, g => g.First().ProcessGuid);
+        foreach (TimelineEvent item in events)
+        {
+            yield return string.IsNullOrWhiteSpace(item.ProcessGuid) && byPid.TryGetValue(item.Pid, out string? guid)
+                ? item with { ProcessGuid = guid }
+                : item;
+        }
+    }
+
+    private static IReadOnlyList<ArtifactItem> BuildArtifacts(IReadOnlyList<TimelineEvent> events, IReadOnlyList<ProcessNode> processes, DateTimeOffset started)
+    {
+        return events
+            .Where(e => e.Category is EventCategory.File or EventCategory.Registry or EventCategory.Network or EventCategory.Dns or EventCategory.Api)
+            .GroupBy(e => e.Category)
+            .Select(g => new ArtifactItem(g.Key.ToString(),
+                string.Join(", ", g.Select(e => e.ObjectValue).Where(v => !string.IsNullOrWhiteSpace(v)).Distinct(StringComparer.OrdinalIgnoreCase).Take(12)),
+                started.Add(g.Min(e => e.Time)), started.Add(g.Max(e => e.Time)), g.Count(),
+                string.Join(", ", g.Select(e => e.Process).Distinct(StringComparer.OrdinalIgnoreCase).Take(8)),
+                g.Any(e => e.Severity is EventSeverity.Critical or EventSeverity.High) ? EventSeverity.High :
+                    g.Any(e => e.Severity == EventSeverity.Medium) ? EventSeverity.Medium : EventSeverity.Low))
+            .OrderByDescending(a => a.EventCount)
+            .ToArray();
+    }
+
+    private static string EventKey(TimelineEvent e) =>
+        $"{e.Source}|{e.Pid}|{e.Action}|{e.ObjectValue}|{(e.CapturedAtUtc ?? DateTimeOffset.MinValue).UtcTicks}";
+}
