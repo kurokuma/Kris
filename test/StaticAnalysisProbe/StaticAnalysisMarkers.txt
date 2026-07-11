@@ -1,0 +1,11 @@
+https://analysis-probe.example.test/update
+http://telemetry.analysis-probe.example.test/beacon
+analysis-probe.example.test
+HKCU\Software\MRTW\StaticAnalysisProbe
+HKLM\Software\Microsoft\Windows\CurrentVersion\Run
+C:\Users\Public\Documents\analysis-probe.dat
+C:\ProgramData\MRTW\StaticAnalysisProbe\probe.bin
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File benign-probe.ps1
+cmd.exe /d /c echo MRTW static analysis probe
+DllRegisterServer
+StartStaticAnalysisProbe

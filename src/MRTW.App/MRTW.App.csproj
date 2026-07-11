@@ -1,0 +1,21 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\MRTW.Core\MRTW.Core.csproj" />
+    <ProjectReference Include="..\MRTW.Collectors.Etw\MRTW.Collectors.Etw.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\MRTW.Native\build\msvc-x64\Release\hook_x64.dll" Link="native\hook_x64.dll" CopyToOutputDirectory="PreserveNewest" Condition="Exists('..\MRTW.Native\build\msvc-x64\Release\hook_x64.dll')" />
+    <None Include="..\MRTW.Native\build\msvc-x64\Release\injector_x64.exe" Link="native\injector_x64.exe" CopyToOutputDirectory="PreserveNewest" Condition="Exists('..\MRTW.Native\build\msvc-x64\Release\injector_x64.exe')" />
+  </ItemGroup>
+
+</Project>

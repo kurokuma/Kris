@@ -1,0 +1,63 @@
+# .NET build output
+**/[Bb]in/
+**/[Oo]bj/
+artifacts/
+out/
+
+# Local .NET SDK and NuGet state
+.dotnet-home/
+.dotnet_home/
+.nuget/
+packages/
+
+# Visual Studio, VS Code, and JetBrains IDEs
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.DotSettings.user
+
+# Test and coverage output
+TestResults/
+coverage/
+coverage.*
+*.coverage
+*.coveragexml
+*.trx
+
+# Native/CMake build output
+**/build/
+**/cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+
+# MRTW-generated analysis and export output
+test/analysis-output/
+test/sqlite-load-output/
+
+# Compiled binaries and debug symbols
+*.exe
+*.dll
+*.pdb
+*.exp
+*.lib
+*.obj
+*.ilk
+
+# Logs and local temporary files
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
+Desktop.ini

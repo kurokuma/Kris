@@ -1,0 +1,348 @@
+using System.Text.Json;
+
+namespace MRTW.Core;
+
+public static class BehaviorCorrelator
+{
+    public static IReadOnlyList<TimelineEvent> Correlate(IReadOnlyList<TimelineEvent> events)
+    {
+        if (events.Count == 0)
+        {
+            return events;
+        }
+
+        var output = events.OrderBy(e => e.Time).ToList();
+        int nextId = output.Count == 0 ? 1 : output.Max(e => e.Id) + 1;
+        foreach (var group in output.Where(e => e.Category != EventCategory.Behavior).GroupBy(e => e.Pid))
+        {
+            AddProcessInjection(output, group.ToArray(), ref nextId);
+            AddProcessHollowing(output, group.ToArray(), ref nextId);
+            AddRansomwareLikeFileEncryption(output, group.ToArray(), ref nextId);
+            AddPersistence(output, group.ToArray(), ref nextId);
+            AddCredentialAccess(output, group.ToArray(), ref nextId);
+            AddDnsC2LikeActivity(output, group.ToArray(), ref nextId);
+            AddScriptExecution(output, group.ToArray(), ref nextId);
+            AddAntiAnalysis(output, group.ToArray(), ref nextId);
+            AddSuspiciousModuleLoad(output, group.ToArray(), ref nextId);
+            AddDiscoveryActivity(output, group.ToArray(), ref nextId);
+            AddTokenManipulation(output, group.ToArray(), ref nextId);
+            AddStealerBehavior(output, group.ToArray(), ref nextId);
+            AddLolbinExecution(output, group.ToArray(), ref nextId);
+            AddAmsiEtwTamper(output, group.ToArray(), ref nextId);
+            AddIpcActivity(output, group.ToArray(), ref nextId);
+            AddComWmiActivity(output, group.ToArray(), ref nextId);
+            AddServiceDriverActivity(output, group.ToArray(), ref nextId);
+            AddNetworkConfigurationActivity(output, group.ToArray(), ref nextId);
+            AddExceptionBasedEvasion(output, group.ToArray(), ref nextId);
+            AddSystemEnvironmentProfiling(output, group.ToArray(), ref nextId);
+        }
+
+        return output.OrderBy(e => e.Time).Select((e, index) => e with { Id = index + 1 }).ToArray();
+    }
+
+    private static void AddProcessInjection(List<TimelineEvent> output, IReadOnlyList<TimelineEvent> events, ref int nextId)
+    {
+        string[] alloc = ["VirtualAllocEx", "VirtualProtectEx"];
+        string[] write = ["WriteProcessMemory"];
+        string[] execute = ["CreateRemoteThread", "QueueUserAPC"];
+        if (HasAny(events, alloc) && HasAny(events, write) && HasAny(events, execute))
+        {
+            AddBehavior(output, events, ref nextId, "Process Injection Detected", "Remote memory allocation, process-memory write, and remote execution APIs were observed in sequence.", EventSeverity.High, "T1055", "Process Injection", "High");
+        }
+    }
+
+    private static void AddProcessHollowing(List<TimelineEvent> output, IReadOnlyList<TimelineEvent> events, ref int nextId)
+    {
+        bool suspendedChild = events.Any(e => e.Action is "CreateProcessW" or "CreateProcessA" && JsonNumber(e.RawJson, "creation_flags") is uint flags && (flags & 0x4) != 0);
+        bool contextSwap = HasAny(events, ["WriteProcessMemory"]) && HasAny(events, ["SetThreadContext"]) && HasAny(events, ["ResumeThread"]);
+        if (suspendedChild && contextSwap)
+        {
+            AddBehavior(output, events, ref nextId, "Possible Process Hollowing", "A suspended process was created and then memory/context manipulation APIs were observed.", EventSeverity.High, "T1055.012", "Process Hollowing", "Medium");
+        }
+    }
+
+    private static void AddRansomwareLikeFileEncryption(List<TimelineEvent> output, IReadOnlyList<TimelineEvent> events, ref int nextId)
+    {
+        int writes = events.Count(e => e.Action == "WriteFile");
+        int creates = events.Count(e => e.Action == "CreateFileW");
+        int renames = events.Count(e => e.Action is "MoveFileExW" or "SetFileInformationByHandle");
+        int deletes = events.Count(e => e.Action == "DeleteFileW");
+        int crypto = events.Count(e => e.Action is "CryptEncrypt" or "BCryptEncrypt" or "BCryptGenerateSymmetricKey" or "CryptGenRandom");
+        bool backupTamper = events.Any(e => ContainsAny(e.RawJson + " " + e.ObjectValue + " " + e.Summary, "vssadmin", "wmic shadowcopy", "wbadmin", "bcdedit", "reagentc"));
+        bool manyFileOps = writes >= 25 && creates >= 15;
+        bool rewriteAndRename = writes >= 10 && renames >= 5;
+        bool destructive = writes >= 10 && deletes >= 5;
+        bool cryptoAndWrites = crypto >= 3 && writes >= 5;
+        if (manyFileOps || rewriteAndRename || destructive || cryptoAndWrites || backupTamper)
+        {
+            AddBehavior(output, events, ref nextId, "Ransomware-like Impact", $"Ransomware-style impact pattern observed: writes={writes}, creates={creates}, renames={renames}, deletes={deletes}, crypto={crypto}, backup_tamper={backupTamper}.", EventSeverity.High, "T1486", "Data Encrypted for Impact", "Medium");
+        }
+    }
+
+    private static void AddPersistence(List<TimelineEvent> output, IReadOnlyList<TimelineEvent> events, ref int nextId)
+    {
+        var persistenceEvents = events.Where(e =>
+            e.Action is "CreateServiceW" or "ChangeServiceConfigW" ||
+            (e.Action is "RegSetValueExW" or "RegSetKeyValueW" or "RegCreateKeyExW" &&
+            ContainsAny(e.RawJson + " " + e.ObjectValue + " " + e.Summary, "Run", "RunOnce", "Services", "Winlogon", "AppInit_DLLs", "Image File Execution Options", "Active Setup"))).ToArray();
+        if (persistenceEvents.Length > 0)
+        {
+            AddBehavior(output, persistenceEvents, ref nextId, "Persistence Established", "A registry or service change associated with autostart persistence was observed.", EventSeverity.High, "T1547", "Boot or Logon Autostart Execution", "Medium");
+        }
+    }
+
+    private static void AddCredentialAccess(List<TimelineEvent> output, IReadOnlyList<TimelineEvent> events, ref int nextId)
+    {
+        var credentialEvents = events.Where(e => e.Category == EventCategory.Credential || e.Action is "CryptUnprotectData" or "CredReadW" or "MiniDumpWriteDump").ToArray();
+        if (credentialEvents.Length > 0)
+        {
+            string action = credentialEvents.Any(e => e.Action == "MiniDumpWriteDump") ? "LSASS Dump Attempt" : "Credential Access Attempt";
+            string id = credentialEvents.Any(e => e.Action == "MiniDumpWriteDump") ? "T1003.001" : "T1003";
+            string name = credentialEvents.Any(e => e.Action == "MiniDumpWriteDump") ? "LSASS Memory" : "OS Credential Dumping";
+            AddBehavior(output, credentialEvents, ref nextId, action, "Credential access APIs or dump creation APIs were observed.", EventSeverity.High, id, name, "High");
+        }
+    }
+
+    private static void AddDnsC2LikeActivity(List<TimelineEvent> output, IReadOnlyList<TimelineEvent> events, ref int nextId)
+    {
+        var dnsEvents = events.Where(e => e.Category == EventCategory.Dns).ToArray();
+        bool manyQueries = dnsEvents.Length >= 10;
+        bool longQuery = dnsEvents.Any(e => (e.ObjectValue.Length >= 50 || e.Summary.Length >= 80));
+        if (manyQueries || longQuery)
+        {
+            AddBehavior(output, dnsEvents, ref nextId, "DNS C2-like Activity", $"DNS activity pattern observed: queries={dnsEvents.Length}, long_query={longQuery}.", EventSeverity.Medium, "T1071.004", "DNS", "Medium");
+        }
+    }
+
+    private static void AddScriptExecution(List<TimelineEvent> output, IReadOnlyList<TimelineEvent> events, ref int nextId)
+    {
+        var scriptEvents = events.Where(e => (e.Action is "CreateProcessW" or "CreateProcessA" or "ShellExecuteW" or "ShellExecuteA" or "ShellExecuteExW") &&
+            ContainsAny(e.RawJson + " " + e.ObjectValue + " " + e.Summary, "powershell", "pwsh", "cmd.exe", "wscript", "cscript", "mshta", "rundll32", "regsvr32", "certutil")).ToArray();
+        if (scriptEvents.Length > 0)
+        {
+            AddBehavior(output, scriptEvents, ref nextId, "Script Execution", "A command or scripting interpreter was launched by the sample process tree.", EventSeverity.Medium, "T1059", "Command and Scripting Interpreter", "Medium");
+        }
+    }
+
+    private static void AddSuspiciousModuleLoad(List<TimelineEvent> output, IReadOnlyList<TimelineEvent> events, ref int nextId)
+    {
+        var moduleEvents = events.Where(e => (e.Action is "LoadLibraryW" or "LoadLibraryExW" or "LdrLoadDll") &&
+            (ContainsAny(e.ObjectValue + " " + e.RawJson, "\\temp\\", "\\appdata\\", "\\programdata\\", "\\downloads\\") || LooksRelativeDll(e.ObjectValue))).ToArray();
+        if (moduleEvents.Length > 0)
+        {
+            AddBehavior(output, moduleEvents, ref nextId, "Suspicious DLL Load", "A DLL was loaded from a user-writable or relative location often used for sideloading.", EventSeverity.Medium, "T1574.002", "DLL Side-Loading", "Medium");
+        }
+    }
+
+    private static void AddDiscoveryActivity(List<TimelineEvent> output, IReadOnlyList<TimelineEvent> events, ref int nextId)
+    {
+        int processDiscovery = events.Count(e => e.Action is "CreateToolhelp32Snapshot" or "Process32FirstW" or "Process32NextW" or "EnumProcesses");
+        int fileDiscovery = events.Count(e => e.Action is "FindFirstFileW" or "FindNextFileW");
+        int registryDiscovery = events.Count(e => e.Action is "RegEnumKeyExW" or "RegEnumValueW");
+        if (processDiscovery >= 3 || fileDiscovery >= 10 || registryDiscovery >= 5 || processDiscovery + fileDiscovery + registryDiscovery >= 12)
+        {
+            var evidence = events.Where(e => e.Action is "CreateToolhelp32Snapshot" or "Process32FirstW" or "Process32NextW" or "EnumProcesses" or "FindFirstFileW" or "FindNextFileW" or "RegEnumKeyExW" or "RegEnumValueW").ToArray();
+            AddBehavior(output, evidence, ref nextId, "Discovery Activity", $"Discovery APIs were observed: process={processDiscovery}, file={fileDiscovery}, registry={registryDiscovery}.", EventSeverity.Medium, "T1082", "System Information Discovery", "Medium");
+        }
+    }
+
+    private static void AddTokenManipulation(List<TimelineEvent> output, IReadOnlyList<TimelineEvent> events, ref int nextId)
+    {
+        var tokenEvents = events.Where(e => e.Action is "OpenProcessToken" or "AdjustTokenPrivileges" or "DuplicateTokenEx" or "ImpersonateLoggedOnUser" or "ShellExecuteW" or "ShellExecuteA" or "ShellExecuteExW").ToArray();
+        bool strongSignal = tokenEvents.Any(e => e.Action is "AdjustTokenPrivileges" or "DuplicateTokenEx" or "ImpersonateLoggedOnUser") ||
+            tokenEvents.Any(e => (e.Action is "ShellExecuteW" or "ShellExecuteA" or "ShellExecuteExW") && ContainsAny(e.RawJson, "runas"));
+        if (strongSignal)
+        {
+            AddBehavior(output, tokenEvents, ref nextId, "Token Privilege Manipulation", "Token privilege, duplication, impersonation, or elevation-related APIs were observed.", EventSeverity.High, "T1134", "Access Token Manipulation", "High");
+        }
+    }
+
+    private static void AddStealerBehavior(List<TimelineEvent> output, IReadOnlyList<TimelineEvent> events, ref int nextId)
+    {
+        var stealerEvents = events.Where(e =>
+            e.Action is "OpenClipboard" or "GetClipboardData" or "SetClipboardData" or "BitBlt" or "GetDC" or "CreateCompatibleBitmap" or "GetAsyncKeyState" or "GetKeyState" or "SetWindowsHookExW" ||
+            ContainsAny(e.RawJson + " " + e.ObjectValue + " " + e.Summary, "\\google\\chrome\\user data", "\\microsoft\\edge\\user data", "\\mozilla\\firefox\\profiles", "\\brave-browser\\user data", "\\opera software\\", "login data", "cookies", "local state", "wallet", "metamask", "exodus", "electrum")).ToArray();
+        if (stealerEvents.Length > 0)
+        {
+            string techniqueId = stealerEvents.Any(e => e.Action is "BitBlt" or "GetDC" or "CreateCompatibleBitmap") ? "T1113" :
+                stealerEvents.Any(e => e.Action is "OpenClipboard" or "GetClipboardData" or "SetClipboardData") ? "T1115" :
+                stealerEvents.Any(e => e.Action is "GetAsyncKeyState" or "GetKeyState" or "SetWindowsHookExW") ? "T1056.001" : "T1555.003";
+            string techniqueName = techniqueId switch
+            {
+                "T1113" => "Screen Capture",
+                "T1115" => "Clipboard Data",
+                "T1056.001" => "Keylogging",
+                _ => "Credentials from Web Browsers"
+            };
+            AddBehavior(output, stealerEvents, ref nextId, "Stealer-like Collection", "Clipboard, screen, keyboard, browser profile, or wallet-related access was observed.", EventSeverity.High, techniqueId, techniqueName, "Medium");
+        }
+    }
+
+    private static void AddLolbinExecution(List<TimelineEvent> output, IReadOnlyList<TimelineEvent> events, ref int nextId)
+    {
+        var lolbinEvents = events.Where(e => (e.Action is "CreateProcessW" or "CreateProcessA" or "ShellExecuteW" or "ShellExecuteA" or "ShellExecuteExW") &&
+            ContainsAny(e.RawJson + " " + e.ObjectValue + " " + e.Summary, "rundll32", "regsvr32", "mshta", "certutil", "bitsadmin", "msiexec", "installutil", "wmic", "schtasks", "vssadmin", "bcdedit", "curl", "wget", "powershell", "pwsh", "cmd.exe", "wscript", "cscript")).ToArray();
+        if (lolbinEvents.Length > 0)
+        {
+            AddBehavior(output, lolbinEvents, ref nextId, "LOLBin Execution", "A Windows living-off-the-land binary or scripting interpreter was launched with arguments visible in the event details.", EventSeverity.Medium, "T1218", "System Binary Proxy Execution", "Medium");
+        }
+    }
+
+    private static void AddAmsiEtwTamper(List<TimelineEvent> output, IReadOnlyList<TimelineEvent> events, ref int nextId)
+    {
+        var tamperEvents = events.Where(e => e.Action is "AmsiScanBuffer" or "EtwEventWrite" or "VirtualProtect").ToArray();
+        bool strong = tamperEvents.Any(e => e.Action is "AmsiScanBuffer" or "EtwEventWrite") &&
+            tamperEvents.Any(e => e.Action == "VirtualProtect" && ContainsAny(e.RawJson, "\"new_protect\":64", "\"new_protect\":128", "\"new_protect\":32"));
+        if (strong || tamperEvents.Count(e => e.Action == "VirtualProtect") >= 3)
+        {
+            AddBehavior(output, tamperEvents, ref nextId, "AMSI/ETW Tamper Signal", "AMSI, ETW, or executable memory protection changes were observed.", EventSeverity.High, "T1562.001", "Disable or Modify Tools", "Medium");
+        }
+    }
+
+    private static void AddIpcActivity(List<TimelineEvent> output, IReadOnlyList<TimelineEvent> events, ref int nextId)
+    {
+        var ipcEvents = events.Where(e => e.Action is "CreateMutexW" or "OpenMutexW" or "CreateNamedPipeW" or "ConnectNamedPipe" or "CallNamedPipeW" or "CreateFileMappingW" or "MapViewOfFile").ToArray();
+        if (ipcEvents.Length >= 2 || ipcEvents.Any(e => e.Action is "CreateNamedPipeW" or "CallNamedPipeW"))
+        {
+            AddBehavior(output, ipcEvents, ref nextId, "IPC or Singleton Coordination", "Mutex, named pipe, or shared-memory APIs were observed.", EventSeverity.Low, "T1559", "Inter-Process Communication", "Low");
+        }
+    }
+
+    private static void AddAntiAnalysis(List<TimelineEvent> output, IReadOnlyList<TimelineEvent> events, ref int nextId)
+    {
+        string[] antiActions = ["IsDebuggerPresent", "CheckRemoteDebuggerPresent", "NtQueryInformationProcess", "Sleep", "SleepEx", "GetTickCount", "QueryPerformanceCounter", "GetSystemFirmwareTable"];
+        var antiEvents = events.Where(e => antiActions.Contains(e.Action, StringComparer.OrdinalIgnoreCase)).ToArray();
+        bool longSleep = antiEvents.Any(e => e.Action is "Sleep" or "SleepEx" && JsonNumber(e.RawJson, "milliseconds") >= 60000);
+        if (antiEvents.Length >= 2 || longSleep)
+        {
+            AddBehavior(output, antiEvents, ref nextId, "Anti-analysis Behavior", $"Anti-analysis or timing APIs were observed: count={antiEvents.Length}, long_sleep={longSleep}.", EventSeverity.Medium, "T1497", "Virtualization/Sandbox Evasion", "Medium");
+        }
+    }
+
+    private static void AddComWmiActivity(List<TimelineEvent> output, IReadOnlyList<TimelineEvent> events, ref int nextId)
+    {
+        var comEvents = events.Where(e => e.Action is "CoCreateInstance" or "CoCreateInstanceEx" or "CoGetClassObject" or "CLSIDFromProgID" or "CLSIDFromString").ToArray();
+        if (comEvents.Length == 0)
+        {
+            return;
+        }
+
+        bool wmi = comEvents.Any(e => ContainsAny(e.RawJson + " " + e.ObjectValue + " " + e.Summary, "WbemScripting", "SWbemLocator", "{4590F811-1D3A-11D0-891F-00AA004B2E24}", "{76A64158-CB41-11D1-8B02-00600806D9B6}", "winmgmts"));
+        AddBehavior(output, comEvents, ref nextId, wmi ? "WMI Automation Activity" : "COM Automation Activity", wmi ? "WMI-related COM activation was observed." : "COM object activation was observed.", wmi ? EventSeverity.High : EventSeverity.Medium, wmi ? "T1047" : "T1559.001", wmi ? "Windows Management Instrumentation" : "Component Object Model", wmi ? "High" : "Medium");
+    }
+
+    private static void AddServiceDriverActivity(List<TimelineEvent> output, IReadOnlyList<TimelineEvent> events, ref int nextId)
+    {
+        var serviceEvents = events.Where(e => e.Action is "OpenSCManagerW" or "OpenServiceW" or "StartServiceW" or "ControlService" or "DeleteService" or "EnumServicesStatusExW" or "NtLoadDriver").ToArray();
+        if (serviceEvents.Length == 0)
+        {
+            return;
+        }
+
+        if (serviceEvents.Any(e => e.Action == "NtLoadDriver"))
+        {
+            AddBehavior(output, serviceEvents, ref nextId, "Driver Load Attempt", "Kernel driver loading API was observed.", EventSeverity.High, "T1547.006", "Kernel Modules and Extensions", "High");
+            return;
+        }
+
+        bool modifying = serviceEvents.Any(e => e.Action is "StartServiceW" or "ControlService" or "DeleteService");
+        AddBehavior(output, serviceEvents, ref nextId, modifying ? "Service Control Activity" : "Service Discovery Activity", modifying ? "Service start, stop, control, or deletion APIs were observed." : "Service manager or service enumeration APIs were observed.", modifying ? EventSeverity.High : EventSeverity.Medium, modifying ? "T1569.002" : "T1007", modifying ? "Service Execution" : "System Service Discovery", modifying ? "High" : "Medium");
+    }
+
+    private static void AddNetworkConfigurationActivity(List<TimelineEvent> output, IReadOnlyList<TimelineEvent> events, ref int nextId)
+    {
+        var configEvents = events.Where(e => e.Action is "InternetSetOptionW" or "WinHttpSetOption").ToArray();
+        if (configEvents.Length > 0)
+        {
+            AddBehavior(output, configEvents, ref nextId, "Network Configuration Change", "WinINet or WinHTTP option changes were observed, which can indicate proxy, TLS, or request-behavior manipulation.", EventSeverity.Medium, "T1090", "Proxy", "Medium");
+        }
+    }
+
+    private static void AddExceptionBasedEvasion(List<TimelineEvent> output, IReadOnlyList<TimelineEvent> events, ref int nextId)
+    {
+        var evasionEvents = events.Where(e => e.Action is "SetUnhandledExceptionFilter" or "AddVectoredExceptionHandler" or "AddVectoredContinueHandler" or "OutputDebugStringW" or "GetThreadContext").ToArray();
+        if (evasionEvents.Length >= 1)
+        {
+            AddBehavior(output, evasionEvents, ref nextId, "Exception or Debugger Evasion", "Exception-handler, debug-output, or thread-context APIs were observed.", EventSeverity.Medium, "T1622", "Debugger Evasion", "Medium");
+        }
+    }
+
+    private static void AddSystemEnvironmentProfiling(List<TimelineEvent> output, IReadOnlyList<TimelineEvent> events, ref int nextId)
+    {
+        var profileEvents = events.Where(e => e.Action is "GetAdaptersAddresses" or "GetComputerNameW" or "GetUserNameW" or "GetSystemFirmwareTable").ToArray();
+        if (profileEvents.Length >= 2)
+        {
+            bool firmware = profileEvents.Any(e => e.Action == "GetSystemFirmwareTable");
+            AddBehavior(output, profileEvents, ref nextId, firmware ? "Sandbox Environment Profiling" : "Host Environment Profiling", firmware ? "Firmware or host identity APIs were observed, which can be used to identify virtualized sandboxes." : "Host identity or network adapter profiling APIs were observed.", EventSeverity.Medium, firmware ? "T1497" : "T1082", firmware ? "Virtualization/Sandbox Evasion" : "System Information Discovery", "Medium");
+        }
+    }
+
+    private static void AddBehavior(List<TimelineEvent> output, IReadOnlyList<TimelineEvent> evidence, ref int nextId, string action, string summary, EventSeverity severity, string techniqueId, string techniqueName, string confidence)
+    {
+        if (evidence.Count == 0)
+        {
+            return;
+        }
+
+        int pid = evidence.First().Pid;
+        if (output.Any(e => e.Category == EventCategory.Behavior && e.Pid == pid && e.Action == action))
+        {
+            return;
+        }
+
+        var raw = JsonSerializer.Serialize(new
+        {
+            source = "Behavior",
+            action,
+            technique_id = techniqueId,
+            technique_name = techniqueName,
+            confidence,
+            evidence_event_ids = evidence.Select(e => e.Id).Take(40).ToArray(),
+            evidence_actions = evidence.Select(e => e.Action).Distinct().Take(20).ToArray()
+        }, JsonDefaults.Options);
+
+        output.Add(new TimelineEvent(
+            nextId++,
+            evidence.Max(e => e.Time).Add(TimeSpan.FromMilliseconds(1)),
+            evidence.FirstOrDefault(e => !string.IsNullOrWhiteSpace(e.Process))?.Process ?? "behavior",
+            pid,
+            EventCategory.Behavior,
+            action,
+            techniqueId,
+            summary,
+            severity,
+            "Behavior",
+            raw,
+            techniqueId,
+            techniqueName,
+            confidence,
+            evidence.FirstOrDefault(e => !string.IsNullOrWhiteSpace(e.ProcessGuid))?.ProcessGuid ?? ""));
+    }
+
+    private static bool HasAny(IReadOnlyList<TimelineEvent> events, IReadOnlyList<string> actions) =>
+        events.Any(e => actions.Contains(e.Action, StringComparer.OrdinalIgnoreCase));
+
+    private static bool ContainsAny(string value, params string[] needles) =>
+        needles.Any(n => value.Contains(n, StringComparison.OrdinalIgnoreCase));
+
+    private static bool LooksRelativeDll(string value) =>
+        value.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) && !Path.IsPathFullyQualified(value);
+
+    private static uint JsonNumber(string rawJson, string propertyName)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(rawJson);
+            if (document.RootElement.TryGetProperty(propertyName, out var value) && value.TryGetUInt32(out uint parsed))
+            {
+                return parsed;
+            }
+        }
+        catch
+        {
+            return 0;
+        }
+
+        return 0;
+    }
+}
