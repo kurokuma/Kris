@@ -83,27 +83,31 @@ public sealed class StaticAnalysisService
 
     private static IEnumerable<string> ExtractStrings(byte[] data, int minLength)
     {
+        const int maximumCandidateLength = 4_096;
+        const int maximumCandidates = 512;
         var current = new StringBuilder();
+        int emitted = 0;
+        string? Finish()
+        {
+            if (current.Length < minLength || emitted >= maximumCandidates) { current.Clear(); return null; }
+            emitted++;
+            string value = current.ToString();
+            current.Clear();
+            return value;
+        }
         foreach (byte b in data)
         {
             if (b is >= 32 and <= 126)
             {
-                current.Append((char)b);
+                if (current.Length < maximumCandidateLength) current.Append((char)b);
             }
             else
             {
-                if (current.Length >= minLength)
-                {
-                    yield return current.ToString();
-                }
-                current.Clear();
+                string? value = Finish(); if (value is not null) yield return value;
             }
         }
 
-        if (current.Length >= minLength)
-        {
-            yield return current.ToString();
-        }
+        string? trailing = Finish(); if (trailing is not null) yield return trailing;
 
         current.Clear();
         for (int i = 0; i + 1 < data.Length; i += 2)
@@ -111,17 +115,14 @@ public sealed class StaticAnalysisService
             ushort ch = BinaryPrimitives.ReadUInt16LittleEndian(data.AsSpan(i, 2));
             if (ch is >= 32 and <= 126)
             {
-                current.Append((char)ch);
+                if (current.Length < maximumCandidateLength) current.Append((char)ch);
             }
             else
             {
-                if (current.Length >= minLength)
-                {
-                    yield return current.ToString();
-                }
-                current.Clear();
+                string? value = Finish(); if (value is not null) yield return value;
             }
         }
+        trailing = Finish(); if (trailing is not null) yield return trailing;
     }
 
     private static PeReadResult TryReadPe(byte[] data)

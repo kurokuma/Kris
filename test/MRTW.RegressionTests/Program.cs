@@ -22,7 +22,9 @@ var tests = new List<(string Name, Action Body)>
     ("evidence generations do not collide", TestEvidenceGenerationCollision),
     ("cancellation before launch never starts target", TestCancellationBeforeLaunch),
     ("snapshot cancellation is immediate and bounded", TestSnapshotCancellation),
-    ("static analysis rejects oversized target", TestStaticAnalysisOversize)
+    ("static analysis rejects oversized target", TestStaticAnalysisOversize),
+    ("static analysis bounds long printable strings", TestStaticAnalysisLongString),
+    ("live batch accumulator handles high volume without per-item snapshots", TestLiveBatchAccumulator)
 };
 
 int failures = 0;
@@ -86,6 +88,51 @@ static void TestStaticAnalysisOversize()
         Throws<InvalidDataException>(() => new StaticAnalysisService().Analyze(path));
     }
     finally { if (File.Exists(path)) File.Delete(path); }
+}
+
+static void TestStaticAnalysisLongString()
+{
+    string path = Path.Combine(Path.GetTempPath(), "mrtw-strings-" + Guid.NewGuid().ToString("N") + ".bin");
+    try
+    {
+        File.WriteAllBytes(path, System.Text.Encoding.ASCII.GetBytes("https://example.com/" + new string('A', 128 * 1024) + "\0"));
+        var result = new StaticAnalysisService().Analyze(path);
+        True(result.SuspiciousStrings.Count > 0, "long printable indicator was not extracted");
+        True(result.SuspiciousStrings.All(s => s.Length <= 4_096), "long printable run was retained without a bound");
+    }
+    finally { if (File.Exists(path)) File.Delete(path); }
+}
+
+static void TestLiveBatchAccumulator()
+{
+    var buffer = new LiveBatchAccumulator<int>();
+    buffer.AddRange(Enumerable.Range(0, 10_000));
+    True(buffer.MaterializationCount == 0, "live buffer materialized during individual adds");
+    var first = buffer.Snapshot();
+    buffer.AddRange(Enumerable.Range(10_000, 2_000));
+    var second = buffer.Snapshot();
+    Equal(2, buffer.MaterializationCount);
+    Equal(10_000, first.Length);
+    Equal(12_000, second.Length);
+    Equal(0, second[0]);
+    Equal(11_999, second[^1]);
+    var ordered = new LiveBatchAccumulator<int>();
+    for (int tick = 0; tick < 100; tick++) ordered.AddOrderedRange([tick * 2 + 1, tick * 2], Comparer<int>.Default);
+    True(ordered.Items.SequenceEqual(Enumerable.Range(0, 200)), "out-of-order batches were not stably merged");
+    True(ordered.MaterializationCount == 0, "cadence ticks materialized history");
+    Equal(50, ordered.TrimToMaximum(150));
+    Equal(150, ordered.Count);
+    Equal(50, ordered.Items[0]);
+    var removed = ordered.RemoveOldestToMaximum(100);
+    Equal(50, removed.Count);
+    Equal(100, ordered.Count);
+    var capped = new LiveBatchAccumulator<int>();
+    capped.AddOrderedRange(Enumerable.Range(1, 10_000), Comparer<int>.Default);
+    capped.AddOrderedRange([0], Comparer<int>.Default);
+    var trimmedLate = capped.RemoveOldestToMaximum(10_000);
+    Equal(1, trimmedLate.Count);
+    Equal(0, trimmedLate[0]);
+    True(!capped.Items.Contains(0) && capped.Count == 10_000, "late oldest event remained after live history cap");
 }
 
 static void TestOrchestratorQuality()

@@ -51,6 +51,7 @@ public sealed class RuntimeCaseCollector
             : [];
         var seenTcpConnections = before.TcpConnections.ToHashSet(StringComparer.OrdinalIgnoreCase);
         Process? process = null;
+        VerifiedTargetHandle? verifiedTarget = null;
         int? pid = null;
         DateTimeOffset? processStarted = null;
         DateTimeOffset? processExited = null;
@@ -119,7 +120,7 @@ public sealed class RuntimeCaseCollector
         {
             try
             {
-                if (!VerifyTargetIntegrity(profile, staticAnalysis, cancellationToken, out string integrityMessage))
+                if (!VerifyTargetIntegrity(profile, staticAnalysis, cancellationToken, out verifiedTarget, out string integrityMessage))
                 {
                     Add(Event(nextId++, DateTimeOffset.Now - started, Path.GetFileName(profile.TargetPath), 0, EventCategory.Process, "Target Integrity Check Failed", profile.TargetPath, integrityMessage, EventSeverity.High, "ExecutionManager"));
                     throw new InvalidOperationException("The target changed after static analysis and was not launched.");
@@ -226,11 +227,18 @@ public sealed class RuntimeCaseCollector
                     }
 
                     int injectedPid = observedInjectedPid > 0 ? observedInjectedPid : TryReadInjectedPid(output);
+                    if (injectedPid > 0)
+                    {
+                        verifiedTarget?.Dispose();
+                        verifiedTarget = null;
+                    }
                     if ((!injectorExited || injectorExitCode != 0) && injectedPid == 0)
                     {
                         cancellationToken.ThrowIfCancellationRequested();
                         Add(Event(nextId++, DateTimeOffset.Now - started, Path.GetFileName(profile.TargetPath), 0, EventCategory.Process, "Hook Fallback Start", profile.CommandLine, "Native hook injection did not produce a target PID; starting target without hook.", EventSeverity.Medium, "ExecutionManager"));
-                        process = StartProcess(profile, cancellationToken);
+                        process = StartProcess(profile, cancellationToken, verifiedTarget);
+                        verifiedTarget?.Dispose();
+                        verifiedTarget = null;
                         pid = process.Id;
                         processStarted = DateTimeOffset.Now;
                     }
@@ -310,7 +318,9 @@ public sealed class RuntimeCaseCollector
                         Add(Event(nextId++, DateTimeOffset.Now - started, Path.GetFileName(profile.TargetPath), 0, EventCategory.Api, "Hook Unavailable", "native\\hook_x64.dll", "Native hook binaries were not found; falling back to standard process execution.", EventSeverity.Medium, "ExecutionManager"));
                     }
 
-                    process = StartProcess(profile, cancellationToken);
+                    process = StartProcess(profile, cancellationToken, verifiedTarget);
+                    verifiedTarget?.Dispose();
+                    verifiedTarget = null;
                     pid = process.Id;
                     processStarted = DateTimeOffset.Now;
                     Add(Event(nextId++, processStarted.Value - started, SafeProcessName(process, profile), pid.Value, EventCategory.Process, "Process Start", profile.CommandLine, "Process started", EventSeverity.Informational, "ExecutionManager"));
@@ -354,6 +364,7 @@ public sealed class RuntimeCaseCollector
             finally
             {
                 process?.Dispose();
+                verifiedTarget?.Dispose();
                 if (hookPipe is not null)
                 {
                     AddMany(hookPipe.DrainEvents(started, ref nextId));
@@ -362,7 +373,7 @@ public sealed class RuntimeCaseCollector
                         "Hook Transport Summary",
                         $"received={hookPipe.ReceivedLines};parse_failures={hookPipe.ParseFailures};connection_failures={hookPipe.ConnectionFailures};dropped={hookPipe.DroppedLines};oversize={hookPipe.OversizeLines};queued={hookPipe.QueuedLines}",
                         transportFailures == 0 && hookPipe.DroppedLines == 0 && hookPipe.OversizeLines == 0 ? "Hook pipe transport completed without observed loss." : "Hook pipe transport reported failures or bounded input; the case may be incomplete.",
-                        transportFailures == 0 ? EventSeverity.Informational : EventSeverity.High,
+                        transportFailures == 0 && hookPipe.DroppedLines == 0 && hookPipe.OversizeLines == 0 ? EventSeverity.Informational : EventSeverity.High,
                         "Hook"));
                     hookPipe.DisposeAsync().AsTask().GetAwaiter().GetResult();
                 }
@@ -428,7 +439,7 @@ public sealed class RuntimeCaseCollector
             PreservedFiles: preservedFiles) { TrustedEvidenceRoot = EvidencePathPolicy.Root(caseId) };
     }
 
-    private static Process StartProcess(ExecutionProfile profile, CancellationToken cancellationToken = default)
+    private static Process StartProcess(ExecutionProfile profile, CancellationToken cancellationToken = default, VerifiedTargetHandle? verifiedTarget = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
         var startInfo = new ProcessStartInfo
@@ -461,12 +472,18 @@ public sealed class RuntimeCaseCollector
         catch (Win32Exception ex) when (ex.NativeErrorCode == ErrorElevationRequired)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            if (verifiedTarget is not null)
+            {
+                throw new InvalidOperationException("Elevated direct execution is refused after integrity verification because Windows shell elevation cannot guarantee an atomic verified path launch.", ex);
+            }
             return StartElevatedProcess(profile, cancellationToken);
         }
     }
 
-    private static bool VerifyTargetIntegrity(ExecutionProfile profile, StaticAnalysisResult? staticAnalysis, CancellationToken cancellationToken, out string message)
+    private static bool VerifyTargetIntegrity(ExecutionProfile profile, StaticAnalysisResult? staticAnalysis, CancellationToken cancellationToken, out VerifiedTargetHandle? verifiedTarget, out string message)
     {
+        verifiedTarget = null;
+        FileStream? stream = null;
         message = "Static analysis was not available; execution integrity comparison was skipped.";
         if (staticAnalysis is null || string.IsNullOrWhiteSpace(staticAnalysis.Sha256)) return true;
         if (!profile.TargetType.Equals("exe", StringComparison.OrdinalIgnoreCase) && !profile.TargetType.Equals("dll", StringComparison.OrdinalIgnoreCase)) return true;
@@ -474,7 +491,7 @@ public sealed class RuntimeCaseCollector
         try
         {
             if (!File.Exists(profile.TargetPath)) { message = "Target no longer exists after static analysis."; return false; }
-            using var stream = new FileStream(profile.TargetPath, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024, FileOptions.SequentialScan);
+            stream = new FileStream(profile.TargetPath, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024, FileOptions.SequentialScan);
             using var hash = System.Security.Cryptography.IncrementalHash.CreateHash(System.Security.Cryptography.HashAlgorithmName.SHA256);
             byte[] buffer = new byte[64 * 1024];
             int read;
@@ -484,12 +501,27 @@ public sealed class RuntimeCaseCollector
                 hash.AppendData(buffer, 0, read);
             }
             string actual = Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
-            if (string.Equals(actual, staticAnalysis.Sha256, StringComparison.OrdinalIgnoreCase)) return true;
+            if (string.Equals(actual, staticAnalysis.Sha256, StringComparison.OrdinalIgnoreCase))
+            {
+                verifiedTarget = new VerifiedTargetHandle(stream!);
+                stream = null;
+                return true;
+            }
+            stream.Dispose();
+            stream = null;
             message = $"SHA-256 changed after static analysis (expected {staticAnalysis.Sha256}, observed {actual}).";
             return false;
         }
-        catch (OperationCanceledException) { throw; }
-        catch (Exception ex) { message = $"Unable to verify target integrity: {ex.Message}"; return false; }
+        catch (OperationCanceledException) { stream?.Dispose(); throw; }
+        catch (Exception ex) { stream?.Dispose(); message = $"Unable to verify target integrity: {ex.Message}"; return false; }
+    }
+
+    private sealed class VerifiedTargetHandle(FileStream stream) : IDisposable
+    {
+        // FileShare.Read keeps this exact file object readable but excludes replacement/delete/write
+        // from hash validation through the process-launch decision.
+        private FileStream? _stream = stream;
+        public void Dispose() => Interlocked.Exchange(ref _stream, null)?.Dispose();
     }
 
     private static Process StartElevatedProcess(ExecutionProfile profile, CancellationToken cancellationToken = default)

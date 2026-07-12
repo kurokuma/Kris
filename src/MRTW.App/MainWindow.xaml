@@ -266,14 +266,14 @@
                                     <ColumnDefinition Width="92" />
                                 </Grid.ColumnDefinitions>
                                 <TextBlock Text="TIMELINE" FontWeight="Bold" VerticalAlignment="Center" Foreground="{StaticResource TextPrimary}" />
-                                <TextBlock Grid.Column="1" Text="{Binding FilteredEvents.Count, StringFormat=({0} events)}" Foreground="{StaticResource TextSecondary}" VerticalAlignment="Center" Margin="8,0" />
+                                <TextBlock Grid.Column="1" Text="{Binding TimelineDisplayEvents.Count, StringFormat=({0} events)}" Foreground="{StaticResource TextSecondary}" VerticalAlignment="Center" Margin="8,0" />
                                 <Grid Grid.Column="2">
                                     <TextBox x:Name="TimelineSearchBox" Text="{Binding TimelineSearchText, UpdateSourceTrigger=PropertyChanged}" />
                                     <TextBlock Text="Search timeline..." Foreground="{StaticResource TextSecondary}" Margin="9,0,0,0" VerticalAlignment="Center" IsHitTestVisible="False" Visibility="{Binding TimelineSearchText, Converter={StaticResource EmptyStringToVisibility}}" />
                                 </Grid>
                                 <Button Grid.Column="3" Content="Filter" Padding="8,4" Click="Filter_Click" />
                             </Grid>
-                            <DataGrid x:Name="TimelineGrid" ItemsSource="{Binding FilteredEvents}" SelectedItem="{Binding SelectedEvent}" Margin="0">
+                            <DataGrid x:Name="TimelineGrid" ItemsSource="{Binding TimelineDisplayEvents}" SelectedItem="{Binding SelectedEvent}" Margin="0">
                                 <DataGrid.Columns>
                                     <DataGridTextColumn Header="Time" Binding="{Binding Time}" Width="112" />
                                     <DataGridTextColumn Header="Process" Binding="{Binding Process}" Width="130" />
@@ -552,6 +552,7 @@
                                     <TextBlock Text="{Binding CollectionQualityStatus}" Foreground="{StaticResource AccentBlue}" />
                                 </UniformGrid>
                                 <TextBlock Text="{Binding CollectionQualitySummary}" TextWrapping="Wrap" Foreground="{StaticResource TextSecondary}" Margin="0,0,0,8" />
+                                <TextBlock Text="{Binding LiveCaptureSummary}" TextWrapping="Wrap" Foreground="{StaticResource TextSecondary}" Margin="0,0,0,8" />
                                 <Separator Background="#26384F" Margin="0,12" />
                                 <TextBlock Text="NOTES" FontWeight="Bold" Margin="0,0,0,5" />
                                 <TextBlock Text="{Binding CurrentCase.AnalystNotes}" TextWrapping="Wrap" Foreground="{StaticResource TextPrimary}" />

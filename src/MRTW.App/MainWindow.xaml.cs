@@ -299,7 +299,7 @@ public partial class MainWindow : Window
         }
         var events = queue.DequeueEvents(256);
         _viewModel.AppendLiveEvents(events);
-        foreach (var session in queue.DequeueNetworkSessions(128)) _viewModel.AppendLiveNetworkSession(session);
+        _viewModel.AppendLiveNetworkSessions(queue.DequeueNetworkSessions(128));
         _viewModel.SetLiveQueueDropCount(queue.DroppedEvents + queue.DroppedNetworkSessions);
         if (!queue.IsEmpty) ScheduleLiveFlush(queue);
         if (events.Count > 0) ScrollTimelineToEnd();

@@ -10,6 +10,7 @@ namespace MRTW.App;
 
 public sealed class MainViewModel : INotifyPropertyChanged
 {
+    private const int MaximumLiveHistory = 10_000;
     private TimelineEvent? _selectedEvent;
     private string _samplePath = string.Empty;
     private bool _isMonitoring;
@@ -32,7 +33,10 @@ public sealed class MainViewModel : INotifyPropertyChanged
     private ProcessNode? _selectedProcessNode;
     private readonly Stopwatch _runClock = new();
     private long _liveQueueDropCount;
-    private DateTimeOffset _lastLiveBindingRefresh;
+    private long _liveHistoryDropCount;
+    private readonly LiveBatchAccumulator<TimelineEvent> _liveEventBuffer = new();
+    private readonly LiveBatchAccumulator<NetworkSession> _liveNetworkBuffer = new();
+    public ObservableCollection<TimelineEvent> LiveTimeline { get; } = [];
 
     public MainViewModel()
     {
@@ -109,13 +113,14 @@ public sealed class MainViewModel : INotifyPropertyChanged
             OnPropertyChanged(nameof(CanStart));
             OnPropertyChanged(nameof(CanStop));
             OnPropertyChanged(nameof(CanChangeRunConfiguration));
+            OnPropertyChanged(nameof(TimelineDisplayEvents));
         }
     }
 
     public bool CanStart => !IsMonitoring;
     public bool CanStop => IsMonitoring;
     public bool CanChangeRunConfiguration => !IsMonitoring;
-    public string LiveCaptureSummary => _liveQueueDropCount == 0 ? "Live capture queue: no dropped UI updates" : $"Live capture queue: {_liveQueueDropCount} UI updates dropped; the final case still contains collector data.";
+    public string LiveCaptureSummary => _liveQueueDropCount + _liveHistoryDropCount == 0 ? "Live capture queue: no dropped UI updates" : $"Live capture display: {_liveQueueDropCount} queued and {_liveHistoryDropCount} historical UI updates dropped; the final case still contains collector data.";
 
     public void SetLiveQueueDropCount(long value)
     {
@@ -185,10 +190,11 @@ public sealed class MainViewModel : INotifyPropertyChanged
 
     public IReadOnlyList<string> ProcessFilterOptions =>
         new[] { "All Processes" }
-            .Concat(CurrentCase.Events.Select(e => e.Process).Where(p => !string.IsNullOrWhiteSpace(p)).Distinct(StringComparer.OrdinalIgnoreCase).Order(StringComparer.OrdinalIgnoreCase))
+            .Concat((IsMonitoring ? _liveEventBuffer.Items : CurrentCase.Events).Select(e => e.Process).Where(p => !string.IsNullOrWhiteSpace(p)).Distinct(StringComparer.OrdinalIgnoreCase).Order(StringComparer.OrdinalIgnoreCase))
             .ToArray();
 
     public IReadOnlyList<TimelineEvent> FilteredEvents => ApplyTimelineFilters();
+    public object TimelineDisplayEvents => IsMonitoring ? LiveTimeline : FilteredEvents;
 
     public IReadOnlyList<string> DllExportCandidates
     {
@@ -442,6 +448,11 @@ public sealed class MainViewModel : INotifyPropertyChanged
             "Analysis is running. Timeline events are appended as they are captured.");
         SelectedEvent = null;
         SetLiveQueueDropCount(0);
+        _liveEventBuffer.Clear();
+        _liveNetworkBuffer.Clear();
+        LiveTimeline.Clear();
+        _liveHistoryDropCount = 0;
+        OnPropertyChanged(nameof(TimelineDisplayEvents));
         RefreshCaseBindings();
     }
 
@@ -454,45 +465,47 @@ public sealed class MainViewModel : INotifyPropertyChanged
     {
         var appended = timelineEvents.ToArray();
         if (appended.Length == 0) return;
-        // Full correlation/process reconstruction is intentionally deferred to CompleteRun.
-        // Repeating it for every ETW event made live collection progressively slower.
-        // Collector order is already chronological. Avoid sorting the entire timeline for each UI batch.
-        var events = CurrentCase.Events.Concat(appended).ToArray();
-        CurrentCase = CurrentCase with
+        // Full correlation/process reconstruction and immutable CaseData materialization are deferred.
+        _liveEventBuffer.AddOrderedRange(appended, TimelineEventOrder.Instance);
+        var removed = _liveEventBuffer.RemoveOldestToMaximum(MaximumLiveHistory);
+        if (removed.Count > 0)
         {
-            Duration = _runClock.Elapsed,
-            Events = events,
-            AnalystNotes = "Analysis is running. Timeline events are appended as they are captured."
-        };
+            _liveHistoryDropCount += removed.Count;
+            OnPropertyChanged(nameof(LiveCaptureSummary));
+            foreach (var item in removed) LiveTimeline.Remove(item);
+        }
+        var retained = new HashSet<TimelineEvent>(_liveEventBuffer.Items, ReferenceEqualityComparer.Instance);
+        foreach (var item in appended.OrderBy(e => e, TimelineEventOrder.Instance)) if (retained.Contains(item) && MatchesLiveFilters(item)) InsertLiveTimeline(item);
 
         SelectedEvent ??= appended[0];
-        if (DateTimeOffset.UtcNow - _lastLiveBindingRefresh >= TimeSpan.FromMilliseconds(250))
-        {
-            _lastLiveBindingRefresh = DateTimeOffset.UtcNow;
-            RefreshLiveBindings();
-        }
+        RefreshLiveBindings();
+        OnPropertyChanged(nameof(ProcessFilterOptions));
     }
 
     public void AppendLiveNetworkSession(NetworkSession session)
     {
-        CurrentCase = CurrentCase with
-        {
-            Duration = _runClock.Elapsed,
-            NetworkSessions = CurrentCase.NetworkSessions.Concat([session]).ToArray(),
-            AnalystNotes = "Analysis is running. Timeline events are appended as they are captured."
-        };
+        AppendLiveNetworkSessions([session]);
+    }
 
-        if (DateTimeOffset.UtcNow - _lastLiveBindingRefresh >= TimeSpan.FromMilliseconds(250))
+    public void AppendLiveNetworkSessions(IEnumerable<NetworkSession> sessions)
+    {
+        var appended = sessions.ToArray();
+        if (appended.Length == 0) return;
+        _liveNetworkBuffer.AddRange(appended);
+        int removed = _liveNetworkBuffer.TrimToMaximum(MaximumLiveHistory);
+        if (removed > 0)
         {
-            _lastLiveBindingRefresh = DateTimeOffset.UtcNow;
-            RefreshLiveBindings();
+            _liveHistoryDropCount += removed;
+            OnPropertyChanged(nameof(LiveCaptureSummary));
         }
+        OnPropertyChanged(nameof(AnalysisSummary));
     }
 
     public void CompleteRun(CaseData data, bool stopped)
     {
         var events = BehaviorCorrelator.Correlate(data.Events).ToArray();
         CurrentCase = data with { Events = events, Artifacts = BuildLiveArtifacts(events, data.Processes) };
+        LiveTimeline.Clear();
         StatusText = stopped ? "Stopped" : "Analysis completed";
         SelectedEvent = CurrentCase.Events.FirstOrDefault();
         IsMonitoring = false;
@@ -615,6 +628,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
     {
         OnPropertyChanged(nameof(CurrentCase));
         OnPropertyChanged(nameof(FilteredEvents));
+        OnPropertyChanged(nameof(TimelineDisplayEvents));
         OnPropertyChanged(nameof(ProcessFilterOptions));
         OnPropertyChanged(nameof(StaticAnalysis));
         OnPropertyChanged(nameof(DllExportCandidates));
@@ -652,6 +666,51 @@ public sealed class MainViewModel : INotifyPropertyChanged
         OnPropertyChanged(nameof(AnalysisSummary));
     }
 
+    private void InsertLiveTimeline(TimelineEvent item)
+    {
+        int low = 0, high = LiveTimeline.Count;
+        while (low < high)
+        {
+            int mid = low + (high - low) / 2;
+            if (TimelineEventOrder.Instance.Compare(LiveTimeline[mid], item) <= 0) low = mid + 1; else high = mid;
+        }
+        LiveTimeline.Insert(low, item);
+    }
+
+    private void RebuildLiveTimeline()
+    {
+        LiveTimeline.Clear();
+        foreach (var item in _liveEventBuffer.Items.Where(MatchesLiveFilters)) LiveTimeline.Add(item);
+        OnPropertyChanged(nameof(TimelineDisplayEvents));
+    }
+
+    private bool MatchesLiveFilters(TimelineEvent item)
+    {
+        if (!string.IsNullOrWhiteSpace(TimelineSearchText))
+        {
+            string q = TimelineSearchText.Trim();
+            if (!Contains(item.Process, q) && !Contains(item.Action, q) && !Contains(item.ObjectValue, q) && !Contains(item.Summary, q) && !Contains(item.TechniqueId, q) && !Contains(item.TechniqueName, q) && !Contains(item.Source, q)) return false;
+        }
+        if (!string.Equals(SelectedProcessFilter, "All Processes", StringComparison.OrdinalIgnoreCase) && !string.Equals(item.Process, SelectedProcessFilter, StringComparison.OrdinalIgnoreCase)) return false;
+        TimeSpan? window = SelectedTimeRange switch { "Last 1 Minute" => TimeSpan.FromMinutes(1), "Last 5 Minutes" => TimeSpan.FromMinutes(5), "Last 15 Minutes" => TimeSpan.FromMinutes(15), _ => null };
+        if (window is not null && _liveEventBuffer.Items.Count > 0 && item.Time < _liveEventBuffer.Items[^1].Time - window.Value) return false;
+        if (!ShowNoiseEvents && IsNoisyEvent(item)) return false;
+        return item.Category switch { EventCategory.Process => ShowProcessEvents, EventCategory.File => ShowFileEvents, EventCategory.Registry => ShowRegistryEvents, EventCategory.Network => ShowNetworkEvents, EventCategory.Dns => ShowDnsEvents, EventCategory.Api => ShowApiEvents, EventCategory.Behavior => ShowBehaviorEvents, _ => true };
+    }
+
+    private sealed class TimelineEventOrder : IComparer<TimelineEvent>
+    {
+        public static TimelineEventOrder Instance { get; } = new();
+        public int Compare(TimelineEvent? x, TimelineEvent? y)
+        {
+            if (ReferenceEquals(x, y)) return 0;
+            if (x is null) return -1; if (y is null) return 1;
+            int byTime = x.Time.CompareTo(y.Time); if (byTime != 0) return byTime;
+            int byCapture = Nullable.Compare(x.CapturedAtUtc, y.CapturedAtUtc); if (byCapture != 0) return byCapture;
+            return x.Id.CompareTo(y.Id);
+        }
+    }
+
     public void ResetTimelineFilters()
     {
         _timelineSearchText = string.Empty;
@@ -686,6 +745,8 @@ public sealed class MainViewModel : INotifyPropertyChanged
     private void OnTimelineFilterChanged()
     {
         OnPropertyChanged(nameof(FilteredEvents));
+        if (IsMonitoring) RebuildLiveTimeline();
+        OnPropertyChanged(nameof(TimelineDisplayEvents));
     }
 
     private IReadOnlyList<TimelineEvent> ApplyTimelineFilters()
