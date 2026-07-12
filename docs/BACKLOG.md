@@ -4,7 +4,7 @@
 
 - 最終更新日: 2026-07-12
 - 調査対象: `README.md`、`docs/`、`src/MRTW.Core/`、`src/MRTW.Collectors.Etw/`、`src/MRTW.Cli/`、`src/MRTW.App/`、`src/MRTW.Native/`、`test/`
-- 主要な懸念: 高頻度イベント時の収集メモリ上限、短命プロセスのETW開始タイミング、Windows実環境での統合試験不足、Privacy Modeとバッチ実行の検証不足
+- 主要な懸念: 高頻度イベント時の収集メモリ上限、短命プロセスのETW開始タイミング、Windows永続化面の観測不足、スクリプト／非PE形式の分析不足、Windows実環境での統合試験不足、Privacy Modeとバッチ実行の検証不足
 - 次に着手すべきタスク: TASK-001
 
 このバックログは、現在の実装・文書・テストから確認できた未対応事項だけを記録する。完了済みのP0/P1 GUI停止・ライブ表示・SQLite入力上限の修正は、重複して登録しない。
@@ -34,7 +34,7 @@
 
 ## 未実装・修正予定の機能
 
-以下のP1〜P3は、上記の実装済み機能を置き換える一覧ではなく、今後実装または調査する残課題である。
+以下のP1〜P3は、上記の実装済み機能を置き換える一覧ではなく、今後実装または調査する残課題である。タスクは13件に限定し、メモリ解析・YARA/YARA-X・capa統合は現方針に従って含めない。
 
 ## 優先順位の定義
 
@@ -130,6 +130,22 @@
 - 依存関係: なし
 - リスク・注意点: `--network block`／`isolated`の失敗を隠蔽してはならない。検体ごとのfail-closed理由をそのまま記録すること。
 
+### TASK-010: Windows永続化面（Startup・Task・Service・WMI）を状態差分として収集する
+
+- 状態: 未着手
+- 規模: L
+- 概要: 現在のランタイム収集はHKCU Run/RunOnceを中心としたレジストリ差分であり、Startup Folder、Task Scheduler、Windows Service、WMI permanent event subscriptionの新規・変更・削除をケースの状態差分として確認できない。これらは実際のマルウェアで用いられる代表的な永続化経路である。
+- 根拠: `docs/architecture.md`はruntime collectionのレジストリ取得をHKCU Run/RunOnceと説明し、`src/MRTW.Core/SnapshotService.cs`もその範囲を取得する。MITRE ATT&CKは、[Boot or Logon Autostart Execution (T1547)](https://attack.mitre.org/techniques/T1547/)にRegistry Run Keys / Startup Folder・Active Setup等を、[Scheduled Task (T1053.005)](https://attack.mitre.org/techniques/T1053/005/)にスケジュールタスクを、[Windows Service (T1543.003)](https://attack.mitre.org/techniques/T1543/003/)にサービス永続化を定義している。
+- 対象: `src/MRTW.Core/SnapshotService.cs`、`src/MRTW.Core/RuntimeCaseCollector.cs`、`src/MRTW.Core/BehaviorCorrelator.cs`、`src/MRTW.Core/Models.cs`、`src/MRTW.Core/CaseExportService.cs`、`test/SafeRuntimeProbe/`、`test/MRTW.RegressionTests/Program.cs`
+- 実装内容: 各永続化面をbefore/afterで正規化して取得し、作成・変更・削除と実行先（コマンド、DLL、service binary、WMI consumer）をタイムラインとArtifactsへ出力する。アクセス拒否・未対応OS・収集上限はCollection Qualityへ残す。管理者権限が必要な面は読み取り不可を明示し、推測結果を生成しない。
+- 完了条件:
+  - [ ] Startup Folder、Task Scheduler、Windows Service、WMI permanent subscriptionの差分を個別に識別できる
+  - [ ] 各差分に根拠となる元データと取得時刻が保存される
+  - [ ] 読み取り権限不足時に「存在しない」と誤表示せず、品質情報へ理由を記録する
+  - [ ] 安全なテストフィクスチャで作成・変更・削除の回帰テストが成功する
+- 依存関係: TASK-003
+- リスク・注意点: ServiceやWMIの列挙は権限・環境差が大きい。収集器が永続化を作成・変更してはならず、読み取り専用に限定すること。
+
 ## P2
 
 ### TASK-006: CLI versionのスキーマ表示を単一の定義へ統一する
@@ -177,6 +193,54 @@
   - [ ] 関連テストが成功する
 - 依存関係: TASK-003
 - リスク・注意点: 検体コピーは証拠保全・AV検知・パス依存挙動に影響する。既定では専用VMでMRTWを管理者起動する案内を維持すること。
+
+### TASK-011: エンコード済みスクリプトとLOLBin連鎖を正規化して分析する
+
+- 状態: 未着手
+- 規模: M
+- 概要: 現在はPowerShell文字列やコマンド候補を抽出・表示するが、Base64等で符号化されたPowerShell、`certutil`・`rundll32`・`regsvr32`・`mshta`等を経由した復号／実行連鎖を、元のコマンド、親子関係、復号後のIOCとして一貫して表示・相関しない。
+- 根拠: `README.md`はPowerShell文字列とCommands Artifactを実装済みとしている。`src/MRTW.App/ViewModels.cs`のCommands Artifactはプロセス名・文字列の一致で候補を作る。MITRE ATT&CKは、[Obfuscated Files or Information (T1027)](https://attack.mitre.org/techniques/T1027/)および[Deobfuscate/Decode Files or Information (T1140)](https://attack.mitre.org/techniques/T1140/)で、Base64・XOR・圧縮・標準ユーティリティを使う復号／実行を代表的な分析対象として示している。
+- 対象: `src/MRTW.Core/RuntimeCaseCollector.cs`、`src/MRTW.Core/HookPipeServer.cs`、`src/MRTW.Core/BehaviorCorrelator.cs`、`src/MRTW.App/ViewModels.cs`、`src/MRTW.Core/CaseExportService.cs`、`test/SyntheticBehaviorCase/`
+- 実装内容: コマンドラインを構文単位で保存し、PowerShellの`-EncodedCommand`、`FromBase64String`、安全に復元できるBase64表現をサイズ上限付きでデコードする。復元に失敗した場合は原文・失敗理由を残す。LOLBin、親子プロセス、直前のファイル書込み／ダウンロードを根拠イベントとして結び、T1027/T1140または実行手法を提示する。
+- 完了条件:
+  - [ ] 安全なBase64 PowerShell・certutil・rundll32・regsvr32・mshtaのフィクスチャで、原文・復元結果・親子関係を確認できる
+  - [ ] デコード対象のサイズ、ネスト深さ、文字コード、失敗を上限付きで記録する
+  - [ ] 復元した内容がraw evidenceを改変せず、JSON/SQLite/HTMLに再現可能な形で保存される
+  - [ ] 関連テストが成功する
+- 依存関係: TASK-001
+- リスク・注意点: 復元処理はコードを実行してはならない。圧縮爆弾、深い再帰、巨大文字列を防ぐ上限を必須とする。
+
+### TASK-012: ホスト設定・セキュリティ設定改ざんの観測範囲を追加する
+
+- 状態: 未着手
+- 規模: M
+- 概要: Run/RunOnce以外のレジストリ値、hostsファイル、WinHTTP/WinINet proxy、Defender除外、Firewall rule等の改ざんは、感染後のC2中継、検知回避、通信妨害を分析する重要な根拠になるが、現在のスナップショット差分では網羅されない。
+- 根拠: `src/MRTW.Core/SnapshotService.cs`は限定されたレジストリ永続化面を収集する。`src/MRTW.Core/BehaviorCorrelator.cs`はWinINet/WinHTTP API観測からProxyを示すが、設定値のbefore/after証拠を取得しない。MITRE ATT&CKの[Modify Registry (T1112)](https://attack.mitre.org/techniques/T1112/)は設定・永続化・防御回避目的のレジストリ改変を、[Hide Artifacts (T1564)](https://attack.mitre.org/techniques/T1564/)は隠し属性・パス除外等の痕跡隠蔽を扱う。
+- 対象: `src/MRTW.Core/SnapshotService.cs`、`src/MRTW.Core/RuntimeCaseCollector.cs`、`src/MRTW.Core/BehaviorCorrelator.cs`、`src/MRTW.Core/Models.cs`、`test/SafeRuntimeProbe/`
+- 実装内容: hosts、proxy設定、ユーザー／マシンの主要なExplorer・Defender・Firewall・Security Center関連設定を、読み取り可能な範囲でbefore/after比較する。変更はキー／値またはファイルdiff、権限状態、収集対象バージョンを添えてタイムライン化する。危険な設定を変更するテストは使わず、事前作成した安全な一時キーとモック可能な抽象化で検証する。
+- 完了条件:
+  - [ ] hosts・proxy・選定した設定面ごとに、変更／未変更／読み取り不能を区別して出力する
+  - [ ] 設定変更のタイムラインには根拠パス・値名・旧値／新値（Privacy Mode適用後）がある
+  - [ ] 収集器自身がFirewall・Defender・hosts設定を変更しないことをテストで確認する
+  - [ ] 関連テストが成功する
+- 依存関係: TASK-003
+- リスク・注意点: セキュリティ製品設定やhostsの実値は機微情報を含む。Privacy Mode、管理者権限、製品差分、OSバージョン差を明示すること。
+
+### TASK-013: 非PE初期侵入形式を安全に静的トリアージする
+
+- 状態: 未着手
+- 規模: M
+- 概要: GUIとCLIの主な対象はEXE/DLLであり、LNK、PowerShell、JavaScript/VBScript、MSI、Office由来のコマンド、ZIP内の一次ファイルなど、マルウェア配布で頻出する非PE形式を実行せずに統一表示する機能がない。
+- 根拠: READMEのGUI操作とCLI `run`はEXE/DLLを対象とし、`src/MRTW.Cli/Program.cs`の`batch`も`.exe`と`.dll`だけを列挙する。MITRE ATT&CKの[T1027](https://attack.mitre.org/techniques/T1027/)は圧縮・暗号化・エンコードされたファイルを、[T1140](https://attack.mitre.org/techniques/T1140/)は復号後の実行を分析対象として挙げている。
+- 対象: `src/MRTW.Core/StaticAnalysisService.cs`、`src/MRTW.Cli/Program.cs`、`src/MRTW.App/`、`src/MRTW.Core/Models.cs`、`test/StaticAnalysisProbe/`、追加する安全なフィクスチャ
+- 実装内容: ファイル種別判定をPE前提から分離し、LNK、PowerShell、JS/VBS、MSI、ZIPを検出して、メタデータ、埋込コマンド、URL、親ファイル、ハッシュ、展開候補を静的結果として出す。アーカイブ展開はファイル数・深さ・合計サイズ・パス走査の上限を持たせ、既定では実行しない。
+- 完了条件:
+  - [ ] 各対応形式を実行せずに種別・主要IOC・抽出コマンドを表示できる
+  - [ ] ZIPのパストラバーサル、暗号化、深い入れ子、過大展開を安全に拒否または警告する
+  - [ ] EXE/DLLの既存静的解析出力との互換性を維持する
+  - [ ] 安全な各形式のフィクスチャで回帰テストが成功する
+- 依存関係: TASK-011
+- リスク・注意点: 非PE解析は「実行可能性」を判定してはならない。Officeやスクリプトの内容は機微情報を含み得るため、エクスポートとPrivacy Modeの扱いを同時に定義すること。
 
 ## P3
 
