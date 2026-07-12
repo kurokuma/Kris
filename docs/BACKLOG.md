@@ -9,6 +9,33 @@
 
 このバックログは、現在の実装・文書・テストから確認できた未対応事項だけを記録する。完了済みのP0/P1 GUI停止・ライブ表示・SQLite入力上限の修正は、重複して登録しない。
 
+## 現在実装済みの主要機能
+
+| 分類 | 実装済みの内容 | 主な根拠・対象 |
+|---|---|---|
+| 静的解析 | MD5/SHA-1/SHA-256、PEヘッダー、Import/Export、Section、Resource、TLS Callback、PDB、.NETメタデータ、Authenticode、文字列・パッカー指標、HTML/JSON/CSV出力 | `README.md`「静的解析」、`src/MRTW.Core/StaticAnalysisService.cs` |
+| 実行・動的収集 | EXE/DLL/コマンド実行、前後スナップショット、レジストリ差分、TCPスナップショット、プロセスツリー、ETW、x64 Native Hook、行動相関、Collection Quality | `README.md`「動的解析」、`src/MRTW.Core/RuntimeCaseCollector.cs`、`src/MRTW.Collectors.Etw/` |
+| 安全制御 | `observe`/`block`/`isolated`のネットワークモード、管理者権限がない場合のfail-closed、起動直前の検体SHA-256再照合、Privacy Mode | `docs/safety.md`、`src/MRTW.Core/NetworkContainmentService.cs`、`RuntimeCaseCollector.cs`、`PrivacyRedactor.cs` |
+| GUI・CLI | WPFでのターゲット選択、静的解析結果、ライブタイムライン、フィルター、Artifacts、ケース読込、エクスポート。CLIのstatic/run/export/batch/selftest/doctor/etw-smoke | `README.md`「WPF GUI」「CLIの使い方」、`src/MRTW.App/`、`src/MRTW.Cli/Program.cs` |
+| ケース管理・出力 | JSON/JSONL/CSV/HTML/SQLite/ZIP、manifest、raw evidence・保存ファイルの整合性確認、JSON/SQLiteの再読込 | `src/MRTW.Core/CaseService.cs`、`CaseExportService.cs`、`EvidencePathPolicy.cs` |
+| 回帰テスト | ネットワークモード、SQLite入出力上限、行動ルール、証拠パス・ハッシュ、Privacy Mode、静的解析上限、ライブバッファの境界 | `test/MRTW.RegressionTests/Program.cs` |
+
+## 完了済みの主な修正・実装
+
+以下は現在のソースに反映済みであり、未着手タスクとして重複登録しない。将来の回帰を防ぐため、関連する残課題だけをP1以降へ登録する。
+
+- 静的解析の詳細結果をWPF GUIへ表示するタブを追加した（Import/Export、Section、Strings、Resources/TLS、Metadata、Indicators）。
+- ケースschema v3、`process_guid`の保存、静的解析結果とCollection QualityのJSON/SQLite往復を実装した。
+- SQLite／case JSON／raw evidence／証拠パスに入力サイズ、ハッシュ、reparse point、信頼済みrootの検証を追加した。
+- 外部行動ルールの検証、評価予算、文字列長上限を実装し、無効ルールは安全にbuiltin ruleへフォールバックするようにした。
+- GUIのStart/Stop/Restart、スナップショットのキャンセル、世代分離したライブ更新、履歴上限、終了時の最終ケース反映を実装した。
+- Hook pipe、GUIライブキュー、静的文字列抽出に上限を設け、超過をCollection Qualityまたは画面へ記録するようにした。
+- 検体の静的解析後から起動までの差替えを検出し、原子的な検証を保証できないUAC直接昇格起動を拒否するようにした。
+
+## 未実装・修正予定の機能
+
+以下のP1〜P3は、上記の実装済み機能を置き換える一覧ではなく、今後実装または調査する残課題である。
+
 ## 優先順位の定義
 
 | 優先度 | 定義 |
