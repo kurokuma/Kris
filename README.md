@@ -270,17 +270,6 @@ verbose: false
 
 詳細は [`test/README.md`](test/README.md) を参照してください。
 
-### P0回帰テスト
-
-外部テストフレームワークに依存しない回帰テストを実行できます。
-
-```powershell
-$env:DOTNET_CLI_HOME = "$PWD\.dotnet-home"
-dotnet run --project test\MRTW.RegressionTests -c Release
-```
-
-現在のテストはネットワークモードのfail-closed設定、共通オーケストレーターの品質情報、UTC取得時刻、SQLiteの往復、Behavior相関の決定性を検証します。
-
 ## リポジトリ構成
 
 ```text
@@ -301,13 +290,3 @@ test/                   安全な検証用プロジェクトとテスト資産
 - [`docs/ui_spec.md`](docs/ui_spec.md)
 - [`docs/build.md`](docs/build.md)
 - [`docs/safety.md`](docs/safety.md)
-
-## 現在の制約
-
-- Windows専用です。
-- Native Hook/Injectorはx64のみです。
-- カーネルドライバー、VMの作成・スナップショット復元、HTTPS復号、メモリダンプ解析、YARA/capa、外部IOC照合は実装していません。
-- `isolated` はWindows Firewallによる解析中のマシン全体の通信遮断です。VMそのものの作成、ホストからの分離、解析後のロールバックは行いません。
-- ETWやHookで得られる範囲は権限、対象アーキテクチャ、プロセス保護、Windowsの構成に依存します。
-- Behavior/Technique分類は調査支援用であり、悪性判定を保証するものではありません。
-- Snapshotは対象の作業ディレクトリ、TEMP、AppDataなどを上限付きで走査するため、完全なファイルシステム差分ではありません。
