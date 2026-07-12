@@ -1,5 +1,6 @@
 using MRTW.Collectors.Etw;
 using MRTW.Core;
+using Microsoft.Data.Sqlite;
 
 var tests = new List<(string Name, Action Body)>
 {
@@ -7,10 +8,13 @@ var tests = new List<(string Name, Action Body)>
     ("unsupported network mode fails", TestInvalidNetworkMode),
     ("shared orchestrator produces quality metadata", TestOrchestratorQuality),
     ("SQLite preserves UTC and quality", TestSqliteRoundTrip),
+    ("SQLite rejects oversized text before materialization", TestOversizedSqliteText),
+    ("SQLite rejects oversized event text before materialization", TestOversizedEventText),
     ("behavior correlation remains deterministic", TestBehaviorCorrelation),
     ("enhanced static analysis emits structured PE metadata", TestEnhancedStaticAnalysis),
     ("schema v3 manifest and enhanced static metadata round trip", TestSchemaV3),
     ("invalid behavior rules fall back safely", TestInvalidRulesFallback),
+    ("behavior rule text bounds fall back safely", TestRuleTextBounds),
     ("behavior rule order and exclusions are enforced", TestRuleConstraints),
     ("untrusted evidence paths are not exported", TestUntrustedEvidenceExport),
     ("tampered raw evidence is rejected", TestTamperedRawEvidence),
@@ -96,6 +100,52 @@ static void TestBehaviorCorrelation()
     Equal(correlated.Count, correlated.Select(e => e.Id).Distinct().Count());
 }
 
+static void TestOversizedSqliteText()
+{
+    string root = Path.Combine(Path.GetTempPath(), "mrtw-sqlite-limit-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        Directory.CreateDirectory(root);
+        var data = new CaseData("limit", "limit", "x", "x", "", DateTimeOffset.UtcNow, TimeSpan.Zero, null, [], [], [], [], "");
+        new CaseExportService().WriteCaseBundle(data, root, new ExportOptions("sqlite", Compress: false));
+        using (var connection = new SqliteConnection($"Data Source={Path.Combine(root, "case.sqlite")};Pooling=False"))
+        {
+            connection.Open();
+            using var command = connection.CreateCommand();
+            command.CommandText = "INSERT INTO static_analysis(json) VALUES($json)";
+            command.Parameters.AddWithValue("$json", new string('x', 16 * 1024 * 1024 + 1));
+            command.ExecuteNonQuery();
+        }
+
+        var loaded = new CaseService().Load(Path.Combine(root, "case.sqlite"));
+        True(loaded.StaticAnalysis is null, "oversized static JSON was accepted");
+    }
+    finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
+}
+
+static void TestOversizedEventText()
+{
+    string root = Path.Combine(Path.GetTempPath(), "mrtw-event-limit-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        Directory.CreateDirectory(root);
+        var eventItem = new TimelineEvent(1, TimeSpan.Zero, "x", 1, EventCategory.Api, "A", "", "", EventSeverity.Low, "", "{}", CapturedAtUtc: DateTimeOffset.UtcNow);
+        var data = new CaseData("event-limit", "event-limit", "x", "x", "", DateTimeOffset.UtcNow, TimeSpan.Zero, null, [], [eventItem], [], [], "");
+        new CaseExportService().WriteCaseBundle(data, root, new ExportOptions("sqlite", Compress: false));
+        using (var connection = new SqliteConnection($"Data Source={Path.Combine(root, "case.sqlite")};Pooling=False"))
+        {
+            connection.Open();
+            using var command = connection.CreateCommand();
+            command.CommandText = "UPDATE events SET captured_at_utc=$value";
+            command.Parameters.AddWithValue("$value", new string('x', 64 * 1024 + 1));
+            command.ExecuteNonQuery();
+        }
+
+        Throws<InvalidDataException>(() => new CaseService().Load(Path.Combine(root, "case.sqlite")));
+    }
+    finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
+}
+
 static void TestEnhancedStaticAnalysis()
 {
     string target = typeof(StaticAnalysisService).Assembly.Location;
@@ -140,6 +190,20 @@ static void TestInvalidRulesFallback()
         File.WriteAllText(file, "[{}]"); Environment.SetEnvironmentVariable("MRTW_BEHAVIOR_RULES", file);
         var correlated = BehaviorCorrelator.Correlate([E(1, "VirtualAllocEx"), E(2, "WriteProcessMemory"), E(3, "CreateRemoteThread")]);
         True(correlated.Any(e => e.Action == "Remote Thread Injection"), "invalid rules did not use fallback");
+    }
+    finally { Environment.SetEnvironmentVariable("MRTW_BEHAVIOR_RULES", null); File.Delete(file); }
+}
+
+static void TestRuleTextBounds()
+{
+    string file = Path.GetTempFileName();
+    try
+    {
+        string tactic = new('t', 161);
+        File.WriteAllText(file, $$"""[{"action":"too-long-tactic","summary":"test","severity":"High","technique_id":"T0001","technique_name":"Test","confidence":"High","actions":["VirtualAllocEx","WriteProcessMemory","CreateRemoteThread"],"version":"1","tactic":"{{tactic}}"}]""");
+        Environment.SetEnvironmentVariable("MRTW_BEHAVIOR_RULES", file);
+        var correlated = BehaviorCorrelator.Correlate([E(1, "VirtualAllocEx"), E(2, "WriteProcessMemory"), E(3, "CreateRemoteThread")]);
+        True(correlated.Any(e => e.Action == "Remote Thread Injection"), "oversized emitted rule field did not fall back");
     }
     finally { Environment.SetEnvironmentVariable("MRTW_BEHAVIOR_RULES", null); File.Delete(file); }
 }

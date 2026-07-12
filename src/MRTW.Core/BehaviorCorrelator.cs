@@ -13,6 +13,10 @@ public static class BehaviorCorrelator
 
         var output = events.OrderBy(e => e.Time).ToList();
         int nextId = output.Count == 0 ? 1 : output.Max(e => e.Id) + 1;
+        // Configurable rules are untrusted input.  Keep their total work bounded across
+        // all process groups; built-in correlations below remain complete.
+        var ruleBudget = new RuleEvaluationBudget();
+        var configuredRules = BehaviorRuleLoader.Load();
         foreach (var group in output.Where(e => e.Category != EventCategory.Behavior).GroupBy(e => e.Pid))
         {
             AddProcessInjection(output, group.ToArray(), ref nextId);
@@ -35,26 +39,32 @@ public static class BehaviorCorrelator
             AddNetworkConfigurationActivity(output, group.ToArray(), ref nextId);
             AddExceptionBasedEvasion(output, group.ToArray(), ref nextId);
             AddSystemEnvironmentProfiling(output, group.ToArray(), ref nextId);
-            AddConfiguredRules(output, group.ToArray(), ref nextId);
+            AddConfiguredRules(output, group.ToArray(), ref nextId, ruleBudget, configuredRules);
         }
 
         return output.OrderBy(e => e.Time).Select((e, index) => e with { Id = index + 1 }).ToArray();
     }
 
-    private static void AddConfiguredRules(List<TimelineEvent> output, IReadOnlyList<TimelineEvent> events, ref int nextId)
+    private static void AddConfiguredRules(List<TimelineEvent> output, IReadOnlyList<TimelineEvent> events, ref int nextId, RuleEvaluationBudget budget, IReadOnlyList<BehaviorRule> rules)
     {
         const int MaxEventsPerGroup = 20_000;
         const int MaxOrderedChecksPerRule = 2_048;
-        const long MaxOrderedComparisons = 1_000_000;
         var orderedGroup = events.OrderBy(e => e.Time).ThenBy(e => e.Id).Take(MaxEventsPerGroup).ToArray();
-        foreach (var rule in BehaviorRuleLoader.Load())
+        foreach (var rule in rules)
         {
+            // Each rule needs one pass over the group.  Do not begin a partial rule
+            // evaluation once the case-level budget is exhausted.
+            if (!budget.TryConsumeEventChecks(orderedGroup.Length)) return;
             var actionSet = rule.Actions.ToHashSet(StringComparer.OrdinalIgnoreCase);
             var excludeSet = (rule.ExcludeActions ?? []).ToHashSet(StringComparer.OrdinalIgnoreCase);
             var counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-            var nextExclude = new int[orderedGroup.Length]; int next = -1;
-            for (int i = orderedGroup.Length - 1; i >= 0; i--) { if (excludeSet.Contains(orderedGroup[i].Action)) next = i; nextExclude[i] = next; }
-            int left = 0, excludes = 0, orderedChecks = 0, totalMatches = 0; long orderedComparisons = 0;
+            int[]? nextExclude = null;
+            if (excludeSet.Count > 0)
+            {
+                nextExclude = new int[orderedGroup.Length]; int next = -1;
+                for (int i = orderedGroup.Length - 1; i >= 0; i--) { if (excludeSet.Contains(orderedGroup[i].Action)) next = i; nextExclude[i] = next; }
+            }
+            int left = 0, excludes = 0, orderedChecks = 0, totalMatches = 0;
             for (int right = 0; right < orderedGroup.Length; right++)
             {
                 var added = orderedGroup[right]; if (actionSet.Contains(added.Action)) { counts[added.Action] = counts.GetValueOrDefault(added.Action) + 1; totalMatches++; } if (excludeSet.Contains(added.Action)) excludes++;
@@ -63,15 +73,33 @@ public static class BehaviorCorrelator
                     var removed = orderedGroup[left++]; if (actionSet.Contains(removed.Action)) { if (--counts[removed.Action] == 0) counts.Remove(removed.Action); totalMatches--; } if (excludeSet.Contains(removed.Action)) excludes--;
                 }
                 bool applies = excludes == 0 && (rule.RequireAll ? rule.Actions.All(counts.ContainsKey) : totalMatches >= Math.Max(1, rule.MinimumMatches));
-                if (applies && nextExclude[left] >= 0 && orderedGroup[nextExclude[left]].Time <= orderedGroup[left].Time.Add(TimeSpan.FromSeconds(rule.TimeWindowSeconds))) applies = false;
+                if (applies && nextExclude is not null && nextExclude[left] >= 0 && orderedGroup[nextExclude[left]].Time <= orderedGroup[left].Time.Add(TimeSpan.FromSeconds(rule.TimeWindowSeconds))) applies = false;
                 if (applies && rule.RequireOrder)
                 {
-                    if (++orderedChecks > MaxOrderedChecksPerRule || (orderedComparisons += right - left + 1) > MaxOrderedComparisons) break;
+                    if (++orderedChecks > MaxOrderedChecksPerRule || !budget.TryConsumeOrderedComparisons(right - left + 1)) break;
                     int cursor = 0; for (int i = left; i <= right; i++) if (cursor < rule.Actions.Count && orderedGroup[i].Action.Equals(rule.Actions[cursor], StringComparison.OrdinalIgnoreCase)) cursor++;
                     applies = cursor == rule.Actions.Count;
                 }
                 if (applies) { var evidence = orderedGroup[left..(right + 1)].Where(e => actionSet.Contains(e.Action)).ToArray(); AddBehavior(output, evidence, ref nextId, rule.Action, $"{rule.Summary} [rule_version={rule.Version}; tactic={rule.Tactic}; rule_hash={rule.RuleHash}]", rule.Severity, rule.TechniqueId, rule.TechniqueName, rule.Confidence); break; }
             }
+        }
+    }
+
+    private sealed class RuleEvaluationBudget
+    {
+        private const long MaxEventChecks = 1_500_000;
+        private const long MaxOrderedComparisons = 1_000_000;
+        private long _remainingEventChecks = MaxEventChecks;
+        private long _remainingOrderedComparisons = MaxOrderedComparisons;
+
+        public bool TryConsumeEventChecks(int count) => TryConsume(ref _remainingEventChecks, count);
+        public bool TryConsumeOrderedComparisons(int count) => TryConsume(ref _remainingOrderedComparisons, count);
+
+        private static bool TryConsume(ref long remaining, int count)
+        {
+            if (count < 0 || remaining < count) return false;
+            remaining -= count;
+            return true;
         }
     }
 

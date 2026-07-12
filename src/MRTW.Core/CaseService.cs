@@ -109,7 +109,7 @@ public sealed class CaseService
         connection.Open();
 
         using var caseCommand = connection.CreateCommand();
-        caseCommand.CommandText = "SELECT case_id, case_name, sample_name, sample_path, sha256, started_at, duration_seconds, analyst_notes FROM cases LIMIT 1";
+        caseCommand.CommandText = "SELECT case_id, case_name, sample_name, sample_path, sha256, started_at, duration_seconds, analyst_notes, length(case_id) AS __len0, length(case_name) AS __len1, length(sample_name) AS __len2, length(sample_path) AS __len3, length(sha256) AS __len4, length(started_at) AS __len5, length(analyst_notes) AS __len7 FROM cases LIMIT 1";
         using var caseReader = caseCommand.ExecuteReader();
         if (!caseReader.Read())
         {
@@ -163,8 +163,9 @@ public sealed class CaseService
     {
         if (!HasTable(connection, table)) return default;
         using var command = connection.CreateCommand();
-        command.CommandText = $"SELECT json FROM {table} LIMIT 1";
-        try { return command.ExecuteScalar() is string json && json.Length <= 4 * 1024 * 1024 ? JsonSerializer.Deserialize<T>(json, InputJsonOptions) : default; }
+        command.CommandText = $"SELECT json, length(json) AS __len0 FROM {table} LIMIT 1";
+        using var reader = command.ExecuteReader();
+        try { return reader.Read() && Text(reader, 0, 4 * 1024 * 1024) is string json && !string.IsNullOrEmpty(json) ? JsonSerializer.Deserialize<T>(json, InputJsonOptions) : default; }
         catch { return default; }
     }
 
@@ -175,11 +176,11 @@ public sealed class CaseService
             return null;
         }
         using var command = connection.CreateCommand();
-        command.CommandText = "SELECT json FROM case_quality LIMIT 1";
-        object? value = command.ExecuteScalar();
+        command.CommandText = "SELECT json, length(json) AS __len0 FROM case_quality LIMIT 1";
+        using var reader = command.ExecuteReader();
         try
         {
-            return value is string json && json.Length <= 1024 * 1024 ? JsonSerializer.Deserialize<CaseQuality>(json, InputJsonOptions) : null;
+            return reader.Read() && Text(reader, 0, 1024 * 1024) is string json && !string.IsNullOrEmpty(json) ? JsonSerializer.Deserialize<CaseQuality>(json, InputJsonOptions) : null;
         }
         catch
         {
@@ -195,16 +196,13 @@ public sealed class CaseService
         }
 
         using var command = connection.CreateCommand();
-        command.CommandText = "SELECT json FROM static_analysis LIMIT 1";
-        object? value = command.ExecuteScalar();
-        if (value is not string json || string.IsNullOrWhiteSpace(json))
-        {
-            return null;
-        }
-
+        command.CommandText = "SELECT json, length(json) AS __len0 FROM static_analysis LIMIT 1";
+        using var reader = command.ExecuteReader();
         try
         {
-            return json.Length <= 16 * 1024 * 1024 ? JsonSerializer.Deserialize<StaticAnalysisResult>(json, InputJsonOptions) : null;
+            if (!reader.Read()) return null;
+            string json = Text(reader, 0, 16 * 1024 * 1024);
+            return string.IsNullOrWhiteSpace(json) ? null : JsonSerializer.Deserialize<StaticAnalysisResult>(json, InputJsonOptions);
         }
         catch
         {
@@ -215,7 +213,7 @@ public sealed class CaseService
     private static IEnumerable<ProcessNode> ReadProcesses(SqliteConnection connection)
     {
         using var command = connection.CreateCommand();
-        command.CommandText = "SELECT pid, parent_pid, name, process_guid, command_line, image_path, start_time, end_time, event_count, network_count, file_count, registry_count FROM processes ORDER BY start_time LIMIT 100001";
+        command.CommandText = "SELECT pid, parent_pid, name, process_guid, command_line, image_path, start_time, end_time, event_count, network_count, file_count, registry_count, length(name) AS __len2, length(process_guid) AS __len3, length(command_line) AS __len4, length(image_path) AS __len5, length(start_time) AS __len6, length(end_time) AS __len7 FROM processes ORDER BY start_time LIMIT 100001";
         using var reader = command.ExecuteReader();
         int count = 0;
         while (reader.Read())
@@ -240,11 +238,16 @@ public sealed class CaseService
         bool hasProcessGuid = HasColumn(connection, "events", "process_guid");
         bool hasCapturedAtUtc = HasColumn(connection, "events", "captured_at_utc");
         using var command = connection.CreateCommand();
-        command.CommandText = hasProcessGuid && hasCapturedAtUtc
-            ? "SELECT id, time, process, pid, process_guid, category, action, object_value, summary, technique_id, technique_name, confidence, severity, source, raw_json, captured_at_utc FROM events ORDER BY id LIMIT 1000001"
+        string fields = hasProcessGuid && hasCapturedAtUtc
+            ? "id, time, process, pid, process_guid, category, action, object_value, summary, technique_id, technique_name, confidence, severity, source, raw_json, captured_at_utc"
             : hasProcessGuid
-            ? "SELECT id, time, process, pid, process_guid, category, action, object_value, summary, technique_id, technique_name, confidence, severity, source, raw_json FROM events ORDER BY id LIMIT 1000001"
-            : "SELECT id, time, process, pid, category, action, object_value, summary, technique_id, technique_name, confidence, severity, source, raw_json FROM events ORDER BY id LIMIT 1000001";
+            ? "id, time, process, pid, process_guid, category, action, object_value, summary, technique_id, technique_name, confidence, severity, source, raw_json"
+            : "id, time, process, pid, category, action, object_value, summary, technique_id, technique_name, confidence, severity, source, raw_json";
+        int lastEventColumn = hasProcessGuid && hasCapturedAtUtc ? 15 : hasProcessGuid ? 14 : 13;
+        // Enumerable.Range takes a count, so this deliberately includes the final
+        // TEXT ordinal (legacy raw_json and v3 captured_at_utc).
+        string lengths = string.Join(", ", Enumerable.Range(1, lastEventColumn).Where(i => i != 3).Select(i => $"length({EventTextColumn(i, hasProcessGuid, hasCapturedAtUtc)}) AS __len{i}"));
+        command.CommandText = $"SELECT {fields}, {lengths} FROM events ORDER BY id LIMIT 1000001";
         using var reader = command.ExecuteReader();
         int count = 0;
         while (reader.Read())
@@ -274,7 +277,7 @@ public sealed class CaseService
     private static IEnumerable<ArtifactItem> ReadArtifacts(SqliteConnection connection)
     {
         using var command = connection.CreateCommand();
-        command.CommandText = "SELECT type, value, first_seen, last_seen, event_count, related_processes, severity FROM artifacts LIMIT 250001";
+        command.CommandText = "SELECT type, value, first_seen, last_seen, event_count, related_processes, severity, length(type) AS __len0, length(value) AS __len1, length(first_seen) AS __len2, length(last_seen) AS __len3, length(related_processes) AS __len5, length(severity) AS __len6 FROM artifacts LIMIT 250001";
         using var reader = command.ExecuteReader();
         int count = 0;
         while (reader.Read())
@@ -295,7 +298,10 @@ public sealed class CaseService
         using var command = connection.CreateCommand();
         bool v3 = HasColumn(connection, "network_sessions", "coverage");
         bool http = HasColumn(connection, "network_sessions", "http_method");
-        command.CommandText = "SELECT process, domain, resolved_ip, remote_ip, port, protocol, first_seen, bytes_sent, bytes_received, user_agent, sni" + (v3 ? ", dns_status, dns_answers, coverage" : "") + (http ? ", http_method, http_host, http_uri, http_headers" : "") + " FROM network_sessions LIMIT 250001";
+        string fields = "process, domain, resolved_ip, remote_ip, port, protocol, first_seen, bytes_sent, bytes_received, user_agent, sni" + (v3 ? ", dns_status, dns_answers, coverage" : "") + (http ? ", http_method, http_host, http_uri, http_headers" : "");
+        int networkFieldCount = 11 + (v3 ? 3 : 0) + (http ? 4 : 0);
+        string lengths = string.Join(", ", Enumerable.Range(0, networkFieldCount).Where(i => i is not 4 and not 7 and not 8).Select(i => $"length({NetworkTextColumn(i, v3, http)}) AS __len{i}"));
+        command.CommandText = $"SELECT {fields}, {lengths} FROM network_sessions LIMIT 250001";
         using var reader = command.ExecuteReader();
         int count = 0;
         while (reader.Read())
@@ -310,28 +316,62 @@ public sealed class CaseService
                 reader.GetInt64(8),
                 Text(reader, 9), Text(reader, 10),
                 v3 ? Text(reader, 11) : "", v3 ? Text(reader, 12) : "", v3 ? Text(reader, 13) : "metadata-only",
-                http ? Text(reader, 14) : "", http ? Text(reader, 15) : "", http ? Text(reader, 16) : "", http ? Text(reader, 17, 256 * 1024) : "");
+                http ? Text(reader, v3 ? 14 : 11) : "", http ? Text(reader, v3 ? 15 : 12) : "", http ? Text(reader, v3 ? 16 : 13) : "", http ? Text(reader, v3 ? 17 : 14, 256 * 1024) : "");
         }
     }
 
     private static string Text(SqliteDataReader reader, int index, int maxChars = 64 * 1024)
     {
         if (reader.IsDBNull(index)) return "";
-        // Microsoft.Data.Sqlite 9 can access-violate on GetChars(..., null, ...).
-        // SQLite file size and row limits bound allocation; enforce the logical cell cap immediately after materialization.
+        int lengthIndex;
+        try { lengthIndex = reader.GetOrdinal($"__len{index}"); }
+        catch (ArgumentOutOfRangeException)
+        {
+            // PRAGMA metadata only. Data-bearing queries always provide SQL-side lengths.
+            lengthIndex = -1;
+        }
+        if (lengthIndex >= 0 && !reader.IsDBNull(lengthIndex) && reader.GetInt64(lengthIndex) > maxChars)
+            throw new InvalidDataException("SQLite text cell limit exceeded.");
+        // Microsoft.Data.Sqlite 9 can access-violate on GetChars(..., null, ...), so
+        // use the SQL-side length above before materializing the managed string.
         string value = reader.GetString(index);
         if (value.Length > maxChars) throw new InvalidDataException("SQLite text cell limit exceeded.");
         return value;
     }
 
+    private static string EventTextColumn(int index, bool hasProcessGuid, bool hasCapturedAtUtc) =>
+        (hasProcessGuid, hasCapturedAtUtc, index) switch
+        {
+            (_, _, 1) => "time", (_, _, 2) => "process",
+            (true, _, 4) => "process_guid",
+            (_, _, var i) => (i - (hasProcessGuid ? 1 : 0)) switch
+            {
+                4 => "category", 5 => "action", 6 => "object_value", 7 => "summary", 8 => "technique_id", 9 => "technique_name", 10 => "confidence", 11 => "severity", 12 => "source", 13 => "raw_json", 14 => "captured_at_utc", _ => throw new InvalidOperationException("Unexpected event text column.")
+            }
+        };
+
+    private static string NetworkTextColumn(int index, bool v3, bool http) => index switch
+    {
+        0 => "process", 1 => "domain", 2 => "resolved_ip", 3 => "remote_ip", 5 => "protocol", 6 => "first_seen", 9 => "user_agent", 10 => "sni",
+        11 when v3 => "dns_status", 12 when v3 => "dns_answers", 13 when v3 => "coverage",
+        11 when !v3 && http => "http_method", 12 when !v3 && http => "http_host", 13 when !v3 && http => "http_uri", 14 when !v3 && http => "http_headers",
+        14 when v3 && http => "http_method", 15 when v3 && http => "http_host", 16 when v3 && http => "http_uri", 17 when v3 && http => "http_headers",
+        _ => throw new InvalidOperationException("Unexpected network text column.")
+    };
+
     private static bool HasColumn(SqliteConnection connection, string table, string column)
     {
         using var command = connection.CreateCommand();
-        command.CommandText = $"PRAGMA table_info({table})";
+        command.CommandText = table switch
+        {
+            "events" => "SELECT name, length(name) AS __len0 FROM pragma_table_info('events')",
+            "network_sessions" => "SELECT name, length(name) AS __len0 FROM pragma_table_info('network_sessions')",
+            _ => throw new ArgumentOutOfRangeException(nameof(table), "Only known case tables may be inspected.")
+        };
         using var reader = command.ExecuteReader();
         while (reader.Read())
         {
-            if (Text(reader, 1, 256).Equals(column, StringComparison.OrdinalIgnoreCase))
+            if (Text(reader, 0, 256).Equals(column, StringComparison.OrdinalIgnoreCase))
             {
                 return true;
             }

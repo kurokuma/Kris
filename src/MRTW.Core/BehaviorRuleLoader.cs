@@ -38,10 +38,12 @@ internal static class BehaviorRuleLoader
         !string.IsNullOrWhiteSpace(r.Summary) && r.Summary.Length <= 2000 &&
         !string.IsNullOrWhiteSpace(r.TechniqueId) && r.TechniqueId.Length <= 32 &&
         !string.IsNullOrWhiteSpace(r.TechniqueName) && r.TechniqueName.Length <= 160 &&
+        !string.IsNullOrWhiteSpace(r.Confidence) && r.Confidence.Length <= 40 &&
         !string.IsNullOrWhiteSpace(r.Version) && r.Version.Length <= 40 &&
+        r.Tactic.Length <= 160 &&
         r.Actions is { Count: > 0 and <= 64 } && r.Actions.All(a => !string.IsNullOrWhiteSpace(a) && a.Length <= 160) &&
         r.MinimumMatches is >= 1 and <= 64 && r.TimeWindowSeconds is >= 1 and <= 86400 &&
-        (r.ExcludeActions?.Count ?? 0) <= 64;
+        (r.ExcludeActions?.Count ?? 0) <= 64 && (r.ExcludeActions?.All(a => !string.IsNullOrWhiteSpace(a) && a.Length <= 160) ?? true);
 
     private static BehaviorRule[] Fallback =>
     [new("Remote Thread Injection", "External rule: remote allocation, write, and thread creation were observed.", EventSeverity.High, "T1055", "Process Injection", "High", ["VirtualAllocEx", "WriteProcessMemory", "CreateRemoteThread"], Version: "builtin-1", Tactic: "Defense Evasion", RequireOrder: true)];
