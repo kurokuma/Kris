@@ -6,6 +6,7 @@ namespace MRTW.Core;
 public sealed class CaseService
 {
     private const long MaxCaseBytes = 64L * 1024 * 1024;
+    private static readonly byte[] Utf8Bom = [0xEF, 0xBB, 0xBF];
     private static readonly JsonSerializerOptions InputJsonOptions = new(JsonDefaults.Options) { MaxDepth = 32 };
     public CaseData Load(string casePath)
     {
@@ -17,7 +18,7 @@ public sealed class CaseService
         string caseJson = ResolveCaseJson(casePath);
         var info = new FileInfo(caseJson);
         if (info.Length > MaxCaseBytes) throw new InvalidDataException("Case JSON exceeds the 64 MiB input limit.");
-        var loaded = JsonSerializer.Deserialize<CaseData>(File.ReadAllBytes(caseJson), InputJsonOptions)
+        var loaded = DeserializeCaseJson(caseJson)
             ?? throw new InvalidOperationException($"Could not load case JSON: {caseJson}");
         Validate(loaded);
         return loaded with { TrustedEvidenceRoot = Path.GetDirectoryName(Path.GetFullPath(caseJson))! };
@@ -51,7 +52,7 @@ public sealed class CaseService
             try
             {
                 if (new FileInfo(caseJson).Length > MaxCaseBytes) continue;
-                var data = JsonSerializer.Deserialize<CaseData>(File.ReadAllBytes(caseJson), InputJsonOptions);
+                var data = DeserializeCaseJson(caseJson);
                 if (data is not null)
                 {
                     Validate(data);
@@ -65,6 +66,15 @@ public sealed class CaseService
         }
 
         return summaries.OrderByDescending(s => s.StartedAt).ToArray();
+    }
+
+    private static CaseData? DeserializeCaseJson(string path)
+    {
+        byte[] bytes = File.ReadAllBytes(path);
+        // CaseExportService writes UTF-8 text. Accept its BOM as well as BOM-free JSON from other producers.
+        ReadOnlySpan<byte> json = bytes.AsSpan();
+        if (json.StartsWith(Utf8Bom)) json = json[Utf8Bom.Length..];
+        return JsonSerializer.Deserialize<CaseData>(json, InputJsonOptions);
     }
 
     public void SaveNotes(string casePath, string notes)

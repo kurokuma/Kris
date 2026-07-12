@@ -268,6 +268,15 @@ verbose: false
 - `NativeExportProbe`: DLL Export解析と `rundll32` 実行選択の確認
 - `NativeSafeRuntimeProbe`: Native Hook観測用の安全なネイティブ検体
 
+通常の回帰と安全プローブは次で実行できます。
+
+```powershell
+dotnet run --project test\MRTW.RegressionTests -c Release
+dotnet run --project test\MRTW.ProbeTests -c Release
+```
+
+隔離VMでのみ実行するETW/containment統合試験は `test\Run-IsolatedVmIntegration.ps1`、対話デスクトップでのみ実行するGUI smoke testは `test\Run-GuiSmoke.ps1` を使います。どちらも環境変数による明示的なopt-inが必要で、通常のビルドやテストでは実行されません。詳細は [`test/README.md`](test/README.md) を参照してください。
+
 詳細は [`test/README.md`](test/README.md) を参照してください。
 
 ## リポジトリ構成

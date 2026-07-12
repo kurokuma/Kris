@@ -85,12 +85,12 @@
 
 ### TASK-003: Windows隔離環境で実行するETW・Native Hook・containmentの統合試験を自動化する
 
-- 状態: 未着手
+  - 状態: ブロック中
 - 規模: L
 - 概要: 現在の回帰スイートは.NETの依存なし実行ファイルであり、実際のETWプロバイダー、Native Hook DLL／injector、Windows Firewall containmentを通した検証を行わない。実機依存機能の回帰を継続的に検出できない。
 - 根拠: `test/MRTW.RegressionTests/MRTW.RegressionTests.csproj` はCoreとETWプロジェクトのみを参照し、`Program.cs`の21件は主にモデル・保存・境界テストである。`docs/safety.md` はETWとNative Hookの正確性検証には制御されたWindows環境が必要と明記し、`test/README.md` は`SafeRuntimeProbe`をhook/ETW smoke test用と定義している。
 - 対象: `test/SafeRuntimeProbe/`、`test/NativeSafeRuntimeProbe/`、`test/NativeExportProbe/`、`src/MRTW.Native/`、`test/`の統合試験用スクリプト、CIまたは隔離VM実行手順
-- 実装内容: 管理者権限を持つ隔離Windows VM向けの統合試験ランナーを作る。SafeRuntimeProbeとNativeSafeRuntimeProbeで、ETWイベント、Hook pipeイベント、子プロセス追跡、`observe`／`block`／`isolated`の許可・失敗時fail-closed、Stop、エクスポート内容を検証する。通常のクロスプラットフォーム回帰とは分離する。
+  - 実装内容: 管理者権限を持つ隔離Windows VM向けの統合試験ランナーを作る。SafeRuntimeProbeとNativeSafeRuntimeProbeで、ETWイベント、Hook pipeイベント、子プロセス追跡、`observe`／`block`／`isolated`の許可・失敗時fail-closed、Stop、エクスポート内容を検証する。通常のクロスプラットフォーム回帰とは分離する。`test/Run-IsolatedVmIntegration.ps1` にゲート付きの初期ランナーを実装済みだが、実際の隔離VM・管理者・Native成果物での実行証跡が未取得のため完了扱いにしない。
 - 完了条件:
   - [ ] ネイティブhook/injectorをCMakeでビルドし、試験用出力へ配置できる
   - [ ] 隔離VMでETW・Hookそれぞれの取得結果とCollection Qualityを機械判定できる
@@ -101,17 +101,17 @@
 
 ### TASK-004: Privacy Modeの全エクスポート形式に対する漏えい回帰試験を追加する
 
-- 状態: 未着手
+  - 状態: 完了
 - 規模: M
 - 概要: Privacy Modeはパス、ユーザー名、ホスト名、プライベートIP、raw evidence、保存ファイルをマスクまたは除外する仕様だが、既存の回帰はプロファイル設定とraw ETLパスの無効化だけを確認している。HTML、CSV、JSON、JSONL、SQLite、ZIPでの実データ漏えいを検出する試験が必要である。
 - 根拠: `README.md` はPrivacy Modeがユーザープロファイル名等をマスクすると説明する。`src/MRTW.Core/PrivacyRedactor.cs` は複数フィールドを変換し、`CaseExportService`は複数形式へ出力する。一方、`test/MRTW.RegressionTests/Program.cs`のPrivacyテストは`ExecutionProfile.PrivacyMode`を確認するのみで、各ファイル内容を検証していない。
 - 対象: `src/MRTW.Core/PrivacyRedactor.cs`、`src/MRTW.Core/CaseExportService.cs`、`test/MRTW.RegressionTests/Program.cs`
 - 実装内容: 固定のユーザー名・ホスト名・プライベートIP・ユーザープロファイルパス・raw/preserved evidenceを含むケースフィクスチャを用意し、全形式をPrivacy Modeでエクスポートする。アーカイブを展開して機密文字列が残らないこと、必要な分析メタデータは残ることを検証する。
 - 完了条件:
-  - [ ] HTML、CSV、JSON、JSONL、SQLite、ZIPの全出力を検査する
-  - [ ] 固定した機密フィクスチャ文字列が出力に存在しない
-  - [ ] `RawEvidence`と`PreservedFiles`がPrivacy Mode出力に含まれない
-  - [ ] 関連テストが成功する
+    - [x] HTML、CSV、JSON、JSONL、SQLite、ZIPの全出力を検査する
+    - [x] 固定した機密フィクスチャ文字列が出力に存在しない
+    - [x] `RawEvidence`と`PreservedFiles`がPrivacy Mode出力に含まれない
+    - [x] 関連テストが成功する
 - 依存関係: なし
 - リスク・注意点: 正規表現だけに依存せず、URL、JSON値、CSV引用、SQLite TEXT、ZIP内ファイルを個別に確認すること。マスキングし過ぎてIOCや時刻を失わないこと。
 
@@ -262,7 +262,7 @@
 ## 保留事項
 
 - メモリ解析、YARA/YARA-X、capa統合は、現在は不要という方針が明示されているため、本バックログの実装タスクには登録しない。
-- GUIの実ユーザー操作を通す自動テスト方式（WPF UI Automation、隔離VMでの手動承認を伴うsmoke testなど）は、CI環境と利用可能なWindowsセッションの情報が不足している。TASK-003の設計時に決定する。
+- GUIの実ユーザー操作を通す自動テストは `test/Run-GuiSmoke.ps1` とAutomationIdを追加したが、CI環境と利用可能なWindows対話セッションの情報が不足しており、実行証跡は未取得である。通常実行には含めない。
 - ネットワークのパケット本文・TLS指標は現実装で未対応だが、取得・保管の権限とプライバシー要件が未確定のためP3の評価タスクに留める。
 
 ## 調査メモ

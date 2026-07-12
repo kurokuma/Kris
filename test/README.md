@@ -14,11 +14,12 @@ This folder contains benign validation helpers for MRTW.
 
 ## Projects
 
-- `SafeRuntimeProbe`: a harmless executable that performs temporary file, HKCU registry, DLL-load, COM init, localhost-only network, and echo child-process actions.
+- `SafeRuntimeProbe`: a harmless executable that performs temporary file, HKCU registry, DLL-load, COM init, loopback HTTP/TCP, UDP, explicit loopback address mapping, and echo child-process actions. It never calls the system DNS resolver. Its cleanup observation JSON is created only beneath `%TEMP%\MRTW-Probe\observations` with a file-name-only argument.
 - `SyntheticBehaviorCase`: generates a MRTW `case.json` with synthetic events for dangerous behaviors without executing those behaviors.
 - `StaticAnalysisProbe`: a harmless executable that embeds static-analysis markers such as URLs, domains, registry paths, file paths, command strings, and export-like names without executing them.
 - `NativeExportProbe`: a harmless DLL that exports `DllRegisterServer`, `Start`, and `Run` for validating PE export table parsing and rundll32 export selection.
 - `MRTW.RegressionTests`: a dependency-free executable regression suite for P0 orchestration, containment-mode validation, UTC event timestamps, SQLite quality round-trips, and deterministic behavior correlation.
+- `MRTW.ProbeTests`: launches the built SafeRuntimeProbe and asserts only loopback HTTP/TCP, UDP, local-only address mapping and cleanup observation. The native direct runner is skipped unless `MRTW_NATIVE_SAFE_PROBE_PATH` explicitly names a built benign binary.
 
 Use `SafeRuntimeProbe` as a real target for hook/ETW smoke tests. Use `SyntheticBehaviorCase` for UI, filtering, and behavior-correlation validation.
 Use `StaticAnalysisProbe` as a stable target for `mrtw static` and string/classification checks. For this .NET sample, point static analysis at `bin\Release\net9.0\StaticAnalysisProbe.dll`; the generated `.exe` is the .NET apphost and mostly contains host/runtime strings.
@@ -27,4 +28,11 @@ Run the regression suite with:
 
 ```powershell
 dotnet run --project test\MRTW.RegressionTests -c Release
+dotnet run --project test\MRTW.ProbeTests -c Release
 ```
+
+## Opt-in Windows integration and GUI smoke tests
+
+`Run-IsolatedVmIntegration.ps1` is intentionally gated by `MRTW_ISOLATED_VM=1`, Windows, elevation, and an explicit disposable-VM sentinel file (`%SystemDrive%\MRTW_DISPOSABLE_VM_OK` containing `MRTW_DISPOSABLE_VM=YES`). `block`/`isolated` additionally require `-AllowContainment`. It uses Privacy Mode for retained artifacts and never enables containment by default.
+
+`Run-GuiSmoke.ps1` is intentionally gated by `MRTW_GUI_TESTS=1` and an interactive desktop. It uses built-in UI Automation IDs to verify static-target setup, enabled Start/Stop transitions, terminal stop state, collection-quality visibility, synthetic-case open, and a Privacy Mode export artifact. The gated `--smoke-target`, `--smoke-case`, and `--smoke-export` app arguments exist only for this script. Neither runner is part of normal builds or test commands.

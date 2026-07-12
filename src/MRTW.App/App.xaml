@@ -1,8 +1,7 @@
 ﻿<Application x:Class="MRTW.App.App"
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-             xmlns:local="clr-namespace:MRTW.App"
-             StartupUri="MainWindow.xaml">
+             xmlns:local="clr-namespace:MRTW.App">
     <Application.Resources>
         <SolidColorBrush x:Key="AppBg" Color="#07111C" />
         <SolidColorBrush x:Key="PanelBg" Color="#0C1724" />

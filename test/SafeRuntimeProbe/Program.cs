@@ -1,8 +1,10 @@
 using System.Diagnostics;
 using System.Net.Sockets;
+using System.Net;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using System.Text;
+using System.Text.Json;
 using Microsoft.Win32;
 
 [assembly: SupportedOSPlatform("windows")]
@@ -18,8 +20,21 @@ RunFileProbe(root);
 RunRegistryProbe();
 RunDllLoadProbe();
 RunComProbe();
-await RunLocalhostProbeAsync();
+var networkObservation = await RunLocalhostProbeAsync();
 RunChildProcessProbe();
+
+string observationName = args.Length == 1 ? args[0] : "network-observation.json";
+if (!string.Equals(observationName, Path.GetFileName(observationName), StringComparison.Ordinal) || !observationName.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
+    throw new ArgumentException("Observation argument must be a JSON file name without a path.");
+string observationDirectory = Path.Combine(root, "observations");
+Directory.CreateDirectory(observationDirectory);
+string observationPath = Path.Combine(observationDirectory, observationName);
+await using (var output = new FileStream(observationPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+await using (var writer = new Utf8JsonWriter(output, new JsonWriterOptions { Indented = true }))
+{
+    JsonSerializer.Serialize(writer, networkObservation);
+}
+Console.WriteLine($"network observation: {observationPath}");
 
 Console.WriteLine("MRTW SafeRuntimeProbe completed.");
 
@@ -102,27 +117,49 @@ static void RunComProbe()
     Console.WriteLine("com probe complete");
 }
 
-static async Task RunLocalhostProbeAsync()
+static async Task<LocalhostObservation> RunLocalhostProbeAsync()
 {
+    using var listener = new TcpListener(IPAddress.Loopback, 0);
+    listener.Start();
+    int tcpPort = ((IPEndPoint)listener.LocalEndpoint).Port;
+    Task<string> server = Task.Run(async () =>
+    {
+        using TcpClient accepted = await listener.AcceptTcpClientAsync();
+        using var reader = new StreamReader(accepted.GetStream(), Encoding.ASCII, leaveOpen: true);
+        string request = await reader.ReadLineAsync() ?? string.Empty;
+        byte[] response = Encoding.ASCII.GetBytes("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        await accepted.GetStream().WriteAsync(response);
+        return request;
+    });
     using var client = new TcpClient();
-    try
-    {
-        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(300));
-        await client.ConnectAsync("127.0.0.1", 9, cts.Token);
-    }
-    catch
-    {
-        // Expected on most hosts. The goal is only a localhost connection attempt.
-    }
+    await client.ConnectAsync(IPAddress.Loopback, tcpPort);
+    byte[] requestBytes = Encoding.ASCII.GetBytes("GET /mrtw-safe-probe HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    await client.GetStream().WriteAsync(requestBytes);
+    byte[] responseBuffer = new byte[128];
+    _ = await client.GetStream().ReadAsync(responseBuffer);
+    string requestLine = await server.WaitAsync(TimeSpan.FromSeconds(2));
 
-    Console.WriteLine("localhost probe complete");
+    using var udpServer = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+    int udpPort = ((IPEndPoint)udpServer.Client.LocalEndPoint!).Port;
+    using var udpClient = new UdpClient(AddressFamily.InterNetwork);
+    byte[] udpPayload = Encoding.ASCII.GetBytes("MRTW-safe-udp");
+    await udpClient.SendAsync(udpPayload, udpPayload.Length, new IPEndPoint(IPAddress.Loopback, udpPort));
+    UdpReceiveResult udpResult = await udpServer.ReceiveAsync().WaitAsync(TimeSpan.FromSeconds(2));
+
+    // Do not call the system resolver: a broken hosts/DNS configuration could emit external traffic.
+    // The probe validates MRTW's localhost-only endpoint handling with explicit loopback addresses.
+    IPAddress[] localhostAddresses = [IPAddress.Loopback, IPAddress.IPv6Loopback];
+    var observation = new LocalhostObservation("127.0.0.1", tcpPort, udpPort, requestLine,
+        Encoding.ASCII.GetString(udpResult.Buffer), localhostAddresses.Select(address => address.ToString()).ToArray(), true);
+    Console.WriteLine("localhost HTTP/TCP and UDP probe complete; local-only address mapping was used.");
+    return observation;
 }
 
 static void RunChildProcessProbe()
 {
     using var process = Process.Start(new ProcessStartInfo
     {
-        FileName = Environment.GetEnvironmentVariable("COMSPEC") ?? "cmd.exe",
+        FileName = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "cmd.exe"),
         Arguments = "/d /c echo MRTW SafeRuntimeProbe child process",
         UseShellExecute = false,
         CreateNoWindow = true,
@@ -185,3 +222,5 @@ internal static partial class NativeMethods
     [DllImport("ole32.dll")]
     internal static extern void CoUninitialize();
 }
+
+internal sealed record LocalhostObservation(string Endpoint, int TcpPort, int UdpPort, string HttpRequestLine, string UdpPayload, IReadOnlyList<string> DnsAddresses, bool CleanupComplete);

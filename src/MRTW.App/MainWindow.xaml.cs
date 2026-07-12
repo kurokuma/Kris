@@ -37,6 +37,31 @@ public partial class MainWindow : Window
         _runTimer.Tick += (_, _) => _viewModel.UpdateRunDuration();
     }
 
+    /// <summary>Opt-in UI-test helper. It is intentionally unavailable unless the test gate is set.</summary>
+    public async Task LoadSmokeTargetAsync(string targetPath)
+    {
+        if (!string.Equals(Environment.GetEnvironmentVariable("MRTW_GUI_TESTS"), "1", StringComparison.Ordinal))
+            throw new InvalidOperationException("GUI smoke support is disabled.");
+        var analysis = await Task.Run(() => new StaticAnalysisService().Analyze(targetPath));
+        if (!_viewModel.IsMonitoring) _viewModel.SelectTarget(targetPath, analysis);
+    }
+
+    public async Task LoadSmokeCaseAsync(string casePath)
+    {
+        if (!string.Equals(Environment.GetEnvironmentVariable("MRTW_GUI_TESTS"), "1", StringComparison.Ordinal))
+            throw new InvalidOperationException("GUI smoke support is disabled.");
+        var data = await Task.Run(() => new CaseService().Load(casePath));
+        if (!_viewModel.IsMonitoring) _viewModel.LoadCaseData(data);
+    }
+
+    public async Task ExportSmokeCaseAsync(string outputRoot)
+    {
+        if (!string.Equals(Environment.GetEnvironmentVariable("MRTW_GUI_TESTS"), "1", StringComparison.Ordinal))
+            throw new InvalidOperationException("GUI smoke support is disabled.");
+        await Task.Run(() => _viewModel.ExportCase(_viewModel.CurrentCase, outputRoot, privacyMode: true));
+        _viewModel.StatusText = "Case exported";
+    }
+
     private async void OpenTarget_Click(object sender, RoutedEventArgs e)
     {
         var dialog = new OpenFileDialog

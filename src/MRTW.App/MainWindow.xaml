@@ -115,13 +115,13 @@
                         <ColumnDefinition Width="170" />
                     </Grid.ColumnDefinitions>
                     <TextBlock Text="Sample:" FontWeight="SemiBold" VerticalAlignment="Center" Foreground="{StaticResource TextPrimary}" />
-                    <TextBlock Grid.Column="1" Text="{Binding CurrentCase.SampleName}" Foreground="{StaticResource AccentBlue}" FontWeight="Bold" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+                    <TextBlock Grid.Column="1" AutomationProperties.AutomationId="CurrentSampleText" Text="{Binding CurrentCase.SampleName}" Foreground="{StaticResource AccentBlue}" FontWeight="Bold" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
                     <TextBlock Grid.Column="2" Text="MD5:" Foreground="{StaticResource TextSecondary}" VerticalAlignment="Center" />
                     <TextBlock Grid.Column="3" Text="{Binding StaticAnalysis.Md5}" Foreground="#B8C6D8" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
                     <TextBlock Grid.Column="4" Text="Analysis Profile:" VerticalAlignment="Center" Foreground="{StaticResource TextPrimary}" />
                     <TextBlock Grid.Column="5" Text="{Binding SelectedProfile.DisplayName}" Foreground="{StaticResource AccentBlue}" VerticalAlignment="Center" Margin="8,0,0,0" TextTrimming="CharacterEllipsis" />
-                    <Button Grid.Column="6" Style="{StaticResource PrimaryButton}" Content="Start" Click="Start_Click" Width="104" IsEnabled="{Binding CanStart}" />
-                    <Button Grid.Column="7" Style="{StaticResource DangerButton}" Content="Stop" Click="Stop_Click" Width="92" IsEnabled="{Binding CanStop}" />
+                    <Button Grid.Column="6" AutomationProperties.AutomationId="StartAnalysisButton" Style="{StaticResource PrimaryButton}" Content="Start" Click="Start_Click" Width="104" IsEnabled="{Binding CanStart}" />
+                    <Button Grid.Column="7" AutomationProperties.AutomationId="StopAnalysisButton" Style="{StaticResource DangerButton}" Content="Stop" Click="Stop_Click" Width="92" IsEnabled="{Binding CanStop}" />
                     <Button Grid.Column="8" Content="Restart" Click="Restart_Click" Width="104" IsEnabled="{Binding CanStop}" />
                     <StackPanel Grid.Column="9" VerticalAlignment="Center" HorizontalAlignment="Right">
                         <TextBlock Text="Run Duration" Foreground="{StaticResource TextSecondary}" HorizontalAlignment="Right" />
@@ -152,7 +152,7 @@
                             <TextBlock Style="{StaticResource SectionTitle}" Text="ANALYSIS STATUS" />
                             <UniformGrid Columns="2" Margin="0,0,0,12">
                                 <TextBlock Style="{StaticResource Muted}" Text="State" />
-                                <TextBlock Text="{Binding StatusText}" Foreground="#66D36E" />
+                                <TextBlock AutomationProperties.AutomationId="AnalysisStatusText" Text="{Binding StatusText}" Foreground="#66D36E" />
                                 <TextBlock Style="{StaticResource Muted}" Text="Target" />
                                 <TextBlock Text="{Binding SelectedTargetDisplay}" TextTrimming="CharacterEllipsis" />
                                 <TextBlock Style="{StaticResource Muted}" Text="Profile" />
@@ -273,7 +273,7 @@
                                 </Grid>
                                 <Button Grid.Column="3" Content="Filter" Padding="8,4" Click="Filter_Click" />
                             </Grid>
-                            <DataGrid x:Name="TimelineGrid" ItemsSource="{Binding TimelineDisplayEvents}" SelectedItem="{Binding SelectedEvent}" Margin="0">
+                            <DataGrid x:Name="TimelineGrid" AutomationProperties.AutomationId="TimelineGrid" ItemsSource="{Binding TimelineDisplayEvents}" SelectedItem="{Binding SelectedEvent}" Margin="0">
                                 <DataGrid.Columns>
                                     <DataGridTextColumn Header="Time" Binding="{Binding Time}" Width="112" />
                                     <DataGridTextColumn Header="Process" Binding="{Binding Process}" Width="130" />
@@ -549,7 +549,7 @@
                                     <TextBlock Style="{StaticResource Muted}" Text="Registry events" />
                                     <TextBlock Text="{Binding RegistryEventCount}" />
                                     <TextBlock Style="{StaticResource Muted}" Text="Collection quality" />
-                                    <TextBlock Text="{Binding CollectionQualityStatus}" Foreground="{StaticResource AccentBlue}" />
+                                    <TextBlock AutomationProperties.AutomationId="CollectionQualityText" Text="{Binding CollectionQualityStatus}" Foreground="{StaticResource AccentBlue}" />
                                 </UniformGrid>
                                 <TextBlock Text="{Binding CollectionQualitySummary}" TextWrapping="Wrap" Foreground="{StaticResource TextSecondary}" Margin="0,0,0,8" />
                                 <TextBlock Text="{Binding LiveCaptureSummary}" TextWrapping="Wrap" Foreground="{StaticResource TextSecondary}" Margin="0,0,0,8" />

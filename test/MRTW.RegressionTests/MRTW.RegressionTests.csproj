@@ -8,6 +8,7 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\MRTW.Core\MRTW.Core.csproj" />
     <ProjectReference Include="..\..\src\MRTW.Collectors.Etw\MRTW.Collectors.Etw.csproj" />
+    <ProjectReference Include="..\StaticAnalysisProbe\StaticAnalysisProbe.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.6" />

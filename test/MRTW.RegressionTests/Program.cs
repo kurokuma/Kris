@@ -1,6 +1,7 @@
 using MRTW.Collectors.Etw;
 using MRTW.Core;
 using Microsoft.Data.Sqlite;
+using System.IO.Compression;
 
 var tests = new List<(string Name, Action Body)>
 {
@@ -8,10 +9,12 @@ var tests = new List<(string Name, Action Body)>
     ("unsupported network mode fails", TestInvalidNetworkMode),
     ("shared orchestrator produces quality metadata", TestOrchestratorQuality),
     ("SQLite preserves UTC and quality", TestSqliteRoundTrip),
+    ("JSON case export with UTF-8 BOM round trips", TestJsonBomRoundTrip),
     ("SQLite rejects oversized text before materialization", TestOversizedSqliteText),
     ("SQLite rejects oversized event text before materialization", TestOversizedEventText),
     ("behavior correlation remains deterministic", TestBehaviorCorrelation),
     ("enhanced static analysis emits structured PE metadata", TestEnhancedStaticAnalysis),
+    ("static analysis probe markers are automatically asserted from DLL", TestStaticAnalysisProbeMarkers),
     ("schema v3 manifest and enhanced static metadata round trip", TestSchemaV3),
     ("invalid behavior rules fall back safely", TestInvalidRulesFallback),
     ("behavior rule text bounds fall back safely", TestRuleTextBounds),
@@ -19,6 +22,8 @@ var tests = new List<(string Name, Action Body)>
     ("untrusted evidence paths are not exported", TestUntrustedEvidenceExport),
     ("tampered raw evidence is rejected", TestTamperedRawEvidence),
     ("privacy profile disables raw ETL path", TestPrivacyProfile),
+    ("privacy export redacts every portable format", TestPortablePrivacyRedaction),
+    ("synthetic persistence and configuration events round trip", TestSyntheticPersistenceConfigRoundTrip),
     ("evidence generations do not collide", TestEvidenceGenerationCollision),
     ("cancellation before launch never starts target", TestCancellationBeforeLaunch),
     ("snapshot cancellation is immediate and bounded", TestSnapshotCancellation),
@@ -173,6 +178,20 @@ static void TestSqliteRoundTrip()
     }
 }
 
+static void TestJsonBomRoundTrip()
+{
+    string root = Path.Combine(Path.GetTempPath(), "mrtw-json-bom-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        var data = new CaseData("json-bom", "json-bom", "sample.exe", "sample.exe", "hash", DateTimeOffset.UtcNow, TimeSpan.Zero, null, [], [], [], [], "");
+        new CaseExportService().WriteCaseBundle(data, root, new ExportOptions("json", Compress: false));
+        byte[] bytes = File.ReadAllBytes(Path.Combine(root, "case.json"));
+        True(bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF, "test fixture did not contain UTF-8 BOM");
+        Equal("json-bom", new CaseService().Load(Path.Combine(root, "case.json")).CaseId);
+    }
+    finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
+}
+
 static void TestBehaviorCorrelation()
 {
     var events = new[]
@@ -239,6 +258,17 @@ static void TestEnhancedStaticAnalysis()
     True(result.DotNetMetadata?.Count > 0, ".NET metadata summary missing");
     True(result.Imports.Any(i => i.Contains('!')), "structured imports missing");
     True(result.VersionInfo is not null, "version information missing");
+}
+
+static void TestStaticAnalysisProbeMarkers()
+{
+    string target = Path.Combine(FindRepositoryRoot(), "test", "StaticAnalysisProbe", "bin", "Release", "net9.0", "StaticAnalysisProbe.dll");
+    True(File.Exists(target), "StaticAnalysisProbe DLL was not built");
+    var result = new StaticAnalysisService().Analyze(target);
+    True(result.IsDotNet, "probe DLL was not identified as .NET");
+    True(result.SuspiciousStrings.Any(s => s.Contains("analysis-probe.example.test", StringComparison.OrdinalIgnoreCase)), "probe domain marker missing");
+    True(result.SuspiciousStrings.Any(s => s.Contains("StaticAnalysisProbe", StringComparison.OrdinalIgnoreCase)), "probe registry/path marker missing");
+    True(result.SuspiciousStrings.Any(s => s.Contains("powershell.exe", StringComparison.OrdinalIgnoreCase)), "probe command marker missing");
 }
 
 static void TestSchemaV3()
@@ -338,6 +368,73 @@ static void TestPrivacyProfile()
 {
     var profile = new ExecutionProfile("x", "exe", "none", null, "x", Environment.CurrentDirectory, 1, true, false, false, false, "observe", ExecuteTarget: false, PrivacyMode: true);
     Equal(true, profile.PrivacyMode);
+}
+
+static void TestPortablePrivacyRedaction()
+{
+    string root = Path.Combine(Path.GetTempPath(), "mrtw-privacy-" + Guid.NewGuid().ToString("N"));
+    string secretUser = Environment.UserName;
+    string secretHost = Environment.MachineName;
+    const string secretIp = "10.23.45.67";
+    try
+    {
+        var now = DateTimeOffset.UtcNow;
+        var evt = new TimelineEvent(1, TimeSpan.Zero, "probe", 7, EventCategory.Network, "Connect", $@"C:\Users\{secretUser}\probe", $"{secretHost} {secretIp}", EventSeverity.Low, "test", $"raw {secretUser} {secretHost} {secretIp}", CapturedAtUtc: now);
+        var process = new ProcessNode("probe", 7, null, "guid", $@"C:\Users\{secretUser}\run.exe", $@"C:\Users\{secretUser}\run.exe", now, null, 1, 0, 0, 0);
+        var network = new NetworkSession("probe", "localhost", secretIp, secretIp, 80, "TCP", TimeSpan.Zero, 0, 0, "", "");
+        string evidencePath = $@"C:\Users\{secretUser}\evidence.etl";
+        var data = new CaseData("privacy", "privacy", "probe", $@"C:\Users\{secretUser}\sample.exe", "hash", now, TimeSpan.Zero, null, [process], [evt], [new ArtifactItem("path", $@"C:\Users\{secretUser}\a", now, now, 1, secretHost, EventSeverity.Low)], [network], $"{secretUser} {secretHost} {secretIp}", RawEvidenceFiles: [evidencePath], PreservedFiles: [new(evidencePath, evidencePath, 1, "hash", "test")])
+        {
+            RawEvidence = [new(evidencePath, 1, "hash", "test")]
+        };
+        new CaseExportService().WriteCaseBundle(data, root, new ExportOptions("all", PrivacyMode: true, IncludeRaw: true, Compress: true));
+        string[] expected = ["case.json", "events.jsonl", "raw_events.jsonl", "timeline.csv", "artifacts.csv", "processes.csv", "network.csv", "report.html", "case.sqlite", "case_export.zip"];
+        foreach (string name in expected) True(File.Exists(Path.Combine(root, name)), "privacy export missing " + name);
+        AssertNoSecrets(Directory.EnumerateFiles(root, "*", SearchOption.TopDirectoryOnly).Where(p => !p.EndsWith(".zip", StringComparison.OrdinalIgnoreCase)), secretUser, secretHost, secretIp);
+        var redacted = new CaseService().Load(Path.Combine(root, "case.json"));
+        True(redacted.RawEvidence.Count == 0 && redacted.RawEvidenceFiles?.Count == 0 && redacted.PreservedFiles?.Count == 0, "privacy export retained evidence references");
+        string extract = Path.Combine(root, "zip"); ZipFile.ExtractToDirectory(Path.Combine(root, "case_export.zip"), extract);
+        AssertNoSecrets(Directory.EnumerateFiles(extract, "*", SearchOption.AllDirectories), secretUser, secretHost, secretIp);
+    }
+    finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
+}
+
+static void TestSyntheticPersistenceConfigRoundTrip()
+{
+    string root = Path.Combine(Path.GetTempPath(), "mrtw-synthetic-state-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        var now = DateTimeOffset.UtcNow;
+        var events = new[]
+        {
+            new TimelineEvent(1, TimeSpan.Zero, "synthetic.exe", 1, EventCategory.Task, "Scheduled Task Created", @"\\MRTW-Safe-Test", "synthetic only", EventSeverity.Medium, "Synthetic", "{}", CapturedAtUtc: now),
+            new TimelineEvent(2, TimeSpan.FromSeconds(1), "synthetic.exe", 1, EventCategory.Service, "Service Configuration Changed", "MRTW-Safe-Test", "synthetic only", EventSeverity.Medium, "Synthetic", "{}", CapturedAtUtc: now),
+            new TimelineEvent(3, TimeSpan.FromSeconds(2), "synthetic.exe", 1, EventCategory.Registry, "Proxy Setting Changed", @"HKCU\Software\MRTW\Synthetic", "synthetic only", EventSeverity.Medium, "Synthetic", "{}", CapturedAtUtc: now)
+        };
+        var data = new CaseData("synthetic-state", "synthetic-state", "synthetic.exe", "synthetic.exe", "hash", now, TimeSpan.Zero, null, [], events, [], [], "synthetic only");
+        new CaseExportService().WriteCaseBundle(data, root, new ExportOptions("json,sqlite", Compress: false));
+        var loaded = new CaseService().Load(Path.Combine(root, "case.sqlite"));
+        Equal(3, loaded.Events.Count);
+        True(loaded.Events.All(e => e.Source == "Synthetic"), "synthetic state roundtrip changed source");
+    }
+    finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
+}
+
+static void AssertNoSecrets(IEnumerable<string> paths, params string[] secrets)
+{
+    foreach (string path in paths)
+    {
+        string content = File.ReadAllText(path);
+        foreach (string secret in secrets)
+            True(!content.Contains(secret, StringComparison.OrdinalIgnoreCase), $"privacy export leaked {secret} in {Path.GetFileName(path)}");
+    }
+}
+
+static string FindRepositoryRoot()
+{
+    for (var current = new DirectoryInfo(Directory.GetCurrentDirectory()); current is not null; current = current.Parent)
+        if (File.Exists(Path.Combine(current.FullName, "MRTW.sln"))) return current.FullName;
+    throw new DirectoryNotFoundException("MRTW.sln not found.");
 }
 
 static void TestEvidenceGenerationCollision()
