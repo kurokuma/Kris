@@ -54,7 +54,8 @@ public sealed class AnalysisOrchestrator
             int pid = await rootPid.Task.ConfigureAwait(false);
             TimeSpan? duration = profile.DurationSeconds is int seconds ? TimeSpan.FromSeconds(Math.Max(1, seconds)) : null;
             etwTask = Task.Run(() => new TraceEventEtwCollector().Collect(
-                new EtwCollectorOptions(pid, duration, FollowDescendants: true, CaseStartedAtUtc: context.StartedAtUtc),
+                new EtwCollectorOptions(pid, duration, FollowDescendants: true, CaseStartedAtUtc: context.StartedAtUtc,
+                    RawTracePath: profile.PrivacyMode ? null : Path.Combine(Path.GetTempPath(), "MRTW", context.CaseId, "raw_evidence", "network-process.etl")),
                 etwStop.Token,
                 item =>
                 {
@@ -123,7 +124,7 @@ public sealed class AnalysisOrchestrator
                 runtimeFailed ? "Runtime execution or live delivery reported a failure." : ""),
             new("Hook", hookStatus, runtimeStarted, ended, combined.Count(e => e.Source.Equals("Hook", StringComparison.OrdinalIgnoreCase)), combined.Count(e => e.Action == "Hook Parse Failure"),
                 hookFailed ? "One or more hook adapters or injection operations failed." : ""),
-            new("ETW", etwStatus, etwStarted, ended, etw?.Events.Count ?? 0, 0, etw?.ErrorMessage ?? "")
+            new("ETW", etwStatus, etwStarted, ended, etw?.Events.Count ?? 0, 0, (etw?.ErrorMessage ?? "") + " Raw kernel ETL is system-wide; persisted structured events are filtered to the target PID tree.")
         };
         string overall = collectors.Any(c => c.Status == "degraded" || c.Status == "unavailable" && c.Collector != "Hook")
             ? "degraded"
@@ -136,9 +137,18 @@ public sealed class AnalysisOrchestrator
             Artifacts = artifacts,
             NetworkSessions = network,
             Duration = ended - data.StartedAt,
-            AnalystNotes = data.AnalystNotes + $" Collection quality: {overall}. Network containment: {containment.Message}",
-            Quality = new CaseQuality(overall, collectors, containment.Message, true)
+            AnalystNotes = data.AnalystNotes + $" Collection quality: {overall}. Network containment: {containment.Message} Evidence staging uses the current Windows token; export rehash rejects detected temporary-evidence changes but does not provide cross-token tamper-proof storage.",
+            Quality = new CaseQuality(overall, collectors, containment.Message, true),
+            RawEvidenceFiles = etw?.RawTracePath is string raw && File.Exists(raw) ? [raw] : data.RawEvidenceFiles,
+            RawEvidence = BuildRawEvidence(etw)
         };
+    }
+
+    private static IReadOnlyList<RawEvidenceFile> BuildRawEvidence(EtwCollectionResult? etw)
+    {
+        if (etw?.RawTracePath is not string path || !File.Exists(path)) return [];
+        try { using var stream = File.OpenRead(path); return [new(path, stream.Length, Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(stream)).ToLowerInvariant(), "system-wide kernel ETL; structured events are target PID-tree filtered")]; }
+        catch { return []; }
     }
 
     private static IReadOnlyList<ProcessNode> MergeProcessNodes(CaseData data, IReadOnlyList<TimelineEvent> events)

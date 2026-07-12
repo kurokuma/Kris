@@ -39,6 +39,9 @@ public sealed class RuntimeCaseCollector
         int callbackFailures = 0;
 
         SnapshotData before = profile.SnapshotBefore ? _snapshot.Capture(profile) : EmptySnapshot();
+        var prestaged = profile.SnapshotBefore
+            ? _snapshot.PreserveChangedFiles(new SnapshotDiff(before.Files.Where(f => f.IsExecutable || (f.AlternateStreams?.Count ?? 0) > 0).Take(64).ToArray(), [], [], [], [], [], []), caseId, "before")
+            : [];
         var seenTcpConnections = before.TcpConnections.ToHashSet(StringComparer.OrdinalIgnoreCase);
         Process? process = null;
         int? pid = null;
@@ -50,6 +53,23 @@ public sealed class RuntimeCaseCollector
         void Add(TimelineEvent timelineEvent)
         {
             events.Add(timelineEvent);
+            if (timelineEvent.Source.Equals("Hook", StringComparison.OrdinalIgnoreCase) && timelineEvent.Category is EventCategory.Network or EventCategory.Dns)
+            {
+                try
+                {
+                    using var doc = JsonDocument.Parse(timelineEvent.RawJson);
+                    string S(string name) => doc.RootElement.TryGetProperty(name, out var v) ? v.ToString() : "";
+                    long L(string name) => long.TryParse(S(name), out long value) ? value : 0;
+                    string host = S("host"); if (string.IsNullOrWhiteSpace(host)) host = S("server_name");
+                    string uri = S("uri"); if (string.IsNullOrWhiteSpace(uri)) uri = S("object_name");
+                    string remote = S("remote_ip"); if (string.IsNullOrWhiteSpace(remote)) remote = timelineEvent.ObjectValue;
+                    int port = int.TryParse(S("port"), out int parsedPort) ? parsedPort : 0;
+                    networks.Add(new NetworkSession(timelineEvent.Process, host, S("resolved_ip"), remote, port,
+                        timelineEvent.Category == EventCategory.Dns ? "DNS" : "Hook", timelineEvent.Time, L("bytes_sent"), L("bytes_received"), S("user_agent"), S("sni"),
+                        S("status"), S("answers"), "native hook API metadata; no packet/TLS payload", S("method"), host, uri, S("headers")));
+                }
+                catch { }
+            }
             try
             {
                 onEvent?.Invoke(timelineEvent);
@@ -331,6 +351,13 @@ public sealed class RuntimeCaseCollector
 
         SnapshotData after = profile.SnapshotAfter ? _snapshot.Capture(profile) : EmptySnapshot();
         SnapshotDiff diff = _snapshot.Diff(before, after);
+        if (File.Exists(profile.TargetPath) && staticAnalysis is not null && new FileInfo(profile.TargetPath).Length <= 32L * 1024 * 1024)
+        {
+            var targetInfo = new FileInfo(profile.TargetPath);
+            var staged = new FileSnapshotEntry(targetInfo.FullName, targetInfo.Length, targetInfo.LastWriteTimeUtc, staticAnalysis.Sha256, targetInfo.Attributes.ToString());
+            diff = diff with { AddedFiles = diff.AddedFiles.Prepend(staged).DistinctBy(f => f.Path, StringComparer.OrdinalIgnoreCase).ToArray() };
+        }
+        var preservedFiles = _snapshot.PreserveChangedFiles(diff, caseId, "after").Concat(prestaged.Where(p => diff.DeletedFiles.Contains(p.OriginalPath, StringComparer.OrdinalIgnoreCase)).Select(p => p with { Reason = "deleted-high-risk-prestage" })).DistinctBy(p => p.StoredPath, StringComparer.OrdinalIgnoreCase).ToArray();
         AddSnapshotEvents(Add, diff, started, ref nextId);
         AddNetworkEvents(Add, networks, diff, seenTcpConnections, started, ref nextId);
         if (callbackFailures > 0)
@@ -366,7 +393,8 @@ public sealed class RuntimeCaseCollector
             correlatedEvents.OrderBy(e => e.Time).ToArray(),
             artifacts,
             networks,
-            notes);
+            notes,
+            PreservedFiles: preservedFiles) { TrustedEvidenceRoot = EvidencePathPolicy.Root(caseId) };
     }
 
     private static Process StartProcess(ExecutionProfile profile)
@@ -887,12 +915,12 @@ public sealed class RuntimeCaseCollector
     {
         foreach (var file in diff.AddedFiles.Take(80))
         {
-            add(Event(nextId++, DateTimeOffset.Now - started, "snapshot", 0, EventCategory.File, "Create", file.Path, $"Created {file.Size} bytes", EventSeverity.Medium, "Snapshot"));
+            add(Event(nextId++, DateTimeOffset.Now - started, "snapshot", 0, EventCategory.File, "Create", file.Path, $"Created {file.Size} bytes; executable={file.IsExecutable}; timestamp_anomaly={file.TimestampAnomaly}; ads={string.Join(',', file.AlternateStreams ?? [])}; sha256={file.Sha256}", file.IsExecutable || (file.AlternateStreams?.Count ?? 0) > 0 ? EventSeverity.High : EventSeverity.Medium, "Snapshot"));
         }
 
         foreach (var file in diff.ModifiedFiles.Take(80))
         {
-            add(Event(nextId++, DateTimeOffset.Now - started, "snapshot", 0, EventCategory.File, "Write", file.Path, $"Modified {file.Size} bytes", EventSeverity.Medium, "Snapshot"));
+            add(Event(nextId++, DateTimeOffset.Now - started, "snapshot", 0, EventCategory.File, "Write", file.Path, $"Modified {file.Size} bytes; executable={file.IsExecutable}; timestamp_anomaly={file.TimestampAnomaly}; ads={string.Join(',', file.AlternateStreams ?? [])}; sha256={file.Sha256}", file.IsExecutable || file.TimestampAnomaly || (file.AlternateStreams?.Count ?? 0) > 0 ? EventSeverity.High : EventSeverity.Medium, "Snapshot"));
         }
 
         foreach (string file in diff.DeletedFiles.Take(40))

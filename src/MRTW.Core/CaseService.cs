@@ -5,6 +5,8 @@ namespace MRTW.Core;
 
 public sealed class CaseService
 {
+    private const long MaxCaseBytes = 64L * 1024 * 1024;
+    private static readonly JsonSerializerOptions InputJsonOptions = new(JsonDefaults.Options) { MaxDepth = 32 };
     public CaseData Load(string casePath)
     {
         if (File.Exists(casePath) && Path.GetFileName(casePath).Equals("case.sqlite", StringComparison.OrdinalIgnoreCase))
@@ -13,8 +15,12 @@ public sealed class CaseService
         }
 
         string caseJson = ResolveCaseJson(casePath);
-        return JsonSerializer.Deserialize<CaseData>(File.ReadAllText(caseJson), JsonDefaults.Options)
+        var info = new FileInfo(caseJson);
+        if (info.Length > MaxCaseBytes) throw new InvalidDataException("Case JSON exceeds the 64 MiB input limit.");
+        var loaded = JsonSerializer.Deserialize<CaseData>(File.ReadAllBytes(caseJson), InputJsonOptions)
             ?? throw new InvalidOperationException($"Could not load case JSON: {caseJson}");
+        Validate(loaded);
+        return loaded with { TrustedEvidenceRoot = Path.GetDirectoryName(Path.GetFullPath(caseJson))! };
     }
 
     public string ResolveCaseDirectory(string casePath)
@@ -44,9 +50,11 @@ public sealed class CaseService
         {
             try
             {
-                var data = JsonSerializer.Deserialize<CaseData>(File.ReadAllText(caseJson), JsonDefaults.Options);
+                if (new FileInfo(caseJson).Length > MaxCaseBytes) continue;
+                var data = JsonSerializer.Deserialize<CaseData>(File.ReadAllBytes(caseJson), InputJsonOptions);
                 if (data is not null)
                 {
+                    Validate(data);
                     summaries.Add(new CaseSummary(data.CaseName, data.SampleName, data.Sha256, "Completed", data.StartedAt, data.Duration, data.Events.Count, data.Processes.Count, Path.GetDirectoryName(caseJson) ?? workspace));
                 }
             }
@@ -96,6 +104,7 @@ public sealed class CaseService
 
     private static CaseData LoadSqlite(string sqlitePath)
     {
+        if (new FileInfo(sqlitePath).Length > 512L * 1024 * 1024) throw new InvalidDataException("Case SQLite exceeds the 512 MiB input limit.");
         using var connection = new SqliteConnection($"Data Source={sqlitePath};Mode=ReadOnly;Pooling=False");
         connection.Open();
 
@@ -107,14 +116,10 @@ public sealed class CaseService
             throw new InvalidOperationException($"SQLite case has no cases row: {sqlitePath}");
         }
 
-        string caseId = caseReader.GetString(0);
-        string caseName = caseReader.GetString(1);
-        string sampleName = caseReader.GetString(2);
-        string samplePath = caseReader.GetString(3);
-        string sha256 = caseReader.GetString(4);
-        var startedAt = DateTimeOffset.TryParse(caseReader.GetString(5), out var parsedStarted) ? parsedStarted : DateTimeOffset.Now;
+        string caseId = Text(caseReader, 0); string caseName = Text(caseReader, 1); string sampleName = Text(caseReader, 2); string samplePath = Text(caseReader, 3); string sha256 = Text(caseReader, 4);
+        var startedAt = DateTimeOffset.TryParse(Text(caseReader, 5), out var parsedStarted) ? parsedStarted : DateTimeOffset.Now;
         var duration = TimeSpan.FromSeconds(caseReader.GetDouble(6));
-        string analystNotes = caseReader.GetString(7);
+        string analystNotes = Text(caseReader, 7, 1024 * 1024);
         caseReader.Close();
 
         var processes = ReadProcesses(connection).ToArray();
@@ -123,8 +128,10 @@ public sealed class CaseService
         var network = ReadNetworkSessions(connection).ToArray();
         var staticAnalysis = ReadStaticAnalysis(connection);
         var quality = ReadQuality(connection);
+        var rawEvidenceMetadata = ReadJsonTable<RawEvidenceFile[]>(connection, "raw_evidence") ?? [];
+        var preservedFiles = ReadJsonTable<PreservedFile[]>(connection, "preserved_files") ?? [];
 
-        return new CaseData(
+        var result = new CaseData(
             caseId,
             caseName,
             sampleName,
@@ -138,7 +145,27 @@ public sealed class CaseService
             artifacts,
             network,
             analystNotes,
-            quality);
+            quality,
+            rawEvidenceMetadata.Select(r => r.StoredPath).ToArray(),
+            preservedFiles) { TrustedEvidenceRoot = Path.GetDirectoryName(Path.GetFullPath(sqlitePath))!, RawEvidence = rawEvidenceMetadata };
+        Validate(result);
+        return result;
+    }
+
+    private static void Validate(CaseData data)
+    {
+        if (data.Events.Count > 1_000_000 || data.Processes.Count > 100_000 || data.Artifacts.Count > 250_000 || data.NetworkSessions.Count > 250_000 ||
+            (data.RawEvidenceFiles?.Count ?? 0) > 32 || (data.PreservedFiles?.Count ?? 0) > 128)
+            throw new InvalidDataException("Case collection count limit exceeded.");
+    }
+
+    private static T? ReadJsonTable<T>(SqliteConnection connection, string table)
+    {
+        if (!HasTable(connection, table)) return default;
+        using var command = connection.CreateCommand();
+        command.CommandText = $"SELECT json FROM {table} LIMIT 1";
+        try { return command.ExecuteScalar() is string json && json.Length <= 4 * 1024 * 1024 ? JsonSerializer.Deserialize<T>(json, InputJsonOptions) : default; }
+        catch { return default; }
     }
 
     private static CaseQuality? ReadQuality(SqliteConnection connection)
@@ -152,7 +179,7 @@ public sealed class CaseService
         object? value = command.ExecuteScalar();
         try
         {
-            return value is string json ? JsonSerializer.Deserialize<CaseQuality>(json, JsonDefaults.Options) : null;
+            return value is string json && json.Length <= 1024 * 1024 ? JsonSerializer.Deserialize<CaseQuality>(json, InputJsonOptions) : null;
         }
         catch
         {
@@ -177,7 +204,7 @@ public sealed class CaseService
 
         try
         {
-            return JsonSerializer.Deserialize<StaticAnalysisResult>(json, JsonDefaults.Options);
+            return json.Length <= 16 * 1024 * 1024 ? JsonSerializer.Deserialize<StaticAnalysisResult>(json, InputJsonOptions) : null;
         }
         catch
         {
@@ -188,17 +215,17 @@ public sealed class CaseService
     private static IEnumerable<ProcessNode> ReadProcesses(SqliteConnection connection)
     {
         using var command = connection.CreateCommand();
-        command.CommandText = "SELECT pid, parent_pid, name, process_guid, command_line, image_path, start_time, end_time, event_count, network_count, file_count, registry_count FROM processes ORDER BY start_time";
+        command.CommandText = "SELECT pid, parent_pid, name, process_guid, command_line, image_path, start_time, end_time, event_count, network_count, file_count, registry_count FROM processes ORDER BY start_time LIMIT 100001";
         using var reader = command.ExecuteReader();
+        int count = 0;
         while (reader.Read())
         {
+            if (++count > 100000) throw new InvalidDataException("Process row limit exceeded.");
             yield return new ProcessNode(
-                reader.GetString(2),
+                Text(reader, 2),
                 reader.GetInt32(0),
                 reader.IsDBNull(1) ? null : reader.GetInt32(1),
-                reader.IsDBNull(3) ? string.Empty : reader.GetString(3),
-                reader.IsDBNull(4) ? string.Empty : reader.GetString(4),
-                reader.IsDBNull(5) ? string.Empty : reader.GetString(5),
+                Text(reader, 3), Text(reader, 4), Text(reader, 5),
                 ParseDate(reader, 6),
                 reader.IsDBNull(7) ? null : ParseDate(reader, 7),
                 reader.GetInt32(8),
@@ -214,77 +241,87 @@ public sealed class CaseService
         bool hasCapturedAtUtc = HasColumn(connection, "events", "captured_at_utc");
         using var command = connection.CreateCommand();
         command.CommandText = hasProcessGuid && hasCapturedAtUtc
-            ? "SELECT id, time, process, pid, process_guid, category, action, object_value, summary, technique_id, technique_name, confidence, severity, source, raw_json, captured_at_utc FROM events ORDER BY id"
+            ? "SELECT id, time, process, pid, process_guid, category, action, object_value, summary, technique_id, technique_name, confidence, severity, source, raw_json, captured_at_utc FROM events ORDER BY id LIMIT 1000001"
             : hasProcessGuid
-            ? "SELECT id, time, process, pid, process_guid, category, action, object_value, summary, technique_id, technique_name, confidence, severity, source, raw_json FROM events ORDER BY id"
-            : "SELECT id, time, process, pid, category, action, object_value, summary, technique_id, technique_name, confidence, severity, source, raw_json FROM events ORDER BY id";
+            ? "SELECT id, time, process, pid, process_guid, category, action, object_value, summary, technique_id, technique_name, confidence, severity, source, raw_json FROM events ORDER BY id LIMIT 1000001"
+            : "SELECT id, time, process, pid, category, action, object_value, summary, technique_id, technique_name, confidence, severity, source, raw_json FROM events ORDER BY id LIMIT 1000001";
         using var reader = command.ExecuteReader();
+        int count = 0;
         while (reader.Read())
         {
+            if (++count > 1000000) throw new InvalidDataException("Event row limit exceeded.");
             int id = reader.GetInt32(0);
-            var time = TimeSpan.TryParse(reader.GetString(1), out var parsedTime) ? parsedTime : TimeSpan.Zero;
-            string process = reader.GetString(2);
+            var time = TimeSpan.TryParse(Text(reader, 1), out var parsedTime) ? parsedTime : TimeSpan.Zero;
+            string process = Text(reader, 2);
             int pid = reader.GetInt32(3);
             int shift = hasProcessGuid ? 1 : 0;
-            string processGuid = hasProcessGuid && !reader.IsDBNull(4) ? reader.GetString(4) : ResolveProcessGuid(caseId, startedAt, time, pid, process, processes);
+            string processGuid = hasProcessGuid ? Text(reader, 4) : ResolveProcessGuid(caseId, startedAt, time, pid, process, processes);
             yield return new TimelineEvent(
                 id,
                 time,
                 process,
                 pid,
-                ParseEnum(reader.GetString(4 + shift), EventCategory.Api),
-                reader.GetString(5 + shift),
-                reader.GetString(6 + shift),
-                reader.GetString(7 + shift),
-                ParseEnum(reader.GetString(11 + shift), EventSeverity.Low),
-                reader.GetString(12 + shift),
-                reader.GetString(13 + shift),
-                reader.IsDBNull(8 + shift) ? string.Empty : reader.GetString(8 + shift),
-                reader.IsDBNull(9 + shift) ? string.Empty : reader.GetString(9 + shift),
-                reader.IsDBNull(10 + shift) ? string.Empty : reader.GetString(10 + shift),
+                ParseEnum(Text(reader, 4 + shift), EventCategory.Api),
+                Text(reader, 5 + shift), Text(reader, 6 + shift), Text(reader, 7 + shift),
+                ParseEnum(Text(reader, 11 + shift), EventSeverity.Low),
+                Text(reader, 12 + shift), Text(reader, 13 + shift, 2 * 1024 * 1024),
+                Text(reader, 8 + shift), Text(reader, 9 + shift), Text(reader, 10 + shift),
                 processGuid,
-                hasCapturedAtUtc && !reader.IsDBNull(15) && DateTimeOffset.TryParse(reader.GetString(15), out var captured) ? captured : startedAt.Add(time));
+                hasCapturedAtUtc && DateTimeOffset.TryParse(Text(reader, 15), out var captured) ? captured : startedAt.Add(time));
         }
     }
 
     private static IEnumerable<ArtifactItem> ReadArtifacts(SqliteConnection connection)
     {
         using var command = connection.CreateCommand();
-        command.CommandText = "SELECT type, value, first_seen, last_seen, event_count, related_processes, severity FROM artifacts";
+        command.CommandText = "SELECT type, value, first_seen, last_seen, event_count, related_processes, severity FROM artifacts LIMIT 250001";
         using var reader = command.ExecuteReader();
+        int count = 0;
         while (reader.Read())
         {
+            if (++count > 250000) throw new InvalidDataException("Artifact row limit exceeded.");
             yield return new ArtifactItem(
-                reader.GetString(0),
-                reader.GetString(1),
+                Text(reader, 0), Text(reader, 1),
                 ParseDate(reader, 2),
                 ParseDate(reader, 3),
                 reader.GetInt32(4),
-                reader.GetString(5),
-                ParseEnum(reader.GetString(6), EventSeverity.Low));
+                Text(reader, 5),
+                ParseEnum(Text(reader, 6), EventSeverity.Low));
         }
     }
 
     private static IEnumerable<NetworkSession> ReadNetworkSessions(SqliteConnection connection)
     {
         using var command = connection.CreateCommand();
-        command.CommandText = "SELECT process, domain, resolved_ip, remote_ip, port, protocol, first_seen, bytes_sent, bytes_received, user_agent, sni FROM network_sessions";
+        bool v3 = HasColumn(connection, "network_sessions", "coverage");
+        bool http = HasColumn(connection, "network_sessions", "http_method");
+        command.CommandText = "SELECT process, domain, resolved_ip, remote_ip, port, protocol, first_seen, bytes_sent, bytes_received, user_agent, sni" + (v3 ? ", dns_status, dns_answers, coverage" : "") + (http ? ", http_method, http_host, http_uri, http_headers" : "") + " FROM network_sessions LIMIT 250001";
         using var reader = command.ExecuteReader();
+        int count = 0;
         while (reader.Read())
         {
+            if (++count > 250000) throw new InvalidDataException("Network row limit exceeded.");
             yield return new NetworkSession(
-                reader.GetString(0),
-                reader.GetString(1),
-                reader.GetString(2),
-                reader.GetString(3),
+                Text(reader, 0), Text(reader, 1), Text(reader, 2), Text(reader, 3),
                 reader.GetInt32(4),
-                reader.GetString(5),
-                TimeSpan.TryParse(reader.GetString(6), out var firstSeen) ? firstSeen : TimeSpan.Zero,
+                Text(reader, 5),
+                TimeSpan.TryParse(Text(reader, 6), out var firstSeen) ? firstSeen : TimeSpan.Zero,
                 reader.GetInt64(7),
                 reader.GetInt64(8),
-                reader.GetString(9),
-                reader.GetString(10));
+                Text(reader, 9), Text(reader, 10),
+                v3 ? Text(reader, 11) : "", v3 ? Text(reader, 12) : "", v3 ? Text(reader, 13) : "metadata-only",
+                http ? Text(reader, 14) : "", http ? Text(reader, 15) : "", http ? Text(reader, 16) : "", http ? Text(reader, 17, 256 * 1024) : "");
         }
+    }
+
+    private static string Text(SqliteDataReader reader, int index, int maxChars = 64 * 1024)
+    {
+        if (reader.IsDBNull(index)) return "";
+        // Microsoft.Data.Sqlite 9 can access-violate on GetChars(..., null, ...).
+        // SQLite file size and row limits bound allocation; enforce the logical cell cap immediately after materialization.
+        string value = reader.GetString(index);
+        if (value.Length > maxChars) throw new InvalidDataException("SQLite text cell limit exceeded.");
+        return value;
     }
 
     private static bool HasColumn(SqliteConnection connection, string table, string column)
@@ -294,7 +331,7 @@ public sealed class CaseService
         using var reader = command.ExecuteReader();
         while (reader.Read())
         {
-            if (reader.GetString(1).Equals(column, StringComparison.OrdinalIgnoreCase))
+            if (Text(reader, 1, 256).Equals(column, StringComparison.OrdinalIgnoreCase))
             {
                 return true;
             }
@@ -312,7 +349,7 @@ public sealed class CaseService
     }
 
     private static DateTimeOffset ParseDate(SqliteDataReader reader, int ordinal) =>
-        DateTimeOffset.TryParse(reader.GetString(ordinal), out var parsed) ? parsed : DateTimeOffset.MinValue;
+        DateTimeOffset.TryParse(Text(reader, ordinal), out var parsed) ? parsed : DateTimeOffset.MinValue;
 
     private static T ParseEnum<T>(string value, T fallback) where T : struct =>
         Enum.TryParse<T>(value, true, out var parsed) ? parsed : fallback;

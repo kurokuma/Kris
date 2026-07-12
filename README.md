@@ -1,5 +1,22 @@
 # MRTW — Malware Runtime Timeline Workbench
 
+## P1解析機能強化（ケーススキーマv3）
+
+- 静的解析はPE Importを`DLL!関数名`またはordinalとして解析し、Export、詳細なSection、Authenticode証明書の有無とWindowsチェーン検証結果、署名者、imphash、Rich Headerハッシュ、manifest、Version情報、.NETメタデータ指標、packer heuristic、最大16個の埋め込みPE候補を記録します。WPFの「Static Analysis」タブではSummary、Imports、Exports、Sections、Strings、Resources/TLS、Metadata、Indicatorsを確認できます。
+- ファイルスナップショットはWorking Directory、Temp、Roaming/Local AppData、ProgramDataを対象とします。32 MiB以下のファイルはSHA-256を取得し、reparse pointは追跡しません。作成・変更ファイルは最大128件、各32 MiBまで安全な一時領域へ保全し、export時に`evidence/files`とメタデータへ保存します。
+- Registry差分はHKCU/HKLMのRun、RunOnceと選択されたWinlogon、Windows、IFEO値を含みます。取得範囲は実行権限とRegistry viewに依存します。
+- ETW収集のRaw `network-process.etl`はWindows kernel sessionの制約上システム全体を含み得ます。構造化イベントは対象PID treeへ絞り込みます。Raw ETLはraw出力有効かつPrivacy Mode無効の場合だけ`raw_evidence`へコピーし、export後は一時原本を削除します。未exportの一時証跡も24時間で清掃します。DNS Client ETWが提供したquery/status/answerを保持します。取得できないpacket payload、HTTP/TLS/SNI、byte countは空のままです。PCAPを取得したとは扱いません。
+- CLIの`--privacy-mode on`またはGUIの`Privacy (no raw ETL)`を指定すると、収集開始前からRaw ETLを作成しません。通常収集ではTCPおよびUDP IPv4/IPv6のkernel ETW metadataと、取得できたDNS answer/CNAME/statusを保持します。PCAP payload、復号TLS、JA3/JA4、FakeNet/INetSim識別は未対応で、coverageにも`unsupported`として記録します。
+- ATT&CK追加ルールは`rules/behavior-rules.json`（または`MRTW_BEHAVIOR_RULES`）から読み込み、ファイル不在・不正時は組み込みfallbackを使用します。既存の時系列相関は後方互換のため維持します。
+- 外部ルールは1 MiB・256件・JSON深度16を上限とし、必須項目、件数、長さ、時間窓を検証します。順序、除外action、時間窓、version、tacticを指定でき、発火結果にはrule versionとSHA-256を保存します。不正ルールを一部だけ適用せず、ファイル全体をfallbackへ切り替えます。
+- Native Hookが取得したWinHTTP/WinINet/DNS/socket metadataはprocessと時刻に関連付け、取得できたHTTP method、host、URI、headers、送受信bytes、DNS status/answersをNetworkSessionへ保存します。APIが提供しない値は補完しません。
+- スキーマv3の追加フィールドはoptionalで、従来のJSON/SQLiteケースも読み込めます。Network coverage、Raw evidence、保全ファイルのメタデータはSQLiteにも保存します。
+- Raw evidenceと保全ファイルは信頼済みcase evidence root配下のcanonical pathだけを読み、reparse point、サイズ、SHA-256を再検証します。ケース内の任意絶対pathはコピーしません。bundle/SQLiteには相対pathを保存して可搬性を維持します。Case JSONは64 MiB・深度32、SQLiteは512 MiB、各collectionにも入力件数上限があります。
+- 証拠copyは検証後にpathを再openせず、同じread handleから上限付きでcopyしながらSHA-256を計算し、期待値不一致時は拒否します。ただし同一Windows tokenで一時証拠rootへ書込み可能な別プロセスは、収集完了からexport開始までに原本を改変できます。export時の再hashで改変を拒否しますが、強い改ざん耐性には専用VM、ACL分離または別tokenの証拠サービスが必要です。
+- Snapshot Beforeでは実行可能ファイルまたはADSを持つ高リスクファイルを上限付きでprestageし、Afterで削除を確認したものだけを`deleted-high-risk-prestage`として採用します。ADSはWindowsの`FindFirstStreamW`/`FindNextStreamW`で列挙します。
+
+Packer・埋め込みPE検出はトリアージ指標であり、ファミリーを断定しません。埋め込み候補は上限付きで識別・ハッシュ化しますが、実行や再帰展開はしません。指定どおり、メモリ解析、YARA/YARA-X、capaは対象外です。
+
 MRTW は Windows の EXE/DLL を静的・動的に観測し、プロセス、API、ファイル、レジストリ、DNS、ネットワークなどの情報を、ひとつのケースと時系列へまとめるローカル分析ツールです。
 
 現在の実装はプレビュー版（`1.0.0-preview`）です。WPF GUI、CLI、SQLiteベースのケース保存、HTML/CSV/JSON/JSONLエクスポート、ETW収集、スナップショット差分、および x64 ネイティブHook/Injectorを含みます。

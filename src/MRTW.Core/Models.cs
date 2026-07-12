@@ -96,9 +96,20 @@ public sealed record NetworkSession(
     long BytesSent,
     long BytesReceived,
     string UserAgent,
-    string Sni);
+    string Sni,
+    string DnsStatus = "",
+    string DnsAnswers = "",
+    string Coverage = "metadata-only",
+    string HttpMethod = "",
+    string HttpHost = "",
+    string HttpUri = "",
+    string HttpHeaders = "");
 
-public sealed record PeSectionInfo(string Name, uint VirtualAddress, uint RawSize, double Entropy);
+public sealed record PeSectionInfo(string Name, uint VirtualAddress, uint RawSize, double Entropy, uint VirtualSize = 0, string Characteristics = "");
+
+public sealed record EmbeddedPeInfo(long Offset, string Architecture, string Sha256, long Size);
+public sealed record PreservedFile(string OriginalPath, string StoredPath, long Size, string Sha256, string Reason);
+public sealed record RawEvidenceFile(string StoredPath, long Size, string Sha256, string Coverage);
 
 public sealed record StaticAnalysisResult(
     string FileName,
@@ -122,7 +133,16 @@ public sealed record StaticAnalysisResult(
     ulong ImageBase = 0,
     IReadOnlyList<string>? Resources = null,
     IReadOnlyList<string>? TlsCallbacks = null,
-    string PdbPath = "");
+    string PdbPath = "",
+    string SignatureStatus = "Not signed",
+    string SignatureSubject = "",
+    string Imphash = "",
+    string RichHeaderHash = "",
+    string Manifest = "",
+    IReadOnlyDictionary<string, string>? VersionInfo = null,
+    IReadOnlyList<string>? DotNetMetadata = null,
+    IReadOnlyList<string>? PackerIndicators = null,
+    IReadOnlyList<EmbeddedPeInfo>? EmbeddedPeFiles = null);
 
 public sealed record CaseData(
     string CaseId,
@@ -138,8 +158,13 @@ public sealed record CaseData(
     IReadOnlyList<ArtifactItem> Artifacts,
     IReadOnlyList<NetworkSession> NetworkSessions,
     string AnalystNotes,
-    CaseQuality? Quality = null)
+    CaseQuality? Quality = null,
+    IReadOnlyList<string>? RawEvidenceFiles = null,
+    IReadOnlyList<PreservedFile>? PreservedFiles = null)
 {
+    [JsonIgnore]
+    public string TrustedEvidenceRoot { get; init; } = "";
+    public IReadOnlyList<RawEvidenceFile> RawEvidence { get; init; } = [];
     [JsonIgnore]
     public int HighCount => Events.Count(e => e.Severity is EventSeverity.Critical or EventSeverity.High);
 
@@ -186,7 +211,7 @@ public sealed record ProfileDefaults(
     string TimeoutAction,
     bool KillTree);
 
-public sealed record FileSnapshotEntry(string Path, long Size, DateTimeOffset LastWriteUtc);
+public sealed record FileSnapshotEntry(string Path, long Size, DateTimeOffset LastWriteUtc, string Sha256 = "", string Attributes = "", DateTimeOffset? CreatedUtc = null, bool IsExecutable = false, bool TimestampAnomaly = false, IReadOnlyList<string>? AlternateStreams = null);
 
 public sealed record RegistrySnapshotEntry(string KeyPath, string Name, string Value);
 
@@ -220,9 +245,27 @@ public sealed record ExecutionProfile(
     string NetworkMode,
     bool KillTree = true,
     string TimeoutAction = "kill",
-    bool ExecuteTarget = true);
+    bool ExecuteTarget = true,
+    bool PrivacyMode = false);
 
 public sealed record CollectionRunContext(string CaseId, DateTimeOffset StartedAtUtc)
 {
-    public static CollectionRunContext Create() => new("case-" + Guid.NewGuid().ToString("N"), DateTimeOffset.UtcNow);
+    public static CollectionRunContext Create()
+    {
+        CleanupExpiredEvidence();
+        return new("case-" + Guid.NewGuid().ToString("N"), DateTimeOffset.UtcNow);
+    }
+    private static void CleanupExpiredEvidence()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "MRTW");
+        try
+        {
+            foreach (string directory in Directory.EnumerateDirectories(root, "case-*", SearchOption.TopDirectoryOnly).Take(200))
+            {
+                var info = new DirectoryInfo(directory);
+                if ((info.Attributes & FileAttributes.ReparsePoint) == 0 && info.LastWriteTimeUtc < DateTime.UtcNow.AddHours(-24)) Directory.Delete(directory, true);
+            }
+        }
+        catch { }
+    }
 }

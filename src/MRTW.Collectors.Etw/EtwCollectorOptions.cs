@@ -8,4 +8,5 @@ public sealed record EtwCollectorOptions(
     bool DnsEvents = true,
     bool ImageLoadEvents = true,
     bool FollowDescendants = true,
-    DateTimeOffset? CaseStartedAtUtc = null);
+    DateTimeOffset? CaseStartedAtUtc = null,
+    string? RawTracePath = null);

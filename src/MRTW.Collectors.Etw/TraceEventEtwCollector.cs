@@ -44,7 +44,9 @@ public sealed class TraceEventEtwCollector
 
         try
         {
-            using var session = new TraceEventSession(sessionName)
+            string? tracePath = options.RawTracePath;
+            if (!string.IsNullOrWhiteSpace(tracePath)) Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(tracePath))!);
+            using var session = string.IsNullOrWhiteSpace(tracePath) ? new TraceEventSession(sessionName) : new TraceEventSession(sessionName, tracePath)
             {
                 StopOnDispose = true
             };
@@ -170,6 +172,22 @@ public sealed class TraceEventEtwCollector
                 EnqueueNetworkSession(sessions, onNetworkSession, new NetworkSession(process, "-", "-", data.daddr.ToString(), data.dport, "TCP", DateTimeOffset.Now - startedAt, 0, 0, "-", "-"));
             };
 
+            session.Source.Kernel.UdpIpSend += data =>
+            {
+                if (!PidMatches(options.TargetPid, trackedPids, data.ProcessID)) return;
+                string remote = $"{data.daddr}:{data.dport}"; string process = KnownProcessName(processNames, data.ProcessID, null, null);
+                EnqueueEvent(events, onEvent, Event(Interlocked.Increment(ref nextId), DateTimeOffset.UtcNow - startedAt, process, data.ProcessID, EventCategory.Network, "UDP Send", remote, "UDP metadata observed by kernel ETW", EventSeverity.Medium, "ETW", data));
+                EnqueueNetworkSession(sessions, onNetworkSession, new NetworkSession(process, "", "", data.daddr.ToString(), data.dport, "UDP", DateTimeOffset.UtcNow - startedAt, data.size, 0, "", "", Coverage: "kernel ETW UDP metadata; payload/TLS/JA3 unsupported"));
+            };
+
+            session.Source.Kernel.UdpIpRecv += data =>
+            {
+                if (!PidMatches(options.TargetPid, trackedPids, data.ProcessID)) return;
+                string remote = $"{data.saddr}:{data.sport}"; string process = KnownProcessName(processNames, data.ProcessID, null, null);
+                EnqueueEvent(events, onEvent, Event(Interlocked.Increment(ref nextId), DateTimeOffset.UtcNow - startedAt, process, data.ProcessID, EventCategory.Network, "UDP Receive", remote, "UDP metadata observed by kernel ETW", EventSeverity.Low, "ETW", data));
+                EnqueueNetworkSession(sessions, onNetworkSession, new NetworkSession(process, "", "", data.saddr.ToString(), data.sport, "UDP", DateTimeOffset.UtcNow - startedAt, 0, data.size, "", "", Coverage: "kernel ETW UDP metadata; payload/TLS/JA3 unsupported"));
+            };
+
             if (options.DnsEvents)
             {
                 session.Source.Dynamic.All += data =>
@@ -186,6 +204,8 @@ public sealed class TraceEventEtwCollector
                     }
 
                     string query = TryPayload(data, "QueryName") ?? TryPayload(data, "Name") ?? data.EventName;
+                    string answers = TryPayload(data, "QueryResults") ?? TryPayload(data, "Address") ?? "";
+                    string status = TryPayload(data, "Status") ?? TryPayload(data, "Result") ?? "";
                     EnqueueEvent(events, onEvent, Event(
                         Interlocked.Increment(ref nextId),
                         DateTimeOffset.Now - startedAt,
@@ -194,10 +214,16 @@ public sealed class TraceEventEtwCollector
                         EventCategory.Dns,
                         "DNS Query",
                         query,
-                        "DNS event observed by ETW",
+                        $"DNS event observed by ETW; status={status}; answers={answers}",
                         EventSeverity.Medium,
                         "ETW",
                         data.PayloadString(0)));
+                    if (!string.IsNullOrWhiteSpace(query))
+                    {
+                        EnqueueNetworkSession(sessions, onNetworkSession, new NetworkSession(
+                            KnownProcessName(processNames, pid, null, null), query, answers, "", 53, "DNS",
+                            DateTimeOffset.UtcNow - startedAt, 0, 0, "", "", status, answers, "DNS client ETW metadata"));
+                    }
                 };
             }
 
@@ -205,11 +231,11 @@ public sealed class TraceEventEtwCollector
             using var cancellationRegistration = cancellationToken.Register(() => session.Stop());
             session.Source.Process();
 
-            return new EtwCollectionResult(true, true, null, events.OrderBy(e => e.Time).ToArray(), sessions.ToArray());
+            return new EtwCollectionResult(true, true, null, events.OrderBy(e => e.Time).ToArray(), sessions.ToArray(), tracePath);
         }
         catch (Exception ex)
         {
-            return new EtwCollectionResult(false, false, ex.Message, events.OrderBy(e => e.Time).ToArray(), sessions.ToArray());
+            return new EtwCollectionResult(false, false, ex.Message, events.OrderBy(e => e.Time).ToArray(), sessions.ToArray(), options.RawTracePath);
         }
     }
 

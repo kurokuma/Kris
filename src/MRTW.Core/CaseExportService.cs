@@ -24,6 +24,7 @@ public sealed class CaseExportService
 
     public void WriteCaseBundle(CaseData data, string caseDirectory, ExportOptions options)
     {
+        var transientEvidence = (data.RawEvidenceFiles ?? []).Concat(data.PreservedFiles?.Select(p => p.StoredPath) ?? []).Where(Path.IsPathFullyQualified).ToArray();
         Directory.CreateDirectory(caseDirectory);
         var warnings = new List<string>();
         var requested = ParseFormats(options.Formats);
@@ -33,6 +34,47 @@ public sealed class CaseExportService
         }
 
         File.WriteAllText(Path.Combine(caseDirectory, "tool_version.txt"), "MRTW 1.0.0-preview" + Environment.NewLine, Encoding.UTF8);
+
+        if (options.IncludeRaw && !options.PrivacyMode && data.RawEvidence is { Count: > 0 })
+        {
+            string rawDirectory = Path.Combine(caseDirectory, "raw_evidence");
+            Directory.CreateDirectory(rawDirectory);
+            var relative = new List<string>();
+            var rawMetadata = new List<RawEvidenceFile>();
+            foreach (var item in data.RawEvidence.Take(32))
+            {
+                string candidate = Path.IsPathFullyQualified(item.StoredPath) ? item.StoredPath : Path.Combine(data.TrustedEvidenceRoot, item.StoredPath);
+                string destination = Path.Combine(rawDirectory, Path.GetFileName(candidate));
+                if (!EvidencePathPolicy.CopyValidated(candidate, destination, data.CaseId, data.TrustedEvidenceRoot, "raw_evidence", 512L * 1024 * 1024, item.Sha256, out long size, out string hash)) continue;
+                relative.Add(Path.GetRelativePath(caseDirectory, destination));
+                rawMetadata.Add(item with { StoredPath = Path.GetRelativePath(caseDirectory, destination), Size = size, Sha256 = hash });
+            }
+            data = data with { RawEvidenceFiles = relative, RawEvidence = rawMetadata };
+        }
+
+        if (!options.PrivacyMode && data.PreservedFiles is { Count: > 0 })
+        {
+            string filesDirectory = Path.Combine(caseDirectory, "evidence", "files");
+            Directory.CreateDirectory(filesDirectory);
+            var exported = new List<object>();
+            var portable = new List<PreservedFile>();
+            foreach (var item in data.PreservedFiles.Take(128))
+            {
+                string candidate = Path.IsPathFullyQualified(item.StoredPath) ? item.StoredPath : Path.Combine(data.TrustedEvidenceRoot, item.StoredPath);
+                string name = Path.GetFileName(candidate);
+                string destination = Path.Combine(filesDirectory, name);
+                if (!EvidencePathPolicy.CopyValidated(candidate, destination, data.CaseId, data.TrustedEvidenceRoot, Path.Combine("evidence", "files"), 32L * 1024 * 1024, item.Sha256, out long copied, out string hash)) continue;
+                exported.Add(new { item.OriginalPath, stored_name = name, item.Size, item.Sha256, item.Reason });
+                portable.Add(item with { StoredPath = Path.GetRelativePath(caseDirectory, destination), Size = copied, Sha256 = hash });
+                if (options.IncludeSample && item.OriginalPath.Equals(data.SamplePath, StringComparison.OrdinalIgnoreCase) && item.Sha256.Equals(data.Sha256, StringComparison.OrdinalIgnoreCase))
+                {
+                    string sampleDir = Path.Combine(caseDirectory, "sample"); Directory.CreateDirectory(sampleDir);
+                    File.Copy(destination, Path.Combine(sampleDir, Path.GetFileName(item.OriginalPath)), true);
+                }
+            }
+            File.WriteAllText(Path.Combine(caseDirectory, "evidence", "files.json"), JsonSerializer.Serialize(exported, JsonDefaults.Options), Encoding.UTF8);
+            data = data with { PreservedFiles = portable };
+        }
 
         if (requested.Contains("json") || requested.Contains("all"))
         {
@@ -67,20 +109,6 @@ public sealed class CaseExportService
             WriteSqliteBundle(data, Path.Combine(caseDirectory, "case.sqlite"));
         }
 
-        if (options.IncludeSample && File.Exists(data.SamplePath))
-        {
-            try
-            {
-                string sampleDir = Path.Combine(caseDirectory, "sample");
-                Directory.CreateDirectory(sampleDir);
-                File.Copy(data.SamplePath, Path.Combine(sampleDir, Path.GetFileName(data.SamplePath)), true);
-            }
-            catch (Exception ex)
-            {
-                warnings.Add($"Sample copy failed: {ex.Message}");
-            }
-        }
-
         if (warnings.Count > 0)
         {
             File.WriteAllLines(Path.Combine(caseDirectory, "export_warnings.txt"), warnings, Encoding.UTF8);
@@ -113,6 +141,14 @@ public sealed class CaseExportService
         }
 
         WriteManifest(caseDirectory);
+        foreach (string transient in transientEvidence)
+        {
+            if (EvidencePathPolicy.TryValidate(transient, data.CaseId, 512L * 1024 * 1024, null, out string trusted) &&
+                trusted.StartsWith(EvidencePathPolicy.Root(data.CaseId), StringComparison.OrdinalIgnoreCase))
+            {
+                try { File.Delete(trusted); } catch { }
+            }
+        }
     }
 
     private static HashSet<string> ParseFormats(string formats) =>
@@ -235,8 +271,10 @@ CREATE TABLE static_analysis(json TEXT);
 CREATE TABLE processes(pid INTEGER, parent_pid INTEGER, name TEXT, process_guid TEXT, command_line TEXT, image_path TEXT, start_time TEXT, end_time TEXT, event_count INTEGER, network_count INTEGER, file_count INTEGER, registry_count INTEGER);
 CREATE TABLE events(id INTEGER PRIMARY KEY, time TEXT, captured_at_utc TEXT, process TEXT, pid INTEGER, process_guid TEXT, category TEXT, action TEXT, object_value TEXT, summary TEXT, technique_id TEXT, technique_name TEXT, confidence TEXT, severity TEXT, source TEXT, raw_json TEXT);
 CREATE TABLE artifacts(type TEXT, value TEXT, first_seen TEXT, last_seen TEXT, event_count INTEGER, related_processes TEXT, severity TEXT);
-CREATE TABLE network_sessions(process TEXT, domain TEXT, resolved_ip TEXT, remote_ip TEXT, port INTEGER, protocol TEXT, first_seen TEXT, bytes_sent INTEGER, bytes_received INTEGER, user_agent TEXT, sni TEXT);
+CREATE TABLE network_sessions(process TEXT, domain TEXT, resolved_ip TEXT, remote_ip TEXT, port INTEGER, protocol TEXT, first_seen TEXT, bytes_sent INTEGER, bytes_received INTEGER, user_agent TEXT, sni TEXT, dns_status TEXT, dns_answers TEXT, coverage TEXT, http_method TEXT, http_host TEXT, http_uri TEXT, http_headers TEXT);
 CREATE TABLE case_quality(json TEXT);
+CREATE TABLE raw_evidence(json TEXT);
+CREATE TABLE preserved_files(json TEXT);
 CREATE INDEX ix_events_time ON events(time);
 CREATE INDEX ix_events_process ON events(process);
 CREATE INDEX ix_events_category ON events(category);
@@ -264,6 +302,8 @@ CREATE INDEX ix_events_category ON events(category);
                 Execute(connection, transaction, "INSERT INTO case_quality VALUES($json)",
                     ("$json", JsonSerializer.Serialize(data.Quality, JsonDefaults.Options)));
             }
+            Execute(connection, transaction, "INSERT INTO raw_evidence VALUES($json)", ("$json", JsonSerializer.Serialize(data.RawEvidence, JsonDefaults.Options)));
+            Execute(connection, transaction, "INSERT INTO preserved_files VALUES($json)", ("$json", JsonSerializer.Serialize(data.PreservedFiles ?? [], JsonDefaults.Options)));
 
             foreach (var p in data.Processes)
             {
@@ -321,7 +361,7 @@ CREATE INDEX ix_events_category ON events(category);
             foreach (var n in data.NetworkSessions)
             {
                 Execute(connection, transaction,
-                    "INSERT INTO network_sessions VALUES($process,$domain,$resolved_ip,$remote_ip,$port,$protocol,$first_seen,$bytes_sent,$bytes_received,$user_agent,$sni)",
+                    "INSERT INTO network_sessions VALUES($process,$domain,$resolved_ip,$remote_ip,$port,$protocol,$first_seen,$bytes_sent,$bytes_received,$user_agent,$sni,$dns_status,$dns_answers,$coverage,$http_method,$http_host,$http_uri,$http_headers)",
                     ("$process", n.Process),
                     ("$domain", n.Domain),
                     ("$resolved_ip", n.ResolvedIp),
@@ -332,7 +372,10 @@ CREATE INDEX ix_events_category ON events(category);
                     ("$bytes_sent", n.BytesSent),
                     ("$bytes_received", n.BytesReceived),
                     ("$user_agent", n.UserAgent),
-                    ("$sni", n.Sni));
+                    ("$sni", n.Sni),
+                    ("$dns_status", n.DnsStatus),
+                    ("$dns_answers", n.DnsAnswers),
+                    ("$coverage", n.Coverage), ("$http_method", n.HttpMethod), ("$http_host", n.HttpHost), ("$http_uri", n.HttpUri), ("$http_headers", n.HttpHeaders));
             }
 
             transaction.Commit();
@@ -378,7 +421,7 @@ CREATE INDEX ix_events_category ON events(category);
         var manifest = new
         {
             tool_version = "1.0.0-preview",
-            schema_version = 2,
+            schema_version = 3,
             created_at_utc = DateTimeOffset.UtcNow,
             files
         };

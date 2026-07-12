@@ -517,9 +517,12 @@ public sealed class MainViewModel : INotifyPropertyChanged
             selected.NetworkMode,
             true,
             selected.TimeoutAction,
-            true);
+            true,
+            PrivacyMode);
         return profile;
     }
+
+    public bool PrivacyMode { get; set; }
 
     private static ProfileOption ResolveConfiguredDefault(MrtwConfig config)
     {

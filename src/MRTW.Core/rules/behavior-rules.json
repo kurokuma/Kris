@@ -1,0 +1,24 @@
+[
+  {
+    "action": "Remote Thread Injection",
+    "summary": "Remote allocation, process-memory write, and remote thread creation were observed.",
+    "severity": "High",
+    "technique_id": "T1055",
+    "technique_name": "Process Injection",
+    "confidence": "High",
+    "actions": [ "VirtualAllocEx", "WriteProcessMemory", "CreateRemoteThread" ],
+    "require_all": true,
+    "minimum_matches": 3
+  },
+  {
+    "action": "Scheduled Task Persistence",
+    "summary": "Task Scheduler APIs or schtasks execution were observed.",
+    "severity": "High",
+    "technique_id": "T1053.005",
+    "technique_name": "Scheduled Task/Job: Scheduled Task",
+    "confidence": "Medium",
+    "actions": [ "SchRpcRegisterTask", "SchRpcRun" ],
+    "require_all": false,
+    "minimum_matches": 1
+  }
+]

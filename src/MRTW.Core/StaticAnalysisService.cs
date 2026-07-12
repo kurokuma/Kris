@@ -1,5 +1,10 @@
 using System.Buffers.Binary;
 using System.Security.Cryptography;
+using System.Diagnostics;
+using System.Security.Cryptography.X509Certificates;
+using System.Runtime.InteropServices;
+using System.Reflection.Metadata;
+using System.Reflection.PortableExecutable;
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -30,7 +35,10 @@ public sealed class StaticAnalysisService
             .Take(80)
             .ToArray();
 
-        bool signed = DetectAuthenticode(data, pe);
+        var signature = ReadSignature(path, pe);
+        var version = ReadVersionInfo(path);
+        var packer = DetectPackerIndicators(pe.Sections, pe.Imports, pe.EntryPoint);
+        var embedded = FindEmbeddedPeFiles(data);
         return new StaticAnalysisResult(
             Path.GetFileName(path),
             Path.GetFullPath(path),
@@ -47,13 +55,22 @@ public sealed class StaticAnalysisService
             pe.Sections,
             strings,
             data.AsSpan().IndexOf(Encoding.ASCII.GetBytes("BSJB")) >= 0,
-            signed,
+            pe.HasCertificate,
             pe.OverlaySize,
             pe.Subsystem,
             pe.ImageBase,
             pe.Resources,
             pe.TlsCallbacks,
-            pe.PdbPath);
+            pe.PdbPath,
+            signature.Status,
+            signature.Subject,
+            ComputeImphash(pe.Imports),
+            ReadRichHeaderHash(data),
+            ReadManifest(data),
+            version,
+            ReadDotNetMetadata(path, data),
+            packer,
+            embedded);
     }
 
     private static IEnumerable<string> ExtractStrings(byte[] data, int minLength)
@@ -155,8 +172,9 @@ public sealed class StaticAnalysisService
                     maxRawEnd = Math.Max(maxRawEnd, rawPointer + (uint)count);
                 }
 
-                sections.Add(new PeSectionInfo(name, virtualAddress, rawSize, Math.Round(entropy, 2)));
                 uint virtualSize = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(sectionOffset + 8, 4));
+                uint characteristics = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(sectionOffset + 36, 4));
+                sections.Add(new PeSectionInfo(name, virtualAddress, rawSize, Math.Round(entropy, 2), virtualSize, $"0x{characteristics:X8}"));
                 sectionHeaders.Add(new SectionHeader(name, virtualAddress, virtualSize, rawPointer, rawSize));
             }
 
@@ -171,11 +189,7 @@ public sealed class StaticAnalysisService
             var peDate = DateTimeOffset.FromUnixTimeSeconds(timestamp);
             long overlaySize = maxRawEnd > 0 && maxRawEnd < data.Length ? data.Length - maxRawEnd : 0;
             var ascii = Encoding.ASCII.GetString(data);
-            var imports = Regex.Matches(ascii, @"[A-Za-z0-9_]+\.(dll|DLL)")
-                .Select(m => m.Value)
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .Take(80)
-                .ToArray();
+            var imports = ReadImports(data, directories, sectionHeaders, pe32Plus).Concat(ReadDelayImports(data, directories, sectionHeaders, pe32Plus)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
             var exports = ReadExports(data, directories, sectionHeaders);
             var resources = ReadResources(data, directories, sectionHeaders);
             var tlsCallbacks = ReadTlsCallbacks(data, directories, sectionHeaders, imageBase, pe32Plus);
@@ -337,6 +351,178 @@ public sealed class StaticAnalysisService
         }
     }
 
+    private static IReadOnlyList<string> ReadImports(byte[] data, IReadOnlyList<DataDirectory> directories, IReadOnlyList<SectionHeader> sections, bool pe32Plus)
+    {
+        if (directories.Count <= 1 || directories[1].Rva == 0) return Array.Empty<string>();
+        var result = new List<string>();
+        try
+        {
+            int descriptor = RvaToOffset(directories[1].Rva, sections);
+            int pointerSize = pe32Plus ? 8 : 4;
+            for (int d = 0; d < 512 && descriptor + d * 20 + 20 <= data.Length; d++)
+            {
+                int p = descriptor + d * 20;
+                uint lookupRva = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(p, 4));
+                uint nameRva = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(p + 12, 4));
+                uint iatRva = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(p + 16, 4));
+                if (lookupRva == 0 && nameRva == 0 && iatRva == 0) break;
+                string dll = ReadAsciiZ(data, RvaToOffset(nameRva, sections), 260);
+                if (string.IsNullOrWhiteSpace(dll)) continue;
+                int lookup = RvaToOffset(lookupRva == 0 ? iatRva : lookupRva, sections);
+                for (int i = 0; i < 8192 && lookup + i * pointerSize + pointerSize <= data.Length; i++)
+                {
+                    ulong thunk = pe32Plus
+                        ? BinaryPrimitives.ReadUInt64LittleEndian(data.AsSpan(lookup + i * pointerSize, 8))
+                        : BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(lookup + i * pointerSize, 4));
+                    if (thunk == 0) break;
+                    ulong ordinalMask = pe32Plus ? 0x8000000000000000UL : 0x80000000UL;
+                    string function = (thunk & ordinalMask) != 0
+                        ? $"ord{thunk & 0xffff}"
+                        : ReadAsciiZ(data, RvaToOffset((uint)thunk, sections) + 2, 512);
+                    result.Add($"{dll}!{(string.IsNullOrWhiteSpace(function) ? "?" : function)}");
+                }
+            }
+        }
+        catch { }
+        return result.Distinct(StringComparer.OrdinalIgnoreCase).Take(8192).ToArray();
+    }
+
+    private static IReadOnlyList<string> ReadDelayImports(byte[] data, IReadOnlyList<DataDirectory> directories, IReadOnlyList<SectionHeader> sections, bool pe32Plus)
+    {
+        if (directories.Count <= 13 || directories[13].Rva == 0) return [];
+        var result = new List<string>();
+        try
+        {
+            int root = RvaToOffset(directories[13].Rva, sections); int pointerSize = pe32Plus ? 8 : 4;
+            for (int d = 0; d < 256 && root + d * 32 + 32 <= data.Length; d++)
+            {
+                int p = root + d * 32; uint attrs = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(p, 4)); uint name = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(p + 4, 4)); uint table = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(p + 16, 4));
+                if (name == 0 && table == 0) break; if ((attrs & 1) == 0) continue;
+                string dll = ReadAsciiZ(data, RvaToOffset(name, sections), 260); int lookup = RvaToOffset(table, sections);
+                for (int i = 0; i < 4096 && lookup + i * pointerSize + pointerSize <= data.Length; i++)
+                {
+                    ulong thunk = pe32Plus ? BinaryPrimitives.ReadUInt64LittleEndian(data.AsSpan(lookup + i * pointerSize, 8)) : BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(lookup + i * pointerSize, 4)); if (thunk == 0) break;
+                    ulong mask = pe32Plus ? 0x8000000000000000UL : 0x80000000UL; string fn = (thunk & mask) != 0 ? $"ord{thunk & 0xffff}" : ReadAsciiZ(data, RvaToOffset((uint)thunk, sections) + 2, 512);
+                    result.Add($"{dll}!{fn} [delay]");
+                }
+            }
+        }
+        catch { }
+        return result;
+    }
+
+    private static string ComputeImphash(IReadOnlyList<string> imports)
+    {
+        if (imports.Count == 0) return "";
+        string canonical = string.Join(',', imports.Select(i => i.ToLowerInvariant().Replace(".dll!", "!")));
+        return Convert.ToHexString(MD5.HashData(Encoding.UTF8.GetBytes(canonical))).ToLowerInvariant();
+    }
+
+    private static (string Status, string Subject) ReadSignature(string path, PeReadResult pe)
+    {
+        if (!pe.HasCertificate) return ("Not signed", "");
+        if (!OperatingSystem.IsWindows()) return ("Present (not validated on this platform)", "");
+        try
+        {
+#pragma warning disable SYSLIB0057
+            using var cert = new X509Certificate2(X509Certificate.CreateFromSignedFile(path));
+#pragma warning restore SYSLIB0057
+            int policy = WinTrustPolicy.Verify(path);
+            return (policy == 0 ? "Valid" : $"Signed (WinVerifyTrust 0x{policy:X8})", cert.Subject);
+        }
+        catch (Exception ex) { return ($"Malformed/unreadable signature: {ex.GetType().Name}", ""); }
+    }
+
+    private static IReadOnlyDictionary<string, string> ReadVersionInfo(string path)
+    {
+        try
+        {
+            var v = FileVersionInfo.GetVersionInfo(path);
+            return new Dictionary<string, string> { ["Company"] = v.CompanyName ?? "", ["Description"] = v.FileDescription ?? "", ["FileVersion"] = v.FileVersion ?? "", ["Product"] = v.ProductName ?? "", ["ProductVersion"] = v.ProductVersion ?? "", ["OriginalFilename"] = v.OriginalFilename ?? "" };
+        }
+        catch { return new Dictionary<string, string>(); }
+    }
+
+    private static string ReadRichHeaderHash(byte[] data)
+    {
+        int rich = data.AsSpan().IndexOf("Rich"u8);
+        if (rich < 0) return "";
+        int start = data.AsSpan(0, rich).LastIndexOf("DanS"u8);
+        if (start < 0) start = Math.Max(0, rich - 256);
+        return Convert.ToHexString(SHA256.HashData(data.AsSpan(start, rich + 8 <= data.Length ? rich + 8 - start : rich + 4 - start))).ToLowerInvariant();
+    }
+
+    private static string ReadManifest(byte[] data)
+    {
+        string text = Encoding.UTF8.GetString(data);
+        int start = text.IndexOf("<assembly", StringComparison.OrdinalIgnoreCase);
+        if (start < 0) return "";
+        int end = text.IndexOf("</assembly>", start, StringComparison.OrdinalIgnoreCase);
+        return end < 0 ? "" : text.Substring(start, Math.Min(end + 11 - start, 32768));
+    }
+
+    private static IReadOnlyList<string> ReadDotNetMetadata(string path, byte[] data)
+    {
+        if (data.AsSpan().IndexOf("BSJB"u8) < 0) return Array.Empty<string>();
+        var found = new List<string> { ".NET metadata signature present" };
+        try
+        {
+            using var stream = File.OpenRead(path); using var pe = new PEReader(stream);
+            if (!pe.HasMetadata) return found;
+            MetadataReader metadata = pe.GetMetadataReader();
+            foreach (var handle in metadata.AssemblyReferences.Take(100)) { var reference = metadata.GetAssemblyReference(handle); found.Add("AssemblyRef: " + metadata.GetString(reference.Name)); }
+            foreach (var handle in metadata.TypeDefinitions.Take(500)) { var type = metadata.GetTypeDefinition(handle); found.Add("Type: " + metadata.GetString(type.Namespace) + "." + metadata.GetString(type.Name)); }
+            foreach (var handle in metadata.MethodDefinitions.Take(1000)) { var method = metadata.GetMethodDefinition(handle); found.Add("Method: " + metadata.GetString(method.Name)); }
+        }
+        catch { }
+        return found.Distinct().Take(1600).ToArray();
+    }
+
+    private static IReadOnlyList<string> DetectPackerIndicators(IReadOnlyList<PeSectionInfo> sections, IReadOnlyList<string> imports, string entryPoint)
+    {
+        var indicators = new List<string>();
+        foreach (var s in sections)
+        {
+            if (s.Entropy >= 7.2) indicators.Add($"High entropy section {s.Name}: {s.Entropy:F2}");
+            if (Regex.IsMatch(s.Name, @"^(UPX|\.aspack|\.adata|MPRESS|Themida)", RegexOptions.IgnoreCase)) indicators.Add($"Known packer-like section name: {s.Name}");
+        }
+        if (imports.Count is > 0 and < 8) indicators.Add($"Very small import table: {imports.Count} entries");
+        return indicators.Take(50).ToArray();
+    }
+
+    private static IReadOnlyList<EmbeddedPeInfo> FindEmbeddedPeFiles(byte[] data)
+    {
+        var result = new List<EmbeddedPeInfo>();
+        const int maxHits = 16;
+        for (int i = 1; i + 0x40 < data.Length && result.Count < maxHits; i++)
+        {
+            if (data[i] != 'M' || data[i + 1] != 'Z') continue;
+            int peOffset;
+            try { peOffset = BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(i + 0x3c, 4)); } catch { continue; }
+            if (peOffset < 0x40 || i + peOffset + 6 >= data.Length || data[i + peOffset] != 'P' || data[i + peOffset + 1] != 'E') continue;
+            int size = EmbeddedImageSize(data, i, peOffset);
+            if (size <= 0) continue;
+            ushort machine = BinaryPrimitives.ReadUInt16LittleEndian(data.AsSpan(i + peOffset + 4, 2));
+            result.Add(new EmbeddedPeInfo(i, machine == 0x8664 ? "x64" : machine == 0x14c ? "x86" : $"0x{machine:X4}", Convert.ToHexString(SHA256.HashData(data.AsSpan(i, size))).ToLowerInvariant(), size));
+            i += 63;
+        }
+        return result;
+    }
+
+    private static int EmbeddedImageSize(byte[] data, int origin, int peOffset)
+    {
+        try
+        {
+            int header = origin + peOffset; ushort sectionCount = BinaryPrimitives.ReadUInt16LittleEndian(data.AsSpan(header + 6, 2)); ushort optionalSize = BinaryPrimitives.ReadUInt16LittleEndian(data.AsSpan(header + 20, 2)); int optional = header + 24; ushort magic = BinaryPrimitives.ReadUInt16LittleEndian(data.AsSpan(optional, 2));
+            int section = optional + optionalSize; long end = section + sectionCount * 40L;
+            for (int s = 0; s < sectionCount && section + s * 40 + 40 <= data.Length; s++) { int p = section + s * 40; uint rawSize = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(p + 16, 4)); uint rawPtr = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(p + 20, 4)); end = Math.Max(end, rawPtr + (long)rawSize); }
+            int certDir = optional + (magic == 0x20b ? 0x90 : 0x80); if (certDir + 8 <= data.Length) { uint certOffset = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(certDir, 4)); uint certSize = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(certDir + 4, 4)); end = Math.Max(end, certOffset + (long)certSize); }
+            if (end <= 0 || end > 16 * 1024 * 1024 || origin + end > data.Length) return 0;
+            return (int)end;
+        }
+        catch { return 0; }
+    }
+
     private static IReadOnlyList<string> ReadResources(byte[] data, IReadOnlyList<DataDirectory> directories, IReadOnlyList<SectionHeader> sections)
     {
         if (directories.Count <= 2 || directories[2].Rva == 0)
@@ -453,4 +639,30 @@ public sealed class StaticAnalysisService
         24 => "Manifest",
         _ => $"ResourceId:{value}"
     };
+
+    private static class WinTrustPolicy
+    {
+        private const uint WtdUiNone = 2, WtdRevokeWholeChain = 1, WtdChoiceFile = 1, WtdStateActionVerify = 1, WtdStateActionClose = 2, WtdCacheOnlyUrlRetrieval = 0x1000;
+        private static readonly Guid Action = new("00AAC56B-CD44-11d0-8CC2-00C04FC295EE");
+        [DllImport("wintrust.dll", CharSet = CharSet.Unicode, ExactSpelling = true)] private static extern int WinVerifyTrust(IntPtr hwnd, [MarshalAs(UnmanagedType.LPStruct)] Guid action, IntPtr data);
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] private struct FileInfo { public uint Size; public IntPtr Path; public IntPtr File; public IntPtr KnownSubject; }
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] private struct TrustData { public uint Size; public IntPtr PolicyCallbackData; public IntPtr SipClientData; public uint UiChoice; public uint RevocationChecks; public uint UnionChoice; public IntPtr FileInfo; public uint StateAction; public IntPtr StateData; public IntPtr UrlReference; public uint ProviderFlags; public uint UiContext; public IntPtr SignatureSettings; }
+        public static int Verify(string path)
+        {
+            if (!OperatingSystem.IsWindows()) return unchecked((int)0x800B0100);
+            IntPtr pathPtr = IntPtr.Zero, filePtr = IntPtr.Zero, dataPtr = IntPtr.Zero;
+            try
+            {
+                pathPtr = Marshal.StringToCoTaskMemUni(path);
+                var file = new FileInfo { Size = (uint)Marshal.SizeOf<FileInfo>(), Path = pathPtr };
+                filePtr = Marshal.AllocCoTaskMem(Marshal.SizeOf<FileInfo>()); Marshal.StructureToPtr(file, filePtr, false);
+                var trust = new TrustData { Size = (uint)Marshal.SizeOf<TrustData>(), UiChoice = WtdUiNone, RevocationChecks = WtdRevokeWholeChain, UnionChoice = WtdChoiceFile, FileInfo = filePtr, StateAction = WtdStateActionVerify, ProviderFlags = WtdCacheOnlyUrlRetrieval };
+                dataPtr = Marshal.AllocCoTaskMem(Marshal.SizeOf<TrustData>()); Marshal.StructureToPtr(trust, dataPtr, false);
+                int result = WinVerifyTrust(new IntPtr(-1), Action, dataPtr);
+                trust.StateAction = WtdStateActionClose; Marshal.StructureToPtr(trust, dataPtr, true); WinVerifyTrust(new IntPtr(-1), Action, dataPtr);
+                return result;
+            }
+            finally { if (dataPtr != IntPtr.Zero) Marshal.FreeCoTaskMem(dataPtr); if (filePtr != IntPtr.Zero) Marshal.FreeCoTaskMem(filePtr); if (pathPtr != IntPtr.Zero) Marshal.FreeCoTaskMem(pathPtr); }
+        }
+    }
 }

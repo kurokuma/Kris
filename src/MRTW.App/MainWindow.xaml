@@ -93,6 +93,7 @@
                                 </DataTemplate>
                             </ComboBox.ItemTemplate>
                         </ComboBox>
+                        <CheckBox Content="Privacy (no raw ETL)" IsChecked="{Binding PrivacyMode}" Margin="12,0,0,0" VerticalAlignment="Center"/>
                         <TextBlock Text="Export:" VerticalAlignment="Center" Foreground="{StaticResource TextSecondary}" Margin="16,0,8,0" />
                         <ComboBox Width="170" ItemsSource="{Binding DllExportCandidates}" Text="{Binding SelectedDllExport, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" IsEditable="True" />
                     </StackPanel>
@@ -407,6 +408,42 @@
                                         <DataGridTextColumn Header="Related Processes" Binding="{Binding RelatedProcesses}" Width="180" />
                                     </DataGrid.Columns>
                                 </DataGrid>
+                            </TabItem>
+                            <TabItem Header="Static Analysis">
+                                <TabControl>
+                                    <TabItem Header="Summary">
+                                        <ScrollViewer><StackPanel Margin="12">
+                                            <UniformGrid Columns="2">
+                                                <TextBlock Style="{StaticResource Muted}" Text="File"/><TextBlock Text="{Binding StaticAnalysis.FileName}"/>
+                                                <TextBlock Style="{StaticResource Muted}" Text="Full path"/><TextBlock Text="{Binding StaticAnalysis.FullPath}" TextWrapping="Wrap"/>
+                                                <TextBlock Style="{StaticResource Muted}" Text="Type / Architecture"/><TextBlock><Run Text="{Binding StaticAnalysis.FileType}"/><Run Text=" / "/><Run Text="{Binding StaticAnalysis.Architecture}"/></TextBlock>
+                                                <TextBlock Style="{StaticResource Muted}" Text="Size"/><TextBlock Text="{Binding StaticAnalysis.FileSize}"/>
+                                                <TextBlock Style="{StaticResource Muted}" Text="MD5"/><TextBox Text="{Binding StaticAnalysis.Md5}" IsReadOnly="True"/>
+                                                <TextBlock Style="{StaticResource Muted}" Text="SHA-1"/><TextBox Text="{Binding StaticAnalysis.Sha1}" IsReadOnly="True"/>
+                                                <TextBlock Style="{StaticResource Muted}" Text="SHA-256"/><TextBox Text="{Binding StaticAnalysis.Sha256}" IsReadOnly="True"/>
+                                                <TextBlock Style="{StaticResource Muted}" Text="Entry point"/><TextBlock Text="{Binding StaticAnalysis.EntryPoint}"/>
+                                                <TextBlock Style="{StaticResource Muted}" Text="Subsystem"/><TextBlock Text="{Binding StaticAnalysis.Subsystem}"/>
+                                                <TextBlock Style="{StaticResource Muted}" Text="Image base"/><TextBlock Text="{Binding StaticAnalysis.ImageBase}"/>
+                                                <TextBlock Style="{StaticResource Muted}" Text="PE timestamp"/><TextBlock Text="{Binding StaticAnalysis.PeTimestamp}"/>
+                                                <TextBlock Style="{StaticResource Muted}" Text="Signature"/><TextBlock Text="{Binding StaticAnalysis.SignatureStatus}" TextWrapping="Wrap"/>
+                                                <TextBlock Style="{StaticResource Muted}" Text="Signature present"/><TextBlock Text="{Binding StaticAnalysis.HasDigitalSignature}"/>
+                                                <TextBlock Style="{StaticResource Muted}" Text=".NET image"/><TextBlock Text="{Binding StaticAnalysis.IsDotNet}"/>
+                                                <TextBlock Style="{StaticResource Muted}" Text="Signer"/><TextBlock Text="{Binding StaticAnalysis.SignatureSubject}" TextWrapping="Wrap"/>
+                                                <TextBlock Style="{StaticResource Muted}" Text="Imphash"/><TextBox Text="{Binding StaticAnalysis.Imphash}" IsReadOnly="True"/>
+                                                <TextBlock Style="{StaticResource Muted}" Text="Rich header SHA-256"/><TextBox Text="{Binding StaticAnalysis.RichHeaderHash}" IsReadOnly="True"/>
+                                                <TextBlock Style="{StaticResource Muted}" Text="Overlay bytes"/><TextBlock Text="{Binding StaticAnalysis.OverlaySize}"/>
+                                                <TextBlock Style="{StaticResource Muted}" Text="PDB"/><TextBlock Text="{Binding StaticAnalysis.PdbPath}" TextWrapping="Wrap"/>
+                                            </UniformGrid>
+                                        </StackPanel></ScrollViewer>
+                                    </TabItem>
+                                    <TabItem Header="Imports"><ListBox ItemsSource="{Binding StaticAnalysis.Imports}" FontFamily="Consolas"/></TabItem>
+                                    <TabItem Header="Exports"><ListBox ItemsSource="{Binding StaticAnalysis.Exports}" FontFamily="Consolas"/></TabItem>
+                                    <TabItem Header="Sections"><DataGrid ItemsSource="{Binding StaticAnalysis.Sections}"><DataGrid.Columns><DataGridTextColumn Header="Name" Binding="{Binding Name}"/><DataGridTextColumn Header="RVA" Binding="{Binding VirtualAddress}"/><DataGridTextColumn Header="Virtual Size" Binding="{Binding VirtualSize}"/><DataGridTextColumn Header="Raw Size" Binding="{Binding RawSize}"/><DataGridTextColumn Header="Entropy" Binding="{Binding Entropy}"/><DataGridTextColumn Header="Characteristics" Binding="{Binding Characteristics}"/></DataGrid.Columns></DataGrid></TabItem>
+                                    <TabItem Header="Strings"><ListBox ItemsSource="{Binding StaticAnalysis.SuspiciousStrings}" FontFamily="Consolas"/></TabItem>
+                                    <TabItem Header="Resources / TLS"><Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition/></Grid.ColumnDefinitions><ListBox ItemsSource="{Binding StaticAnalysis.Resources}"/><ListBox Grid.Column="1" ItemsSource="{Binding StaticAnalysis.TlsCallbacks}" FontFamily="Consolas"/></Grid></TabItem>
+                                    <TabItem Header="Metadata"><Grid><Grid.RowDefinitions><RowDefinition/><RowDefinition/><RowDefinition/></Grid.RowDefinitions><DataGrid ItemsSource="{Binding StaticAnalysis.VersionInfo}" AutoGenerateColumns="False"><DataGrid.Columns><DataGridTextColumn Header="Version field" Binding="{Binding Key}" Width="180"/><DataGridTextColumn Header="Value" Binding="{Binding Value}" Width="*"/></DataGrid.Columns></DataGrid><ListBox Grid.Row="1" ItemsSource="{Binding StaticAnalysis.DotNetMetadata}"/><TextBox Grid.Row="2" Text="{Binding StaticAnalysis.Manifest}" IsReadOnly="True" AcceptsReturn="True" TextWrapping="Wrap" FontFamily="Consolas"/></Grid></TabItem>
+                                    <TabItem Header="Indicators"><Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition/></Grid.ColumnDefinitions><ListBox ItemsSource="{Binding StaticAnalysis.PackerIndicators}"/><DataGrid Grid.Column="1" ItemsSource="{Binding StaticAnalysis.EmbeddedPeFiles}"/></Grid></TabItem>
+                                </TabControl>
                             </TabItem>
                             <TabItem Header="API Raw">
                                 <TextBox Text="{Binding SelectedEvent.RawJson}" AcceptsReturn="True" TextWrapping="Wrap" FontFamily="Consolas" />

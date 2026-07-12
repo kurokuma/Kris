@@ -36,6 +36,9 @@ public sealed class PrivacyRedactor
                 RemoteIp = RedactText(n.RemoteIp)
             }).ToArray(),
             AnalystNotes = RedactText(data.AnalystNotes)
+            ,RawEvidenceFiles = Array.Empty<string>(),
+            PreservedFiles = Array.Empty<PreservedFile>()
+            ,RawEvidence = Array.Empty<RawEvidenceFile>()
         };
     }
 

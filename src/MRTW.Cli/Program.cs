@@ -65,7 +65,7 @@ internal static class CliApp
             ["schema"] = 1,
             ["hook_x64"] = new NativeHookLauncher().IsAvailable ? "available" : "not found",
             ["etw_collector"] = "TraceEvent"
-        }, $"MRTW CLI: 1.0.0-preview\nMRTW Core: 1.0.0-preview\nSchema: 2\nHook x64: {(new NativeHookLauncher().IsAvailable ? "available" : "not found")}\nETW Collector: TraceEvent");
+        }, $"MRTW CLI: 1.0.0-preview\nMRTW Core: 1.0.0-preview\nSchema: 3\nHook x64: {(new NativeHookLauncher().IsAvailable ? "available" : "not found")}\nETW Collector: TraceEvent");
         return 0;
     }
 
@@ -84,7 +84,7 @@ internal static class CliApp
         };
 
         Log(json, "doctor", checks,
-            $"MRTW Doctor\n[OK] OS: {Environment.OSVersion}\n[OK] .NET Runtime: {Environment.Version}\n[{(IsAdministrator() ? "OK" : "WARN")}] Administrator\n[OK] Workspace writable\n[OK] SQLite: Microsoft.Data.Sqlite\n[OK] TraceEvent: {typeof(TraceEventEtwCollector).Assembly.GetName().Version}\n[{(new NativeHookLauncher().IsAvailable ? "OK" : "WARN")}] Hook DLL: {(new NativeHookLauncher().IsAvailable ? "available" : "not found")}\n[INFO] Case schema: 2");
+            $"MRTW Doctor\n[OK] OS: {Environment.OSVersion}\n[OK] .NET Runtime: {Environment.Version}\n[{(IsAdministrator() ? "OK" : "WARN")}] Administrator\n[OK] Workspace writable\n[OK] SQLite: Microsoft.Data.Sqlite\n[OK] TraceEvent: {typeof(TraceEventEtwCollector).Assembly.GetName().Version}\n[{(new NativeHookLauncher().IsAvailable ? "OK" : "WARN")}] Hook DLL: {(new NativeHookLauncher().IsAvailable ? "available" : "not found")}\n[INFO] Case schema: 3");
         return 0;
     }
 
@@ -160,7 +160,8 @@ internal static class CliApp
             Get(options, "network") ?? profileDefaults.Network,
             killTree,
             timeoutAction,
-            executeTarget);
+            executeTarget,
+            exportOptions.PrivacyMode);
 
         var data = new AnalysisCaseRunner().Run(profile, output, exportOptions, Get(options, "case-name"), options.ContainsKey("overwrite"), options.ContainsKey("auto-suffix"));
         string casePath = Path.Combine(output, data.CaseName);
