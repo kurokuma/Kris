@@ -12,6 +12,8 @@ namespace MRTW.Core;
 
 public sealed class StaticAnalysisService
 {
+    // Interactive analysis must never allocate an attacker-controlled multi-gigabyte file.
+    public const long MaximumInputBytes = 256L * 1024 * 1024;
     private static readonly Regex InterestingStringPattern = new(
         @"(https?://[^\s""']+|[A-Za-z]:\\[^\r\n\t""']+|HK(CU|LM|CR|U|CC)\\[^\r\n\t""']+|[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}|powershell[^\r\n]*)",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
@@ -21,6 +23,12 @@ public sealed class StaticAnalysisService
         if (!File.Exists(path))
         {
             throw new FileNotFoundException("Target file was not found.", path);
+        }
+
+        var fileInfo = new FileInfo(path);
+        if (fileInfo.Length > MaximumInputBytes)
+        {
+            throw new InvalidDataException($"Target exceeds the static-analysis limit of {MaximumInputBytes / 1024 / 1024} MiB.");
         }
 
         byte[] data = File.ReadAllBytes(path);

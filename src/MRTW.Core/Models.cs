@@ -221,6 +221,9 @@ public sealed record SnapshotData(
     IReadOnlyList<RegistrySnapshotEntry> RegistryValues,
     IReadOnlyList<string> TcpConnections);
 
+/// <summary>Bounded snapshot result used by interactive collection.</summary>
+public sealed record SnapshotCaptureResult(SnapshotData Data, bool Completed, bool Canceled, bool Bounded, string Note);
+
 public sealed record SnapshotDiff(
     IReadOnlyList<FileSnapshotEntry> AddedFiles,
     IReadOnlyList<FileSnapshotEntry> ModifiedFiles,

@@ -19,7 +19,10 @@ var tests = new List<(string Name, Action Body)>
     ("untrusted evidence paths are not exported", TestUntrustedEvidenceExport),
     ("tampered raw evidence is rejected", TestTamperedRawEvidence),
     ("privacy profile disables raw ETL path", TestPrivacyProfile),
-    ("evidence generations do not collide", TestEvidenceGenerationCollision)
+    ("evidence generations do not collide", TestEvidenceGenerationCollision),
+    ("cancellation before launch never starts target", TestCancellationBeforeLaunch),
+    ("snapshot cancellation is immediate and bounded", TestSnapshotCancellation),
+    ("static analysis rejects oversized target", TestStaticAnalysisOversize)
 };
 
 int failures = 0;
@@ -49,6 +52,40 @@ static void TestNetworkModes()
 static void TestInvalidNetworkMode()
 {
     Throws<ArgumentException>(() => NetworkContainmentService.NormalizeMode("pretend"));
+}
+
+static void TestCancellationBeforeLaunch()
+{
+    using var canceled = new CancellationTokenSource();
+    canceled.Cancel();
+    string target = Environment.ProcessPath ?? typeof(RuntimeCaseCollector).Assembly.Location;
+    var profile = new ExecutionProfile(target, "exe", "none", null, $"\"{target}\"", Path.GetDirectoryName(target)!, null,
+        false, false, false, false, "observe");
+    var data = new RuntimeCaseCollector().Collect(profile, null, canceled.Token);
+    True(data.Events.Any(e => e.Action == "Collection Canceled Before Launch"), "pre-launch cancellation was not recorded");
+    True(!data.Events.Any(e => e.Action == "Process Start"), "target was launched after cancellation");
+}
+
+static void TestSnapshotCancellation()
+{
+    using var canceled = new CancellationTokenSource();
+    canceled.Cancel();
+    string target = Environment.ProcessPath ?? typeof(SnapshotService).Assembly.Location;
+    var profile = new ExecutionProfile(target, "exe", "none", null, "", Path.GetDirectoryName(target)!, null, false, false, true, false, "observe");
+    var result = new SnapshotService().Capture(profile, canceled.Token);
+    True(result.Canceled, "canceled snapshot was reported as active");
+    True(result.Data.Files.Count == 0, "canceled snapshot enumerated files");
+}
+
+static void TestStaticAnalysisOversize()
+{
+    string path = Path.Combine(Path.GetTempPath(), "mrtw-large-" + Guid.NewGuid().ToString("N") + ".bin");
+    try
+    {
+        using (var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write)) stream.SetLength(StaticAnalysisService.MaximumInputBytes + 1);
+        Throws<InvalidDataException>(() => new StaticAnalysisService().Analyze(path));
+    }
+    finally { if (File.Exists(path)) File.Delete(path); }
 }
 
 static void TestOrchestratorQuality()

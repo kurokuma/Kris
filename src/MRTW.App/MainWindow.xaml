@@ -38,24 +38,24 @@
     <DockPanel Background="{StaticResource AppBg}">
         <Menu DockPanel.Dock="Top">
             <MenuItem Header="_File">
-                <MenuItem Header="Open Target..." Click="OpenTarget_Click" />
-                <MenuItem Header="Open Case..." Click="OpenCase_Click" />
+                <MenuItem Header="Open Target..." Click="OpenTarget_Click" IsEnabled="{Binding CanChangeRunConfiguration}" />
+                <MenuItem Header="Open Case..." Click="OpenCase_Click" IsEnabled="{Binding CanChangeRunConfiguration}" />
                 <Separator />
-                <MenuItem Header="Export Case..." Click="Export_Click" />
+                <MenuItem Header="Export Case..." Click="Export_Click" IsEnabled="{Binding CanChangeRunConfiguration}" />
                 <Separator />
                 <MenuItem Header="Exit" Click="Exit_Click" />
             </MenuItem>
             <MenuItem Header="_Run">
-                <MenuItem Header="Start" Click="Start_Click" />
-                <MenuItem Header="Stop" Click="Stop_Click" />
-                <MenuItem Header="Restart" Click="Restart_Click" />
+                <MenuItem Header="Start" Click="Start_Click" IsEnabled="{Binding CanStart}" />
+                <MenuItem Header="Stop" Click="Stop_Click" IsEnabled="{Binding CanStop}" />
+                <MenuItem Header="Restart" Click="Restart_Click" IsEnabled="{Binding CanStop}" />
             </MenuItem>
             <MenuItem Header="_View">
                 <MenuItem Header="Recent Cases..." Click="RecentCases_Click" />
             </MenuItem>
             <MenuItem Header="_Settings">
-                <MenuItem Header="Profile Settings..." Click="ProfileSettings_Click" />
-                <MenuItem Header="Export Options..." Click="Settings_Click" />
+                <MenuItem Header="Profile Settings..." Click="ProfileSettings_Click" IsEnabled="{Binding CanChangeRunConfiguration}" />
+                <MenuItem Header="Export Options..." Click="Settings_Click" IsEnabled="{Binding CanChangeRunConfiguration}" />
             </MenuItem>
         </Menu>
 
@@ -81,7 +81,7 @@
                         <TextBlock Text="Target:" VerticalAlignment="Center" Foreground="{StaticResource TextSecondary}" Margin="0,0,8,0" />
                         <TextBlock Text="{Binding SelectedTargetDisplay}" Width="360" VerticalAlignment="Center" Foreground="{StaticResource TextPrimary}" TextTrimming="CharacterEllipsis" />
                         <TextBlock Text="Profile:" VerticalAlignment="Center" Foreground="{StaticResource TextSecondary}" Margin="16,0,8,0" />
-                        <ComboBox Width="150" ItemsSource="{Binding Profiles}" SelectedItem="{Binding SelectedProfile}" ToolTip="{Binding SelectedProfile.Description}">
+                        <ComboBox Width="150" ItemsSource="{Binding Profiles}" SelectedItem="{Binding SelectedProfile}" ToolTip="{Binding SelectedProfile.Description}" IsEnabled="{Binding CanChangeRunConfiguration}">
                             <ComboBox.Resources>
                                 <Style TargetType="{x:Type TextBlock}">
                                     <Setter Property="Foreground" Value="#111827" />
@@ -93,9 +93,9 @@
                                 </DataTemplate>
                             </ComboBox.ItemTemplate>
                         </ComboBox>
-                        <CheckBox Content="Privacy (no raw ETL)" IsChecked="{Binding PrivacyMode}" Margin="12,0,0,0" VerticalAlignment="Center"/>
+                        <CheckBox Content="Privacy (no raw ETL)" IsChecked="{Binding PrivacyMode}" Margin="12,0,0,0" VerticalAlignment="Center" IsEnabled="{Binding CanChangeRunConfiguration}"/>
                         <TextBlock Text="Export:" VerticalAlignment="Center" Foreground="{StaticResource TextSecondary}" Margin="16,0,8,0" />
-                        <ComboBox Width="170" ItemsSource="{Binding DllExportCandidates}" Text="{Binding SelectedDllExport, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" IsEditable="True" />
+                        <ComboBox Width="170" ItemsSource="{Binding DllExportCandidates}" Text="{Binding SelectedDllExport, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" IsEditable="True" IsEnabled="{Binding CanChangeRunConfiguration}" />
                     </StackPanel>
                 </Grid>
             </Border>
@@ -120,9 +120,9 @@
                     <TextBlock Grid.Column="3" Text="{Binding StaticAnalysis.Md5}" Foreground="#B8C6D8" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
                     <TextBlock Grid.Column="4" Text="Analysis Profile:" VerticalAlignment="Center" Foreground="{StaticResource TextPrimary}" />
                     <TextBlock Grid.Column="5" Text="{Binding SelectedProfile.DisplayName}" Foreground="{StaticResource AccentBlue}" VerticalAlignment="Center" Margin="8,0,0,0" TextTrimming="CharacterEllipsis" />
-                    <Button Grid.Column="6" Style="{StaticResource PrimaryButton}" Content="Start" Click="Start_Click" Width="104" />
-                    <Button Grid.Column="7" Style="{StaticResource DangerButton}" Content="Stop" Click="Stop_Click" Width="92" />
-                    <Button Grid.Column="8" Content="Restart" Click="Restart_Click" Width="104" />
+                    <Button Grid.Column="6" Style="{StaticResource PrimaryButton}" Content="Start" Click="Start_Click" Width="104" IsEnabled="{Binding CanStart}" />
+                    <Button Grid.Column="7" Style="{StaticResource DangerButton}" Content="Stop" Click="Stop_Click" Width="92" IsEnabled="{Binding CanStop}" />
+                    <Button Grid.Column="8" Content="Restart" Click="Restart_Click" Width="104" IsEnabled="{Binding CanStop}" />
                     <StackPanel Grid.Column="9" VerticalAlignment="Center" HorizontalAlignment="Right">
                         <TextBlock Text="Run Duration" Foreground="{StaticResource TextSecondary}" HorizontalAlignment="Right" />
                         <TextBlock Text="{Binding RunDuration}" Foreground="{StaticResource AccentBlue}" FontSize="18" FontWeight="SemiBold" HorizontalAlignment="Right" />

@@ -2,6 +2,9 @@ using System.IO;
 using System.Text;
 using System.Windows;
 using System.Windows.Threading;
+using System.Collections.Concurrent;
+using System.ComponentModel;
+using System.Threading;
 using Microsoft.Win32;
 using MRTW.Collectors.Etw;
 using MRTW.Core;
@@ -14,6 +17,9 @@ public partial class MainWindow : Window
     private readonly DispatcherTimer _runTimer;
     private CancellationTokenSource? _runCancellation;
     private Task? _runTask;
+    private LiveUpdateQueue? _liveQueue;
+    private int _runGeneration;
+    private bool _closePending;
 
     public MainWindow()
     {
@@ -31,7 +37,7 @@ public partial class MainWindow : Window
         _runTimer.Tick += (_, _) => _viewModel.UpdateRunDuration();
     }
 
-    private void OpenTarget_Click(object sender, RoutedEventArgs e)
+    private async void OpenTarget_Click(object sender, RoutedEventArgs e)
     {
         var dialog = new OpenFileDialog
         {
@@ -41,11 +47,22 @@ public partial class MainWindow : Window
 
         if (dialog.ShowDialog(this) == true)
         {
-            _viewModel.SelectTarget(dialog.FileName);
+            string path = dialog.FileName;
+            try
+            {
+                _viewModel.StatusText = "Analyzing target...";
+                var analysis = await Task.Run(() => new StaticAnalysisService().Analyze(path));
+                if (!_viewModel.IsMonitoring) _viewModel.SelectTarget(path, analysis);
+            }
+            catch (Exception ex)
+            {
+                _viewModel.StatusText = "Ready";
+                MessageBox.Show(this, ex.Message, "MRTW Static Analysis Error", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
         }
     }
 
-    private void OpenCase_Click(object sender, RoutedEventArgs e)
+    private async void OpenCase_Click(object sender, RoutedEventArgs e)
     {
         var dialog = new OpenFileDialog
         {
@@ -55,8 +72,22 @@ public partial class MainWindow : Window
 
         if (dialog.ShowDialog(this) == true)
         {
-            _viewModel.LoadCase(dialog.FileName);
-            ScrollTimelineToEnd();
+            try
+            {
+                string path = dialog.FileName;
+                _viewModel.StatusText = "Opening case...";
+                var data = await Task.Run(() => new CaseService().Load(path));
+                if (!_viewModel.IsMonitoring)
+                {
+                    _viewModel.LoadCaseData(data);
+                    ScrollTimelineToEnd();
+                }
+            }
+            catch (Exception ex)
+            {
+                _viewModel.StatusText = "Ready";
+                MessageBox.Show(this, ex.Message, "MRTW Open Case Error", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
         }
     }
 
@@ -84,26 +115,32 @@ public partial class MainWindow : Window
             await _runTask;
         }
 
+        Task<CaseData>? task = null;
+        CancellationTokenSource? cancellation = null;
         try
         {
             var profile = _viewModel.PrepareRun();
             _viewModel.BeginLiveRun(profile);
-            _runCancellation = new CancellationTokenSource();
+            cancellation = new CancellationTokenSource();
+            _runCancellation = cancellation;
+            int generation = Interlocked.Increment(ref _runGeneration);
+            var liveQueue = new LiveUpdateQueue(generation);
+            _liveQueue = liveQueue;
             _runTimer.Start();
-            _runTask = Task.Run(() => new AnalysisOrchestrator().Collect(
+            task = Task.Run(() => new AnalysisOrchestrator().Collect(
                 profile,
                 _viewModel.StaticAnalysis,
-                _runCancellation.Token,
-                timelineEvent => Dispatcher.Invoke(() =>
-                {
-                    _viewModel.AppendLiveEvent(timelineEvent);
-                    ScrollTimelineToEnd();
-                }),
-                session => Dispatcher.BeginInvoke(() => _viewModel.AppendLiveNetworkSession(session))));
-            var data = await (Task<CaseData>)_runTask;
-            _runTimer.Stop();
-            _viewModel.CompleteRun(data, _runCancellation.IsCancellationRequested);
-            ScrollTimelineToEnd();
+                cancellation.Token,
+                timelineEvent => QueueLiveEvent(liveQueue, timelineEvent),
+                session => QueueLiveNetworkSession(liveQueue, session)));
+            _runTask = task;
+            var data = await task;
+            if (generation == Volatile.Read(ref _runGeneration))
+            {
+                _runTimer.Stop();
+                _viewModel.CompleteRun(data, cancellation.IsCancellationRequested);
+                ScrollTimelineToEnd();
+            }
         }
         catch (InvalidOperationException ex)
         {
@@ -119,9 +156,13 @@ public partial class MainWindow : Window
         }
         finally
         {
-            _runCancellation?.Dispose();
-            _runCancellation = null;
-            _runTask = null;
+            if (task is not null && ReferenceEquals(_runTask, task))
+            {
+                _runTimer.Stop();
+                _runCancellation?.Dispose();
+                _runCancellation = null;
+                _runTask = null;
+            }
         }
     }
 
@@ -183,11 +224,22 @@ public partial class MainWindow : Window
         MessageBox.Show(this, builder.Length == 0 ? "No recent cases were found." : builder.ToString(), "Recent Cases", MessageBoxButton.OK, MessageBoxImage.Information);
     }
 
-    private void Export_Click(object sender, RoutedEventArgs e)
+    private async void Export_Click(object sender, RoutedEventArgs e)
     {
-        string outputRoot = Path.Combine(AppContext.BaseDirectory, "out");
-        string caseDir = _viewModel.ExportCurrentCase(outputRoot);
-        MessageBox.Show(this, $"Case exported:\n{caseDir}", "MRTW Export", MessageBoxButton.OK, MessageBoxImage.Information);
+        try
+        {
+            string outputRoot = Path.Combine(AppContext.BaseDirectory, "out");
+            var snapshot = _viewModel.CurrentCase;
+            _viewModel.StatusText = "Exporting case...";
+            string caseDir = await Task.Run(() => _viewModel.ExportCase(snapshot, outputRoot));
+            _viewModel.StatusText = "Case exported";
+            MessageBox.Show(this, $"Case exported:\n{caseDir}", "MRTW Export", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+        catch (Exception ex)
+        {
+            _viewModel.StatusText = "Export failed";
+            MessageBox.Show(this, ex.Message, "MRTW Export Error", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
     }
 
     private void Exit_Click(object sender, RoutedEventArgs e)
@@ -216,6 +268,82 @@ public partial class MainWindow : Window
                 TimelineGrid.ScrollIntoView(last);
             }
         }, DispatcherPriority.Background);
+    }
+
+    private void QueueLiveEvent(LiveUpdateQueue queue, TimelineEvent timelineEvent)
+    {
+        if (!ReferenceEquals(queue, Volatile.Read(ref _liveQueue)) || queue.Generation != Volatile.Read(ref _runGeneration)) return;
+        queue.Enqueue(timelineEvent);
+        ScheduleLiveFlush(queue);
+    }
+
+    private void QueueLiveNetworkSession(LiveUpdateQueue queue, NetworkSession session)
+    {
+        if (!ReferenceEquals(queue, Volatile.Read(ref _liveQueue)) || queue.Generation != Volatile.Read(ref _runGeneration)) return;
+        queue.Enqueue(session);
+        ScheduleLiveFlush(queue);
+    }
+
+    private void ScheduleLiveFlush(LiveUpdateQueue queue)
+    {
+        if (!queue.TrySchedule()) return;
+        Dispatcher.BeginInvoke(() => FlushLiveUpdates(queue), DispatcherPriority.Background);
+    }
+
+    private void FlushLiveUpdates(LiveUpdateQueue queue)
+    {
+        queue.MarkFlushed();
+        if (!ReferenceEquals(queue, Volatile.Read(ref _liveQueue)) || queue.Generation != Volatile.Read(ref _runGeneration) || !_viewModel.IsMonitoring)
+        {
+            return;
+        }
+        var events = queue.DequeueEvents(256);
+        _viewModel.AppendLiveEvents(events);
+        foreach (var session in queue.DequeueNetworkSessions(128)) _viewModel.AppendLiveNetworkSession(session);
+        _viewModel.SetLiveQueueDropCount(queue.DroppedEvents + queue.DroppedNetworkSessions);
+        if (!queue.IsEmpty) ScheduleLiveFlush(queue);
+        if (events.Count > 0) ScrollTimelineToEnd();
+    }
+
+    protected override void OnClosing(CancelEventArgs e)
+    {
+        if (!_closePending && _runTask is { IsCompleted: false })
+        {
+            e.Cancel = true;
+            _closePending = true;
+            Interlocked.Increment(ref _runGeneration);
+            _liveQueue = null;
+            StopCurrentRun();
+            _ = AwaitCloseAsync(_runTask);
+            return;
+        }
+        base.OnClosing(e);
+    }
+
+    private async Task AwaitCloseAsync(Task task)
+    {
+        try { await task; } catch { }
+        _ = Dispatcher.BeginInvoke(Close);
+    }
+
+    private sealed class LiveUpdateQueue(int generation)
+    {
+        private const int EventCapacity = 10_000;
+        private const int NetworkCapacity = 2_000;
+        private readonly ConcurrentQueue<TimelineEvent> _events = new();
+        private readonly ConcurrentQueue<NetworkSession> _network = new();
+        private int _eventCount, _networkCount, _scheduled;
+        private long _droppedEvents, _droppedNetwork;
+        public int Generation { get; } = generation;
+        public long DroppedEvents => Interlocked.Read(ref _droppedEvents);
+        public long DroppedNetworkSessions => Interlocked.Read(ref _droppedNetwork);
+        public bool IsEmpty => Volatile.Read(ref _eventCount) == 0 && Volatile.Read(ref _networkCount) == 0;
+        public void Enqueue(TimelineEvent value) { if (Interlocked.Increment(ref _eventCount) > EventCapacity) { Interlocked.Decrement(ref _eventCount); Interlocked.Increment(ref _droppedEvents); return; } _events.Enqueue(value); }
+        public void Enqueue(NetworkSession value) { if (Interlocked.Increment(ref _networkCount) > NetworkCapacity) { Interlocked.Decrement(ref _networkCount); Interlocked.Increment(ref _droppedNetwork); return; } _network.Enqueue(value); }
+        public List<TimelineEvent> DequeueEvents(int maximum) { var result = new List<TimelineEvent>(maximum); while (result.Count < maximum && _events.TryDequeue(out var value)) { Interlocked.Decrement(ref _eventCount); result.Add(value); } return result; }
+        public List<NetworkSession> DequeueNetworkSessions(int maximum) { var result = new List<NetworkSession>(maximum); while (result.Count < maximum && _network.TryDequeue(out var value)) { Interlocked.Decrement(ref _networkCount); result.Add(value); } return result; }
+        public bool TrySchedule() => Interlocked.Exchange(ref _scheduled, 1) == 0;
+        public void MarkFlushed() => Interlocked.Exchange(ref _scheduled, 0);
     }
 
 }

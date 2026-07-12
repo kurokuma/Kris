@@ -12,7 +12,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
 {
     private TimelineEvent? _selectedEvent;
     private string _samplePath = string.Empty;
-    private bool _isMonitoring = true;
+    private bool _isMonitoring;
     private string _statusText = "Ready";
     private ProfileOption _selectedProfile;
     private string _runDuration = "00:00:00";
@@ -31,6 +31,8 @@ public sealed class MainViewModel : INotifyPropertyChanged
     private bool _showNoiseEvents;
     private ProcessNode? _selectedProcessNode;
     private readonly Stopwatch _runClock = new();
+    private long _liveQueueDropCount;
+    private DateTimeOffset _lastLiveBindingRefresh;
 
     public MainViewModel()
     {
@@ -104,7 +106,22 @@ public sealed class MainViewModel : INotifyPropertyChanged
         {
             _isMonitoring = value;
             OnPropertyChanged();
+            OnPropertyChanged(nameof(CanStart));
+            OnPropertyChanged(nameof(CanStop));
+            OnPropertyChanged(nameof(CanChangeRunConfiguration));
         }
+    }
+
+    public bool CanStart => !IsMonitoring;
+    public bool CanStop => IsMonitoring;
+    public bool CanChangeRunConfiguration => !IsMonitoring;
+    public string LiveCaptureSummary => _liveQueueDropCount == 0 ? "Live capture queue: no dropped UI updates" : $"Live capture queue: {_liveQueueDropCount} UI updates dropped; the final case still contains collector data.";
+
+    public void SetLiveQueueDropCount(long value)
+    {
+        if (_liveQueueDropCount == value) return;
+        _liveQueueDropCount = value;
+        OnPropertyChanged(nameof(LiveCaptureSummary));
     }
 
     public string StatusText
@@ -371,8 +388,13 @@ public sealed class MainViewModel : INotifyPropertyChanged
 
     public void SelectTarget(string path)
     {
+        SelectTarget(path, File.Exists(path) ? new StaticAnalysisService().Analyze(path) : StaticAnalysis);
+    }
+
+    public void SelectTarget(string path, StaticAnalysisResult analysis)
+    {
         SamplePath = path;
-        StaticAnalysis = File.Exists(path) ? new StaticAnalysisService().Analyze(path) : StaticAnalysis;
+        StaticAnalysis = analysis;
         SelectedDllExport = DllExportCandidates.FirstOrDefault(e => e.Equals("DllRegisterServer", StringComparison.OrdinalIgnoreCase))
             ?? DllExportCandidates.FirstOrDefault()
             ?? "DllRegisterServer";
@@ -419,25 +441,36 @@ public sealed class MainViewModel : INotifyPropertyChanged
             Array.Empty<NetworkSession>(),
             "Analysis is running. Timeline events are appended as they are captured.");
         SelectedEvent = null;
+        SetLiveQueueDropCount(0);
         RefreshCaseBindings();
     }
 
     public void AppendLiveEvent(TimelineEvent timelineEvent)
     {
-        var events = BehaviorCorrelator.Correlate(CurrentCase.Events.Concat([timelineEvent]).OrderBy(e => e.Time).ToArray()).ToArray();
-        var processNodes = BuildLiveProcessNodes(events);
-        events = AttachLiveProcessGuids(events, processNodes, CurrentCase.CaseId, CurrentCase.StartedAt);
+        AppendLiveEvents([timelineEvent]);
+    }
+
+    public void AppendLiveEvents(IEnumerable<TimelineEvent> timelineEvents)
+    {
+        var appended = timelineEvents.ToArray();
+        if (appended.Length == 0) return;
+        // Full correlation/process reconstruction is intentionally deferred to CompleteRun.
+        // Repeating it for every ETW event made live collection progressively slower.
+        // Collector order is already chronological. Avoid sorting the entire timeline for each UI batch.
+        var events = CurrentCase.Events.Concat(appended).ToArray();
         CurrentCase = CurrentCase with
         {
             Duration = _runClock.Elapsed,
             Events = events,
-            Processes = processNodes,
-            Artifacts = BuildLiveArtifacts(events, processNodes),
             AnalystNotes = "Analysis is running. Timeline events are appended as they are captured."
         };
 
-        SelectedEvent ??= timelineEvent;
-        RefreshCaseBindings();
+        SelectedEvent ??= appended[0];
+        if (DateTimeOffset.UtcNow - _lastLiveBindingRefresh >= TimeSpan.FromMilliseconds(250))
+        {
+            _lastLiveBindingRefresh = DateTimeOffset.UtcNow;
+            RefreshLiveBindings();
+        }
     }
 
     public void AppendLiveNetworkSession(NetworkSession session)
@@ -449,7 +482,11 @@ public sealed class MainViewModel : INotifyPropertyChanged
             AnalystNotes = "Analysis is running. Timeline events are appended as they are captured."
         };
 
-        RefreshCaseBindings();
+        if (DateTimeOffset.UtcNow - _lastLiveBindingRefresh >= TimeSpan.FromMilliseconds(250))
+        {
+            _lastLiveBindingRefresh = DateTimeOffset.UtcNow;
+            RefreshLiveBindings();
+        }
     }
 
     public void CompleteRun(CaseData data, bool stopped)
@@ -546,7 +583,12 @@ public sealed class MainViewModel : INotifyPropertyChanged
 
     public void LoadCase(string casePath)
     {
-        CurrentCase = new CaseService().Load(casePath);
+        LoadCaseData(new CaseService().Load(casePath));
+    }
+
+    public void LoadCaseData(CaseData data)
+    {
+        CurrentCase = data;
         StaticAnalysis = CurrentCase.StaticAnalysis ?? EmptyStaticAnalysis();
         SamplePath = CurrentCase.SamplePath;
         SelectedEvent = CurrentCase.Events.FirstOrDefault();
@@ -557,9 +599,15 @@ public sealed class MainViewModel : INotifyPropertyChanged
 
     public string ExportCurrentCase(string outputRoot, bool privacyMode = false)
     {
-        string caseDir = Path.Combine(outputRoot, CurrentCase.CaseName);
-        new CaseExportService().WriteCaseBundle(CurrentCase, caseDir, ExportSettings.ToExportOptions(privacyMode));
+        var result = ExportCase(CurrentCase, outputRoot, privacyMode);
         StatusText = "Case exported";
+        return result;
+    }
+
+    public string ExportCase(CaseData data, string outputRoot, bool privacyMode = false)
+    {
+        string caseDir = Path.Combine(outputRoot, data.CaseName);
+        new CaseExportService().WriteCaseBundle(data, caseDir, ExportSettings.ToExportOptions(privacyMode));
         return caseDir;
     }
 
@@ -590,6 +638,18 @@ public sealed class MainViewModel : INotifyPropertyChanged
         OnPropertyChanged(nameof(EvidenceSummary));
         OnPropertyChanged(nameof(AnalysisSummary));
         OnPropertyChanged(nameof(SelectedTargetDisplay));
+    }
+
+    private void RefreshLiveBindings()
+    {
+        OnPropertyChanged(nameof(CurrentCase));
+        OnPropertyChanged(nameof(FilteredEvents));
+        OnPropertyChanged(nameof(ProcessFilterOptions));
+        OnPropertyChanged(nameof(FileEventCount));
+        OnPropertyChanged(nameof(RegistryEventCount));
+        OnPropertyChanged(nameof(NetworkEventCount));
+        OnPropertyChanged(nameof(DnsEventCount));
+        OnPropertyChanged(nameof(AnalysisSummary));
     }
 
     public void ResetTimelineFilters()

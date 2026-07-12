@@ -8,12 +8,18 @@ namespace MRTW.Core;
 
 public sealed class HookPipeServer : IAsyncDisposable
 {
+    private const int MaximumLineBytes = 64 * 1024;
+    private const int MaximumQueuedLines = 4_096;
+    private const int MaximumDrainEvents = 512;
     private readonly CancellationTokenSource _cancellation = new();
     private readonly ConcurrentQueue<string> _rawLines = new();
     private Task? _serverTask;
     private long _receivedLines;
     private long _parseFailures;
     private long _connectionFailures;
+    private long _droppedLines;
+    private long _oversizeLines;
+    private int _queuedLines;
 
     public string PipeName { get; } = "mrtw-hook-" + Guid.NewGuid().ToString("N");
 
@@ -22,6 +28,9 @@ public sealed class HookPipeServer : IAsyncDisposable
     public long ReceivedLines => Interlocked.Read(ref _receivedLines);
     public long ParseFailures => Interlocked.Read(ref _parseFailures);
     public long ConnectionFailures => Interlocked.Read(ref _connectionFailures);
+    public long DroppedLines => Interlocked.Read(ref _droppedLines);
+    public long OversizeLines => Interlocked.Read(ref _oversizeLines);
+    public int QueuedLines => Volatile.Read(ref _queuedLines);
 
     public void Start()
     {
@@ -31,8 +40,9 @@ public sealed class HookPipeServer : IAsyncDisposable
     public IReadOnlyList<TimelineEvent> DrainEvents(DateTimeOffset startedAt, ref int nextId)
     {
         var events = new List<TimelineEvent>();
-        while (_rawLines.TryDequeue(out string? line))
+        while (events.Count < MaximumDrainEvents && _rawLines.TryDequeue(out string? line))
         {
+            Interlocked.Decrement(ref _queuedLines);
             events.Add(ToTimelineEvent(line, startedAt, nextId++));
         }
 
@@ -65,17 +75,29 @@ public sealed class HookPipeServer : IAsyncDisposable
             {
                 await using var server = new NamedPipeServerStream(PipeName, PipeDirection.In, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
                 await server.WaitForConnectionAsync(_cancellation.Token);
-                using var reader = new StreamReader(server, Encoding.UTF8, leaveOpen: true);
                 while (!_cancellation.IsCancellationRequested && server.IsConnected)
                 {
-                    string? line = await reader.ReadLineAsync(_cancellation.Token);
-                    if (line is null)
+                    var line = await ReadBoundedLineAsync(server, _cancellation.Token);
+                    if (line.EndOfStream)
                     {
                         break;
                     }
-
-                    _rawLines.Enqueue(line);
                     Interlocked.Increment(ref _receivedLines);
+                    if (line.Oversize)
+                    {
+                        Interlocked.Increment(ref _oversizeLines);
+                        continue;
+                    }
+                    if (line.Value is not null)
+                    {
+                        if (Interlocked.Increment(ref _queuedLines) > MaximumQueuedLines)
+                        {
+                            Interlocked.Decrement(ref _queuedLines);
+                            Interlocked.Increment(ref _droppedLines);
+                            continue;
+                        }
+                        _rawLines.Enqueue(line.Value);
+                    }
                 }
             }
             catch (OperationCanceledException)
@@ -87,6 +109,21 @@ public sealed class HookPipeServer : IAsyncDisposable
                 Interlocked.Increment(ref _connectionFailures);
                 await Task.Delay(100, _cancellation.Token).ContinueWith(_ => { });
             }
+        }
+    }
+
+    private static async ValueTask<(string? Value, bool Oversize, bool EndOfStream)> ReadBoundedLineAsync(Stream stream, CancellationToken cancellationToken)
+    {
+        byte[] buffer = new byte[MaximumLineBytes];
+        int count = 0;
+        bool oversize = false;
+        var one = new byte[1];
+        while (true)
+        {
+            int read = await stream.ReadAsync(one.AsMemory(0, 1), cancellationToken);
+            if (read == 0) return (count == 0 && !oversize ? null : Encoding.UTF8.GetString(buffer, 0, count), oversize, true);
+            if (one[0] == (byte)'\n') return (oversize ? null : Encoding.UTF8.GetString(buffer, 0, count).TrimEnd('\r'), oversize, false);
+            if (count < buffer.Length) buffer[count++] = one[0]; else oversize = true;
         }
     }
 

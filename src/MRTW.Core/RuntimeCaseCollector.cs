@@ -38,9 +38,16 @@ public sealed class RuntimeCaseCollector
         HookPipeServer? hookPipe = null;
         int callbackFailures = 0;
 
-        SnapshotData before = profile.SnapshotBefore ? _snapshot.Capture(profile) : EmptySnapshot();
+        var beforeCapture = profile.SnapshotBefore ? _snapshot.Capture(profile, cancellationToken) : new SnapshotCaptureResult(EmptySnapshot(), true, false, false, "Pre-execution snapshot disabled.");
+        SnapshotData before = beforeCapture.Data;
+        if (cancellationToken.IsCancellationRequested)
+        {
+            var canceled = Event(nextId++, TimeSpan.Zero, Path.GetFileName(profile.TargetPath), 0, EventCategory.Api, "Collection Canceled Before Launch", profile.TargetPath, beforeCapture.Note, EventSeverity.Low, "Runtime");
+            return new CaseData(caseId, $"{Path.GetFileNameWithoutExtension(profile.TargetPath)}_canceled", Path.GetFileName(profile.TargetPath), profile.TargetPath,
+                staticAnalysis?.Sha256 ?? "unknown", started, DateTimeOffset.UtcNow - started, staticAnalysis, [], [canceled], [], [], "Collection was stopped before the target was launched.") { TrustedEvidenceRoot = EvidencePathPolicy.Root(caseId) };
+        }
         var prestaged = profile.SnapshotBefore
-            ? _snapshot.PreserveChangedFiles(new SnapshotDiff(before.Files.Where(f => f.IsExecutable || (f.AlternateStreams?.Count ?? 0) > 0).Take(64).ToArray(), [], [], [], [], [], []), caseId, "before")
+            ? _snapshot.PreserveChangedFiles(new SnapshotDiff(before.Files.Where(f => f.IsExecutable || (f.AlternateStreams?.Count ?? 0) > 0).Take(64).ToArray(), [], [], [], [], [], []), caseId, "before", cancellationToken)
             : [];
         var seenTcpConnections = before.TcpConnections.ToHashSet(StringComparer.OrdinalIgnoreCase);
         Process? process = null;
@@ -80,6 +87,11 @@ public sealed class RuntimeCaseCollector
             }
         }
 
+        if (beforeCapture.Bounded)
+        {
+            Add(Event(nextId++, TimeSpan.Zero, "snapshot", 0, EventCategory.Api, "Snapshot Bounded", "before", beforeCapture.Note, EventSeverity.Low, "Snapshot"));
+        }
+
         void AddMany(IEnumerable<TimelineEvent> timelineEvents)
         {
             foreach (var timelineEvent in timelineEvents)
@@ -107,10 +119,16 @@ public sealed class RuntimeCaseCollector
         {
             try
             {
+                if (!VerifyTargetIntegrity(profile, staticAnalysis, cancellationToken, out string integrityMessage))
+                {
+                    Add(Event(nextId++, DateTimeOffset.Now - started, Path.GetFileName(profile.TargetPath), 0, EventCategory.Process, "Target Integrity Check Failed", profile.TargetPath, integrityMessage, EventSeverity.High, "ExecutionManager"));
+                    throw new InvalidOperationException("The target changed after static analysis and was not launched.");
+                }
                 var nativeHook = new NativeHookLauncher();
                 bool hookSupported = IsNativeHookSupported(profile, staticAnalysis);
                 if (profile.EnableHook && nativeHook.IsAvailable && hookSupported)
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
                     hookPipe = new HookPipeServer();
                     hookPipe.Start();
                     processStarted = DateTimeOffset.Now;
@@ -210,8 +228,9 @@ public sealed class RuntimeCaseCollector
                     int injectedPid = observedInjectedPid > 0 ? observedInjectedPid : TryReadInjectedPid(output);
                     if ((!injectorExited || injectorExitCode != 0) && injectedPid == 0)
                     {
+                        cancellationToken.ThrowIfCancellationRequested();
                         Add(Event(nextId++, DateTimeOffset.Now - started, Path.GetFileName(profile.TargetPath), 0, EventCategory.Process, "Hook Fallback Start", profile.CommandLine, "Native hook injection did not produce a target PID; starting target without hook.", EventSeverity.Medium, "ExecutionManager"));
-                        process = StartProcess(profile);
+                        process = StartProcess(profile, cancellationToken);
                         pid = process.Id;
                         processStarted = DateTimeOffset.Now;
                     }
@@ -281,6 +300,7 @@ public sealed class RuntimeCaseCollector
                 }
                 else
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
                     if (profile.EnableHook && !hookSupported)
                     {
                         Add(Event(nextId++, DateTimeOffset.Now - started, Path.GetFileName(profile.TargetPath), 0, EventCategory.Api, "Hook Skipped", staticAnalysis?.Architecture ?? "unknown", NativeHookSkipSummary(staticAnalysis), EventSeverity.Medium, "ExecutionManager"));
@@ -290,7 +310,7 @@ public sealed class RuntimeCaseCollector
                         Add(Event(nextId++, DateTimeOffset.Now - started, Path.GetFileName(profile.TargetPath), 0, EventCategory.Api, "Hook Unavailable", "native\\hook_x64.dll", "Native hook binaries were not found; falling back to standard process execution.", EventSeverity.Medium, "ExecutionManager"));
                     }
 
-                    process = StartProcess(profile);
+                    process = StartProcess(profile, cancellationToken);
                     pid = process.Id;
                     processStarted = DateTimeOffset.Now;
                     Add(Event(nextId++, processStarted.Value - started, SafeProcessName(process, profile), pid.Value, EventCategory.Process, "Process Start", profile.CommandLine, "Process started", EventSeverity.Informational, "ExecutionManager"));
@@ -323,6 +343,10 @@ public sealed class RuntimeCaseCollector
                     }
                 }
             }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                Add(Event(nextId++, DateTimeOffset.Now - started, Path.GetFileName(profile.TargetPath), pid ?? 0, EventCategory.Process, "User Stop", profile.CommandLine, "Collection stopped before a further target launch.", EventSeverity.Low, "ExecutionManager"));
+            }
             catch (Exception ex)
             {
                 Add(Event(nextId++, DateTimeOffset.Now - started, Path.GetFileName(profile.TargetPath), 0, EventCategory.Process, "Execution Failed", profile.CommandLine, ex.Message, EventSeverity.High, "ExecutionManager"));
@@ -336,8 +360,8 @@ public sealed class RuntimeCaseCollector
                     long transportFailures = hookPipe.ParseFailures + hookPipe.ConnectionFailures;
                     Add(Event(nextId++, DateTimeOffset.UtcNow - started, "hook", pid ?? 0, EventCategory.Api,
                         "Hook Transport Summary",
-                        $"received={hookPipe.ReceivedLines};parse_failures={hookPipe.ParseFailures};connection_failures={hookPipe.ConnectionFailures}",
-                        transportFailures == 0 ? "Hook pipe transport completed without observed loss." : "Hook pipe transport reported failures; the case may be incomplete.",
+                        $"received={hookPipe.ReceivedLines};parse_failures={hookPipe.ParseFailures};connection_failures={hookPipe.ConnectionFailures};dropped={hookPipe.DroppedLines};oversize={hookPipe.OversizeLines};queued={hookPipe.QueuedLines}",
+                        transportFailures == 0 && hookPipe.DroppedLines == 0 && hookPipe.OversizeLines == 0 ? "Hook pipe transport completed without observed loss." : "Hook pipe transport reported failures or bounded input; the case may be incomplete.",
                         transportFailures == 0 ? EventSeverity.Informational : EventSeverity.High,
                         "Hook"));
                     hookPipe.DisposeAsync().AsTask().GetAwaiter().GetResult();
@@ -349,7 +373,10 @@ public sealed class RuntimeCaseCollector
             Add(Event(nextId++, TimeSpan.Zero, Path.GetFileName(profile.TargetPath), 0, EventCategory.Process, "Execution Skipped", profile.TargetPath, "Execution disabled by profile", EventSeverity.Low, "ExecutionManager"));
         }
 
-        SnapshotData after = profile.SnapshotAfter ? _snapshot.Capture(profile) : EmptySnapshot();
+        var afterCapture = !cancellationToken.IsCancellationRequested && profile.SnapshotAfter
+            ? _snapshot.Capture(profile, cancellationToken)
+            : new SnapshotCaptureResult(EmptySnapshot(), !cancellationToken.IsCancellationRequested, cancellationToken.IsCancellationRequested, false, cancellationToken.IsCancellationRequested ? "Post-execution snapshot skipped after cancellation." : "Post-execution snapshot disabled.");
+        SnapshotData after = afterCapture.Data;
         SnapshotDiff diff = _snapshot.Diff(before, after);
         if (File.Exists(profile.TargetPath) && staticAnalysis is not null && new FileInfo(profile.TargetPath).Length <= 32L * 1024 * 1024)
         {
@@ -357,7 +384,11 @@ public sealed class RuntimeCaseCollector
             var staged = new FileSnapshotEntry(targetInfo.FullName, targetInfo.Length, targetInfo.LastWriteTimeUtc, staticAnalysis.Sha256, targetInfo.Attributes.ToString());
             diff = diff with { AddedFiles = diff.AddedFiles.Prepend(staged).DistinctBy(f => f.Path, StringComparer.OrdinalIgnoreCase).ToArray() };
         }
-        var preservedFiles = _snapshot.PreserveChangedFiles(diff, caseId, "after").Concat(prestaged.Where(p => diff.DeletedFiles.Contains(p.OriginalPath, StringComparer.OrdinalIgnoreCase)).Select(p => p with { Reason = "deleted-high-risk-prestage" })).DistinctBy(p => p.StoredPath, StringComparer.OrdinalIgnoreCase).ToArray();
+        var preservedFiles = cancellationToken.IsCancellationRequested ? prestaged : _snapshot.PreserveChangedFiles(diff, caseId, "after", cancellationToken).Concat(prestaged.Where(p => diff.DeletedFiles.Contains(p.OriginalPath, StringComparer.OrdinalIgnoreCase)).Select(p => p with { Reason = "deleted-high-risk-prestage" })).DistinctBy(p => p.StoredPath, StringComparer.OrdinalIgnoreCase).ToArray();
+        if (afterCapture.Bounded || afterCapture.Canceled)
+        {
+            Add(Event(nextId++, DateTimeOffset.UtcNow - started, "snapshot", 0, EventCategory.Api, afterCapture.Canceled ? "Post Snapshot Skipped" : "Snapshot Bounded", "after", afterCapture.Note, EventSeverity.Low, "Snapshot"));
+        }
         AddSnapshotEvents(Add, diff, started, ref nextId);
         AddNetworkEvents(Add, networks, diff, seenTcpConnections, started, ref nextId);
         if (callbackFailures > 0)
@@ -397,8 +428,9 @@ public sealed class RuntimeCaseCollector
             PreservedFiles: preservedFiles) { TrustedEvidenceRoot = EvidencePathPolicy.Root(caseId) };
     }
 
-    private static Process StartProcess(ExecutionProfile profile)
+    private static Process StartProcess(ExecutionProfile profile, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var startInfo = new ProcessStartInfo
         {
             WorkingDirectory = Directory.Exists(profile.WorkingDirectory) ? profile.WorkingDirectory : Environment.CurrentDirectory,
@@ -428,12 +460,41 @@ public sealed class RuntimeCaseCollector
         }
         catch (Win32Exception ex) when (ex.NativeErrorCode == ErrorElevationRequired)
         {
-            return StartElevatedProcess(profile);
+            cancellationToken.ThrowIfCancellationRequested();
+            return StartElevatedProcess(profile, cancellationToken);
         }
     }
 
-    private static Process StartElevatedProcess(ExecutionProfile profile)
+    private static bool VerifyTargetIntegrity(ExecutionProfile profile, StaticAnalysisResult? staticAnalysis, CancellationToken cancellationToken, out string message)
     {
+        message = "Static analysis was not available; execution integrity comparison was skipped.";
+        if (staticAnalysis is null || string.IsNullOrWhiteSpace(staticAnalysis.Sha256)) return true;
+        if (!profile.TargetType.Equals("exe", StringComparison.OrdinalIgnoreCase) && !profile.TargetType.Equals("dll", StringComparison.OrdinalIgnoreCase)) return true;
+        cancellationToken.ThrowIfCancellationRequested();
+        try
+        {
+            if (!File.Exists(profile.TargetPath)) { message = "Target no longer exists after static analysis."; return false; }
+            using var stream = new FileStream(profile.TargetPath, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024, FileOptions.SequentialScan);
+            using var hash = System.Security.Cryptography.IncrementalHash.CreateHash(System.Security.Cryptography.HashAlgorithmName.SHA256);
+            byte[] buffer = new byte[64 * 1024];
+            int read;
+            while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                hash.AppendData(buffer, 0, read);
+            }
+            string actual = Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
+            if (string.Equals(actual, staticAnalysis.Sha256, StringComparison.OrdinalIgnoreCase)) return true;
+            message = $"SHA-256 changed after static analysis (expected {staticAnalysis.Sha256}, observed {actual}).";
+            return false;
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex) { message = $"Unable to verify target integrity: {ex.Message}"; return false; }
+    }
+
+    private static Process StartElevatedProcess(ExecutionProfile profile, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
         var startInfo = new ProcessStartInfo
         {
             WorkingDirectory = Directory.Exists(profile.WorkingDirectory) ? profile.WorkingDirectory : Environment.CurrentDirectory,
