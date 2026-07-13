@@ -249,7 +249,9 @@ public sealed record ExecutionProfile(
     bool KillTree = true,
     string TimeoutAction = "kill",
     bool ExecuteTarget = true,
-    bool PrivacyMode = false);
+    bool PrivacyMode = false,
+    int MaxPersistedEvents = CaptureLimits.DefaultEvents,
+    int MaxPersistedNetworkSessions = CaptureLimits.DefaultNetworkSessions);
 
 public sealed record CollectionRunContext(string CaseId, DateTimeOffset StartedAtUtc)
 {

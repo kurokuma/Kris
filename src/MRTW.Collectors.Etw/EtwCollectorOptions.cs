@@ -1,3 +1,5 @@
+using MRTW.Core;
+
 namespace MRTW.Collectors.Etw;
 
 public sealed record EtwCollectorOptions(
@@ -9,4 +11,7 @@ public sealed record EtwCollectorOptions(
     bool ImageLoadEvents = true,
     bool FollowDescendants = true,
     DateTimeOffset? CaseStartedAtUtc = null,
-    string? RawTracePath = null);
+    string? RawTracePath = null,
+    int MaxPersistedEvents = CaptureLimits.DefaultEvents,
+    int MaxPersistedNetworkSessions = CaptureLimits.DefaultNetworkSessions,
+    long MaxRawTraceBytes = CaptureLimits.DefaultRawTraceBytes);

@@ -5,7 +5,7 @@
 - 最終更新日: 2026-07-12
 - 調査対象: `README.md`、`docs/`、`src/MRTW.Core/`、`src/MRTW.Collectors.Etw/`、`src/MRTW.Cli/`、`src/MRTW.App/`、`src/MRTW.Native/`、`test/`
 - 主要な懸念: 高頻度イベント時の収集メモリ上限、短命プロセスのETW開始タイミング、Windows永続化面の観測不足、スクリプト／非PE形式の分析不足、Windows実環境での統合試験不足、Privacy Modeとバッチ実行の検証不足
-- 次に着手すべきタスク: TASK-001
+- 次に着手すべきタスク: TASK-002
 
 このバックログは、現在の実装・文書・テストから確認できた未対応事項だけを記録する。完了済みのP0/P1 GUI停止・ライブ表示・SQLite入力上限の修正は、重複して登録しない。
 
@@ -53,17 +53,17 @@
 
 ### TASK-001: ETW・ランタイム収集結果に永続化用の上限と欠落品質情報を追加する
 
-- 状態: 未着手
+- 状態: 完了
 - 規模: M
-- 概要: 現在はGUI入力キューには上限がある一方、`TraceEventEtwCollector` のイベント／ネットワークセッションキューと `RuntimeCaseCollector` の永続ケース用リストは収集終了まで増加し続ける。高頻度の検体でメモリ消費が増大し、ケース確定またはエクスポートまで到達できない可能性がある。
-- 根拠: `src/MRTW.Collectors.Etw/TraceEventEtwCollector.cs` は `ConcurrentQueue<TimelineEvent>` と `ConcurrentQueue<NetworkSession>` に無制限に追加する。`src/MRTW.Core/RuntimeCaseCollector.cs` もイベントとネットワークセッションをリストに蓄積する。READMEはGUIライブ表示だけを10,000件に制限すると明記している。
+- 概要: RuntimeとETWの永続イベントを既定50,000件、ネットワークセッションを10,000件に先着保持で制限し、上限超過分の受信数・破棄数・理由をCollection Qualityへ保存する。raw ETLは512 MiBでrawと構造化ETWの双方を停止し、未完了rawを証拠として採用しない。
+- 根拠: 実装前は`TraceEventEtwCollector`と`RuntimeCaseCollector`の永続収集が無制限だった。`BoundedCaptureBuffer<T>`を共有し、Runtime/ETW双方で同じ先着保持方針を実装した。
 - 対象: `src/MRTW.Collectors.Etw/TraceEventEtwCollector.cs`、`src/MRTW.Core/RuntimeCaseCollector.cs`、`src/MRTW.Collectors.Etw/AnalysisOrchestrator.cs`、`src/MRTW.Core/Models.cs`、`test/MRTW.RegressionTests/Program.cs`
-- 実装内容: 収集器ごとにイベント数・ネットワークセッション数・raw evidenceサイズの上限を設定可能にする。上限到達後は定義済み方針（停止または後続イベントの破棄）で動作し、破棄数・理由・開始／終了時刻を`CollectionQuality`へ保存する。GUI、JSON、SQLite、HTMLの品質表示が同じ欠落情報を示すようにする。
+- 実装内容: `ExecutionProfile`／`EtwCollectorOptions`の末尾互換オプションで上限を指定できる。上限は中央検証で安全な範囲外を明示拒否する。`CollectorHealth.Message`に上限・受信数・破棄数・理由を記録し、ETWネットワーク品質も独立してGUI、JSON、SQLite、HTMLへ出力する。raw出力先は信頼済みケースscratch配下・reparse pointなしを入口でfail-closed検証し、既存ancestorを確認後に段階作成・再検証する。raw上限時はそのETLだけをbest-effortで削除する。非管理者回帰で先着順、破棄品質、JSON／SQLite／HTMLの出力、無効上限、未信頼rawパス、canonical traversal、利用可能な環境でのreparse pathの拒否を検証した。
 - 完了条件:
-  - [ ] 高頻度イベントを発生させるテストで、メモリ上限相当の件数を超えても収集が完了する
-  - [ ] 破棄または打切り件数と理由が`CaseData.Quality`、JSON、SQLiteに保存される
-  - [ ] 上限未到達ケースのイベント順序と既存の出力互換性を維持する
-  - [ ] 関連テストが成功する
+  - [x] 高頻度イベントを発生させるテストで、メモリ上限相当の件数を超えても収集が完了する
+  - [x] 破棄または打切り件数と理由が`CaseData.Quality`、JSON、SQLiteに保存される
+  - [x] 上限未到達ケースのイベント順序と既存の出力互換性を維持する
+  - [x] 関連テストが成功する
 - 依存関係: なし
 - リスク・注意点: 上限を設けると証拠が欠落するため、無言で切り捨ててはならない。ケース品質を低下として明示すること。
 
@@ -262,7 +262,7 @@
 ## 保留事項
 
 - メモリ解析、YARA/YARA-X、capa統合は、現在は不要という方針が明示されているため、本バックログの実装タスクには登録しない。
-- GUIの実ユーザー操作を通す自動テストは `test/Run-GuiSmoke.ps1` とAutomationIdを追加したが、CI環境と利用可能なWindows対話セッションの情報が不足しており、実行証跡は未取得である。通常実行には含めない。
+- GUIの実ユーザー操作を通す自動テストは `test/Run-GuiSmoke.ps1` とAutomationIdを追加し、対話デスクトップで静的ターゲット選択、Start/Stop、タイムライン、Collection Quality、合成ケース読込、Privacy Modeエクスポートの実行証跡を取得済みである。CI環境への統合は未整備であり、通常実行には含めない。
 - ネットワークのパケット本文・TLS指標は現実装で未対応だが、取得・保管の権限とプライバシー要件が未確定のためP3の評価タスクに留める。
 
 ## 調査メモ

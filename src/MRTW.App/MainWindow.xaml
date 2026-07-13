@@ -115,13 +115,13 @@
                         <ColumnDefinition Width="170" />
                     </Grid.ColumnDefinitions>
                     <TextBlock Text="Sample:" FontWeight="SemiBold" VerticalAlignment="Center" Foreground="{StaticResource TextPrimary}" />
-                    <TextBlock Grid.Column="1" AutomationProperties.AutomationId="CurrentSampleText" Text="{Binding CurrentCase.SampleName}" Foreground="{StaticResource AccentBlue}" FontWeight="Bold" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+                    <TextBlock x:Name="CurrentSampleText" Grid.Column="1" AutomationProperties.AutomationId="CurrentSampleText" Text="{Binding CurrentCase.SampleName}" Foreground="{StaticResource AccentBlue}" FontWeight="Bold" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
                     <TextBlock Grid.Column="2" Text="MD5:" Foreground="{StaticResource TextSecondary}" VerticalAlignment="Center" />
                     <TextBlock Grid.Column="3" Text="{Binding StaticAnalysis.Md5}" Foreground="#B8C6D8" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
                     <TextBlock Grid.Column="4" Text="Analysis Profile:" VerticalAlignment="Center" Foreground="{StaticResource TextPrimary}" />
                     <TextBlock Grid.Column="5" Text="{Binding SelectedProfile.DisplayName}" Foreground="{StaticResource AccentBlue}" VerticalAlignment="Center" Margin="8,0,0,0" TextTrimming="CharacterEllipsis" />
-                    <Button Grid.Column="6" AutomationProperties.AutomationId="StartAnalysisButton" Style="{StaticResource PrimaryButton}" Content="Start" Click="Start_Click" Width="104" IsEnabled="{Binding CanStart}" />
-                    <Button Grid.Column="7" AutomationProperties.AutomationId="StopAnalysisButton" Style="{StaticResource DangerButton}" Content="Stop" Click="Stop_Click" Width="92" IsEnabled="{Binding CanStop}" />
+                    <Button x:Name="StartAnalysisButton" Grid.Column="6" AutomationProperties.AutomationId="StartAnalysisButton" Style="{StaticResource PrimaryButton}" Content="Start" Click="Start_Click" Width="104" IsEnabled="{Binding CanStart}" />
+                    <Button x:Name="StopAnalysisButton" Grid.Column="7" AutomationProperties.AutomationId="StopAnalysisButton" Style="{StaticResource DangerButton}" Content="Stop" Click="Stop_Click" Width="92" IsEnabled="{Binding CanStop}" />
                     <Button Grid.Column="8" Content="Restart" Click="Restart_Click" Width="104" IsEnabled="{Binding CanStop}" />
                     <StackPanel Grid.Column="9" VerticalAlignment="Center" HorizontalAlignment="Right">
                         <TextBlock Text="Run Duration" Foreground="{StaticResource TextSecondary}" HorizontalAlignment="Right" />
@@ -549,7 +549,7 @@
                                     <TextBlock Style="{StaticResource Muted}" Text="Registry events" />
                                     <TextBlock Text="{Binding RegistryEventCount}" />
                                     <TextBlock Style="{StaticResource Muted}" Text="Collection quality" />
-                                    <TextBlock AutomationProperties.AutomationId="CollectionQualityText" Text="{Binding CollectionQualityStatus}" Foreground="{StaticResource AccentBlue}" />
+                                    <TextBlock x:Name="CollectionQualityText" AutomationProperties.AutomationId="CollectionQualityText" Text="{Binding CollectionQualityStatus}" Foreground="{StaticResource AccentBlue}" />
                                 </UniformGrid>
                                 <TextBlock Text="{Binding CollectionQualitySummary}" TextWrapping="Wrap" Foreground="{StaticResource TextSecondary}" Margin="0,0,0,8" />
                                 <TextBlock Text="{Binding LiveCaptureSummary}" TextWrapping="Wrap" Foreground="{StaticResource TextSecondary}" Margin="0,0,0,8" />

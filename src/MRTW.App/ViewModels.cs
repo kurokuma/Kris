@@ -167,7 +167,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
     public string CollectionQualitySummary => CurrentCase.Quality is null
         ? "Collector health metadata is not available for this case."
         : string.Join(" | ", CurrentCase.Quality.Collectors.Select(c =>
-            $"{c.Collector}: {c.Status} ({c.EventsReceived} events, {c.EventsDropped} dropped)")) +
+            $"{c.Collector}: {c.Status} ({c.EventsReceived} received, {c.EventsDropped} dropped){(string.IsNullOrWhiteSpace(c.Message) ? "" : $"; {c.Message}")}")) +
           $" | Network: {CurrentCase.Quality.NetworkContainment}";
 
     public ExportSettings ExportSettings

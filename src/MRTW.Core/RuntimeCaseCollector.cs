@@ -28,12 +28,13 @@ public sealed class RuntimeCaseCollector
 
     public CaseData Collect(ExecutionProfile profile, StaticAnalysisResult? staticAnalysis, CancellationToken cancellationToken, Action<TimelineEvent>? onEvent, CollectionRunContext? runContext)
     {
+        CaptureLimits.ValidatePersisted(profile.MaxPersistedEvents, profile.MaxPersistedNetworkSessions);
         runContext ??= CollectionRunContext.Create();
         string caseId = runContext.CaseId;
         var started = runContext.StartedAtUtc;
-        var events = new List<TimelineEvent>();
+        var events = new BoundedCaptureBuffer<TimelineEvent>(profile.MaxPersistedEvents);
         var processes = new List<ProcessNode>();
-        var networks = new List<NetworkSession>();
+        var networks = new BoundedCaptureBuffer<NetworkSession>(profile.MaxPersistedNetworkSessions);
         int nextId = 1;
         HookPipeServer? hookPipe = null;
         int callbackFailures = 0;
@@ -60,7 +61,6 @@ public sealed class RuntimeCaseCollector
 
         void Add(TimelineEvent timelineEvent)
         {
-            events.Add(timelineEvent);
             if (timelineEvent.Source.Equals("Hook", StringComparison.OrdinalIgnoreCase) && timelineEvent.Category is EventCategory.Network or EventCategory.Dns)
             {
                 try
@@ -72,12 +72,13 @@ public sealed class RuntimeCaseCollector
                     string uri = S("uri"); if (string.IsNullOrWhiteSpace(uri)) uri = S("object_name");
                     string remote = S("remote_ip"); if (string.IsNullOrWhiteSpace(remote)) remote = timelineEvent.ObjectValue;
                     int port = int.TryParse(S("port"), out int parsedPort) ? parsedPort : 0;
-                    networks.Add(new NetworkSession(timelineEvent.Process, host, S("resolved_ip"), remote, port,
+                    networks.TryAdd(new NetworkSession(timelineEvent.Process, host, S("resolved_ip"), remote, port,
                         timelineEvent.Category == EventCategory.Dns ? "DNS" : "Hook", timelineEvent.Time, L("bytes_sent"), L("bytes_received"), S("user_agent"), S("sni"),
                         S("status"), S("answers"), "native hook API metadata; no packet/TLS payload", S("method"), host, uri, S("headers")));
                 }
                 catch { }
             }
+            if (!events.TryAdd(timelineEvent)) return;
             try
             {
                 onEvent?.Invoke(timelineEvent);
@@ -111,7 +112,7 @@ public sealed class RuntimeCaseCollector
                 }
 
                 var parsed = ParseConnection(connection);
-                networks.Add(new NetworkSession("system", "-", "-", parsed.RemoteHost, parsed.RemotePort, "TCP", DateTimeOffset.Now - started, 0, 0, "-", "-"));
+                networks.TryAdd(new NetworkSession("system", "-", "-", parsed.RemoteHost, parsed.RemotePort, "TCP", DateTimeOffset.Now - started, 0, 0, "-", "-"));
                 Add(Event(nextId++, DateTimeOffset.Now - started, "system", 0, EventCategory.Network, "TCP Connect", $"{parsed.RemoteHost}:{parsed.RemotePort}", connection, EventSeverity.Low, "NetworkSnapshot"));
             }
         }
@@ -401,24 +402,25 @@ public sealed class RuntimeCaseCollector
             Add(Event(nextId++, DateTimeOffset.UtcNow - started, "snapshot", 0, EventCategory.Api, afterCapture.Canceled ? "Post Snapshot Skipped" : "Snapshot Bounded", "after", afterCapture.Note, EventSeverity.Low, "Snapshot"));
         }
         AddSnapshotEvents(Add, diff, started, ref nextId);
-        AddNetworkEvents(Add, networks, diff, seenTcpConnections, started, ref nextId);
+        AddNetworkEvents(Add, item => networks.TryAdd(item), diff, seenTcpConnections, started, ref nextId);
         if (callbackFailures > 0)
         {
-            events.Add(Event(nextId++, DateTimeOffset.UtcNow - started, "collector", 0, EventCategory.Api,
+            Add(Event(nextId++, DateTimeOffset.UtcNow - started, "collector", 0, EventCategory.Api,
                 "Live Callback Failures", callbackFailures.ToString(), "One or more live UI callbacks failed; persisted collection continued.", EventSeverity.Medium, "Runtime"));
         }
 
-        processes.AddRange(BuildProcessNodes(caseId, events, profile, pid ?? 0, processStarted ?? started, processExited));
-        events = AttachProcessGuids(events, processes, caseId, started);
+        var capturedEvents = events.ToArray();
+        processes.AddRange(BuildProcessNodes(caseId, capturedEvents, profile, pid ?? 0, processStarted ?? started, processExited));
+        var eventsWithProcessGuids = AttachProcessGuids(capturedEvents, processes, caseId, started);
 
-        var correlatedEvents = BehaviorCorrelator.Correlate(events);
+        var correlatedEvents = BehaviorCorrelator.Correlate(eventsWithProcessGuids);
         correlatedEvents = AttachProcessGuids(correlatedEvents, processes, caseId, started);
         var artifacts = BuildArtifacts(correlatedEvents, processes, started);
         string sampleName = Path.GetFileName(profile.TargetPath);
         string sha = staticAnalysis?.Sha256 ?? "unknown";
-        string notes = events.Any(e => e.Action == "Execution Failed")
+        string notes = eventsWithProcessGuids.Any(e => e.Action == "Execution Failed")
             ? "The target could not be executed in this environment. Static analysis and snapshot telemetry were still preserved."
-            : events.Any(e => e.Action == "Launcher Process Exit")
+            : eventsWithProcessGuids.Any(e => e.Action == "Launcher Process Exit")
                 ? "The target behaved like a Windows shell/app launcher and exited with code 0 after handoff. MRTW did not stop it; review shell activation, child process, ETW, and hook events for the continued behavior."
                 : "The case contains process execution, snapshot diff, registry, file, and system TCP observations collected with the standard .NET runtime.";
 
@@ -434,8 +436,9 @@ public sealed class RuntimeCaseCollector
             processes,
             correlatedEvents.OrderBy(e => e.Time).ToArray(),
             artifacts,
-            networks,
+            networks.ToArray(),
             notes,
+            Quality: RuntimeQuality(events, networks, started),
             PreservedFiles: preservedFiles) { TrustedEvidenceRoot = EvidencePathPolicy.Root(caseId) };
     }
 
@@ -1037,7 +1040,7 @@ public sealed class RuntimeCaseCollector
         }
     }
 
-    private static void AddNetworkEvents(Action<TimelineEvent> add, List<NetworkSession> networks, SnapshotDiff diff, HashSet<string> seenTcpConnections, DateTimeOffset started, ref int nextId)
+    private static void AddNetworkEvents(Action<TimelineEvent> add, Action<NetworkSession> addNetwork, SnapshotDiff diff, HashSet<string> seenTcpConnections, DateTimeOffset started, ref int nextId)
     {
         foreach (string connection in diff.NewTcpConnections.Take(80))
         {
@@ -1047,7 +1050,7 @@ public sealed class RuntimeCaseCollector
             }
 
             var parsed = ParseConnection(connection);
-            networks.Add(new NetworkSession("system", "-", "-", parsed.RemoteHost, parsed.RemotePort, "TCP", DateTimeOffset.Now - started, 0, 0, "-", "-"));
+            addNetwork(new NetworkSession("system", "-", "-", parsed.RemoteHost, parsed.RemotePort, "TCP", DateTimeOffset.Now - started, 0, 0, "-", "-"));
             add(Event(nextId++, DateTimeOffset.Now - started, "system", 0, EventCategory.Network, "TCP Connect", $"{parsed.RemoteHost}:{parsed.RemotePort}", connection, EventSeverity.Low, "NetworkSnapshot"));
         }
     }
@@ -1068,6 +1071,18 @@ public sealed class RuntimeCaseCollector
         }
 
         return (endpoint, 0);
+    }
+
+    private static CaseQuality RuntimeQuality(BoundedCaptureBuffer<TimelineEvent> events, BoundedCaptureBuffer<NetworkSession> networks, DateTimeOffset started)
+    {
+        DateTimeOffset ended = DateTimeOffset.UtcNow;
+        bool bounded = events.Dropped > 0 || networks.Dropped > 0;
+        string message = $"event_limit={events.Capacity};event_received={events.Received};event_dropped={events.Dropped};network_limit={networks.Capacity};network_received={networks.Received};network_dropped={networks.Dropped}";
+        if (bounded) message += "; persisted runtime capture reached its first-in limit; later items were discarded while monitoring continued.";
+        return new CaseQuality(bounded ? "degraded" : "healthy",
+            [new CollectorHealth("Runtime", bounded ? "degraded" : "healthy", started, ended, events.Received, events.Dropped, message),
+             new CollectorHealth("RuntimeNetwork", bounded ? "degraded" : "healthy", started, ended, networks.Received, networks.Dropped, message)],
+            "not-applied", true);
     }
 
     private static IReadOnlyList<ArtifactItem> BuildArtifacts(IReadOnlyList<TimelineEvent> events, IReadOnlyList<ProcessNode> processes, DateTimeOffset started)

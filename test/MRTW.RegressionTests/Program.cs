@@ -30,6 +30,9 @@ var tests = new List<(string Name, Action Body)>
     ("static analysis rejects oversized target", TestStaticAnalysisOversize),
     ("static analysis bounds long printable strings", TestStaticAnalysisLongString),
     ("live batch accumulator handles high volume without per-item snapshots", TestLiveBatchAccumulator)
+    ,("bounded capture preserves first items and exports loss quality", TestBoundedCaptureQualityRoundTrip)
+    ,("capture limits reject unsafe values", TestCaptureLimitValidation)
+    ,("raw ETL path accepts only trusted case scratch", TestRawTracePathPolicy)
 };
 
 int failures = 0;
@@ -190,6 +193,114 @@ static void TestJsonBomRoundTrip()
         Equal("json-bom", new CaseService().Load(Path.Combine(root, "case.json")).CaseId);
     }
     finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
+}
+
+static void TestBoundedCaptureQualityRoundTrip()
+{
+    var buffer = new BoundedCaptureBuffer<int>(2);
+    var networkBuffer = new BoundedCaptureBuffer<string>(2);
+    True(buffer.TryAdd(10), "first item was not retained");
+    True(buffer.TryAdd(20), "second item was not retained");
+    True(!buffer.TryAdd(30), "overflow item was retained");
+    Equal(3L, buffer.Received);
+    Equal(1L, buffer.Dropped);
+    Equal(10, buffer.ToArray()[0]);
+    Equal(20, buffer.ToArray()[1]);
+    True(networkBuffer.TryAdd("network-first"), "network capture did not remain independent of event capture");
+    True(networkBuffer.TryAdd("network-second"), "network capture stopped when event capture overflowed");
+    True(!networkBuffer.TryAdd("network-third"), "network overflow item was retained");
+    Equal(2L, networkBuffer.ToArray().LongLength);
+    Equal(1L, networkBuffer.Dropped);
+
+    string root = Path.Combine(Path.GetTempPath(), "mrtw-bounded-quality-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        var health = new CollectorHealth("Runtime", "degraded", now, now, buffer.Received, buffer.Dropped,
+            "event_limit=2;event_received=3;event_dropped=1; persisted runtime capture reached its first-in limit; later items were discarded while monitoring continued.");
+        var networkHealth = new CollectorHealth("ETWNetwork", "degraded", now, now, networkBuffer.Received, networkBuffer.Dropped,
+            "network_limit=2;network_received=3;network_dropped=1;");
+        var data = new CaseData("bounded", "bounded", "sample.exe", "sample.exe", "hash", now, TimeSpan.Zero, null, [],
+            [new TimelineEvent(1, TimeSpan.Zero, "sample.exe", 1, EventCategory.Process, "Process Start", "first", "first retained", EventSeverity.Low, "Runtime", "{}", CapturedAtUtc: now),
+             new TimelineEvent(2, TimeSpan.FromSeconds(1), "sample.exe", 1, EventCategory.Process, "Process Exit", "second", "second retained", EventSeverity.Low, "Runtime", "{}", CapturedAtUtc: now.AddSeconds(1))],
+            [], [], "bounded test", new CaseQuality("degraded", [health, networkHealth], "observe", true));
+        new CaseExportService().WriteCaseBundle(data, root, new ExportOptions("html,json,sqlite", Compress: false));
+        CaseData json = new CaseService().Load(Path.Combine(root, "case.json"));
+        CaseData sqlite = new CaseService().Load(Path.Combine(root, "case.sqlite"));
+        Equal(1L, json.Quality!.Collectors.Single(c => c.Collector == "Runtime").EventsDropped);
+        Equal(3L, sqlite.Quality!.Collectors.Single(c => c.Collector == "Runtime").EventsReceived);
+        Equal(1L, sqlite.Quality.Collectors.Single(c => c.Collector == "ETWNetwork").EventsDropped);
+        string html = File.ReadAllText(Path.Combine(root, "report.html"));
+        True(html.Contains("event_dropped=1", StringComparison.Ordinal), "HTML omitted bounded capture reason");
+        True(html.Contains("network_dropped=1", StringComparison.Ordinal), "HTML omitted bounded ETW network reason");
+    }
+    finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
+}
+
+static void TestCaptureLimitValidation()
+{
+    CaptureLimits.Validate(CaptureLimits.DefaultEvents, CaptureLimits.DefaultNetworkSessions, CaptureLimits.DefaultRawTraceBytes);
+    CaptureLimits.Validate(1, 1, CaptureLimits.MinimumRawTraceBytes);
+    CaptureLimits.Validate(CaptureLimits.MaximumEvents, CaptureLimits.MaximumNetworkSessions, CaptureLimits.MaximumRawTraceBytes);
+    Throws<ArgumentOutOfRangeException>(() => CaptureLimits.ValidatePersisted(0, 1));
+    Throws<ArgumentOutOfRangeException>(() => CaptureLimits.ValidatePersisted(CaptureLimits.MaximumEvents + 1, 1));
+    Throws<ArgumentOutOfRangeException>(() => CaptureLimits.ValidatePersisted(1, 0));
+    Throws<ArgumentOutOfRangeException>(() => CaptureLimits.Validate(1, 1, CaptureLimits.MinimumRawTraceBytes - 1));
+    Throws<ArgumentOutOfRangeException>(() => new TraceEventEtwCollector().Collect(new EtwCollectorOptions(null, null, MaxRawTraceBytes: CaptureLimits.MaximumRawTraceBytes + 1)));
+}
+
+static void TestRawTracePathPolicy()
+{
+    string caseId = "case-regression-" + Guid.NewGuid().ToString("N");
+    string root = Path.Combine(Path.GetTempPath(), "MRTW", caseId);
+    try
+    {
+        string trusted = Path.Combine(root, "raw_evidence", "network-process.etl");
+        Equal(Path.GetFullPath(trusted), TraceEventEtwCollector.ValidateRawTracePath(trusted));
+        Throws<InvalidOperationException>(() => TraceEventEtwCollector.ValidateRawTracePath(Path.Combine(Path.GetTempPath(), "outside.etl")));
+        Throws<InvalidOperationException>(() => TraceEventEtwCollector.ValidateRawTracePath(Path.Combine(root, "case-extra", "raw_evidence", "..", "escaped.etl")));
+        Throws<InvalidOperationException>(() => new TraceEventEtwCollector().Collect(new EtwCollectorOptions(null, null, RawTracePath: Path.Combine(Path.GetTempPath(), "outside.etl"))));
+        TestRawTraceReparseRejection();
+    }
+    finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
+}
+
+static void TestRawTraceReparseRejection()
+{
+    string caseDirectory = Path.Combine(Path.GetTempPath(), "MRTW", "case-link-" + Guid.NewGuid().ToString("N"));
+    string rawDirectory = Path.Combine(caseDirectory, "raw_evidence");
+    string outside = Path.Combine(Path.GetTempPath(), "mrtw-raw-link-target-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(caseDirectory);
+    Directory.CreateDirectory(outside);
+    try
+    {
+        try
+        {
+            Directory.CreateSymbolicLink(rawDirectory, outside);
+            Throws<InvalidOperationException>(() => TraceEventEtwCollector.ValidateRawTracePath(Path.Combine(rawDirectory, "linked.etl")));
+        }
+        catch (UnauthorizedAccessException) { Console.WriteLine("SKIP raw ETL parent reparse test: symbolic-link creation is unavailable."); }
+        catch (IOException) { Console.WriteLine("SKIP raw ETL parent reparse test: symbolic-link creation is unavailable."); }
+
+        if (Directory.Exists(rawDirectory) && (File.GetAttributes(rawDirectory) & FileAttributes.ReparsePoint) != 0)
+            Directory.Delete(rawDirectory);
+        Directory.CreateDirectory(rawDirectory);
+        string linkedFile = Path.Combine(rawDirectory, "linked-file.etl");
+        string outsideFile = Path.Combine(outside, "outside.etl");
+        File.WriteAllText(outsideFile, "safe regression fixture");
+        try
+        {
+            File.CreateSymbolicLink(linkedFile, outsideFile);
+            Throws<InvalidOperationException>(() => TraceEventEtwCollector.ValidateRawTracePath(linkedFile));
+        }
+        catch (UnauthorizedAccessException) { Console.WriteLine("SKIP raw ETL file reparse test: symbolic-link creation is unavailable."); }
+        catch (IOException) { Console.WriteLine("SKIP raw ETL file reparse test: symbolic-link creation is unavailable."); }
+    }
+    finally
+    {
+        try { if (Directory.Exists(outside)) Directory.Delete(outside, true); } catch { }
+        try { if (Directory.Exists(caseDirectory)) Directory.Delete(caseDirectory, true); } catch { }
+    }
 }
 
 static void TestBehaviorCorrelation()

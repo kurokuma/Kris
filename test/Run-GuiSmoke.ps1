@@ -23,9 +23,26 @@ if (-not (Test-Path -LiteralPath $Case)) {
 }
 
 function Get-WindowElement([Diagnostics.Process]$Process) {
-    $deadline = (Get-Date).AddSeconds(20); $element = $null
-    do { Start-Sleep -Milliseconds 250; $element = [System.Windows.Automation.AutomationElement]::FromHandle($Process.MainWindowHandle) } while (($null -eq $element -or $element.Current.Name -notmatch 'MRTW') -and (Get-Date) -lt $deadline)
-    if ($null -eq $element) { throw 'MRTW window was not available.' }; return $element
+    $deadline = (Get-Date).AddSeconds(20)
+    $sawWindowHandle = $false
+    do {
+        $Process.Refresh()
+        if ($Process.HasExited) { throw 'MRTW process exited before its GUI window became available.' }
+
+        $handle = $Process.MainWindowHandle
+        if ($handle -ne [IntPtr]::Zero) {
+            $sawWindowHandle = $true
+            try { $element = [System.Windows.Automation.AutomationElement]::FromHandle($handle) }
+            catch { $element = $null }
+            if ($null -ne $element) { return $element }
+        }
+        Start-Sleep -Milliseconds 250
+    } while ((Get-Date) -lt $deadline)
+
+    $Process.Refresh()
+    if ($Process.HasExited) { throw 'MRTW process exited before its GUI window became available.' }
+    if (-not $sawWindowHandle) { throw 'MRTW window handle was not available within 20 seconds.' }
+    throw 'MRTW window handle was available, but its UI Automation root could not be obtained within 20 seconds.'
 }
 function Find-Id($Element, [string]$Id) {
     return $Element.FindFirst([System.Windows.Automation.TreeScope]::Descendants, (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::AutomationIdProperty, $Id)))

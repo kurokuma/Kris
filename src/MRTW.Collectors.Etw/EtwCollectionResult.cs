@@ -8,4 +8,11 @@ public sealed record EtwCollectionResult(
     string? ErrorMessage,
     IReadOnlyList<TimelineEvent> Events,
     IReadOnlyList<NetworkSession> NetworkSessions,
-    string? RawTracePath = null);
+    string? RawTracePath = null,
+    long EventsReceived = 0,
+    long EventsDropped = 0,
+    long NetworkSessionsReceived = 0,
+    long NetworkSessionsDropped = 0,
+    long RawTraceBytes = 0,
+    long RawTraceByteLimit = 0,
+    string CaptureLimitReason = "");

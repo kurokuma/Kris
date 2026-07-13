@@ -55,7 +55,8 @@ public sealed class AnalysisOrchestrator
             TimeSpan? duration = profile.DurationSeconds is int seconds ? TimeSpan.FromSeconds(Math.Max(1, seconds)) : null;
             etwTask = Task.Run(() => new TraceEventEtwCollector().Collect(
                 new EtwCollectorOptions(pid, duration, FollowDescendants: true, CaseStartedAtUtc: context.StartedAtUtc,
-                    RawTracePath: profile.PrivacyMode ? null : Path.Combine(Path.GetTempPath(), "MRTW", context.CaseId, "raw_evidence", "network-process.etl")),
+                    RawTracePath: profile.PrivacyMode ? null : Path.Combine(Path.GetTempPath(), "MRTW", context.CaseId, "raw_evidence", "network-process.etl"),
+                    MaxPersistedEvents: profile.MaxPersistedEvents, MaxPersistedNetworkSessions: profile.MaxPersistedNetworkSessions),
                 etwStop.Token,
                 item =>
                 {
@@ -117,16 +118,27 @@ public sealed class AnalysisOrchestrator
         string hookStatus = !hookRequested ? "disabled" : !profile.ExecuteTarget ? "skipped" : hookFailed ? "degraded" : hookObserved ? "healthy" : "unavailable";
         string etwStatus = !profile.EnableEtw ? "disabled" : !profile.ExecuteTarget ? "skipped" : etw is null ? "unavailable" : etw.Started && etw.Completed ? "healthy" : "degraded";
         bool runtimeFailed = combined.Any(e => e.Action is "Execution Failed" or "Live Callback Failures");
+        CollectorHealth? runtimeCapture = data.Quality?.Collectors.FirstOrDefault(c => c.Collector == "Runtime");
+        CollectorHealth? runtimeNetworkCapture = data.Quality?.Collectors.FirstOrDefault(c => c.Collector == "RuntimeNetwork");
+        bool captureBounded = (runtimeCapture?.EventsDropped ?? 0) > 0 || (runtimeNetworkCapture?.EventsDropped ?? 0) > 0 ||
+            (etw?.EventsDropped ?? 0) > 0 || (etw?.NetworkSessionsDropped ?? 0) > 0 || !string.IsNullOrWhiteSpace(etw?.CaptureLimitReason);
         var collectors = new List<CollectorHealth>
         {
-            new("Runtime", runtimeFailed ? "degraded" : "healthy", runtimeStarted, ended, data.Events.Count,
-                combined.Where(e => e.Action == "Live Callback Failures").Sum(e => long.TryParse(e.ObjectValue, out long count) ? count : 0),
-                runtimeFailed ? "Runtime execution or live delivery reported a failure." : ""),
+            new("Runtime", runtimeFailed || (runtimeCapture?.EventsDropped ?? 0) > 0 ? "degraded" : "healthy", runtimeStarted, ended,
+                runtimeCapture?.EventsReceived ?? data.Events.Count, runtimeCapture?.EventsDropped ?? 0,
+                (runtimeCapture?.Message ?? "") + (runtimeFailed ? " Runtime execution or live delivery reported a failure." : "")),
+            new("RuntimeNetwork", (runtimeNetworkCapture?.EventsDropped ?? 0) > 0 ? "degraded" : "healthy", runtimeStarted, ended,
+                runtimeNetworkCapture?.EventsReceived ?? data.NetworkSessions.Count, runtimeNetworkCapture?.EventsDropped ?? 0, runtimeNetworkCapture?.Message ?? ""),
             new("Hook", hookStatus, runtimeStarted, ended, combined.Count(e => e.Source.Equals("Hook", StringComparison.OrdinalIgnoreCase)), combined.Count(e => e.Action == "Hook Parse Failure"),
                 hookFailed ? "One or more hook adapters or injection operations failed." : ""),
-            new("ETW", etwStatus, etwStarted, ended, etw?.Events.Count ?? 0, 0, (etw?.ErrorMessage ?? "") + " Raw kernel ETL is system-wide; persisted structured events are filtered to the target PID tree.")
+            new("ETW", captureBounded && (!string.IsNullOrWhiteSpace(etw?.CaptureLimitReason) || (etw?.EventsDropped ?? 0) > 0) ? "degraded" : etwStatus,
+                etwStarted, ended, etw?.EventsReceived ?? 0, etw?.EventsDropped ?? 0,
+                (etw?.ErrorMessage ?? "") + " " + (etw?.CaptureLimitReason ?? "") + $" event_limit={profile.MaxPersistedEvents};network_limit={profile.MaxPersistedNetworkSessions};raw_etl_limit={(etw?.RawTraceByteLimit ?? 0)}. Raw kernel ETL is system-wide; persisted structured events are filtered to the target PID tree.")
+            ,new("ETWNetwork", (etw?.NetworkSessionsDropped ?? 0) > 0 || !string.IsNullOrWhiteSpace(etw?.CaptureLimitReason) ? "degraded" : etwStatus,
+                etwStarted, ended, etw?.NetworkSessionsReceived ?? 0, etw?.NetworkSessionsDropped ?? 0,
+                (etw?.CaptureLimitReason ?? "") + $" network_limit={profile.MaxPersistedNetworkSessions};network_received={(etw?.NetworkSessionsReceived ?? 0)};network_dropped={(etw?.NetworkSessionsDropped ?? 0)}.")
         };
-        string overall = collectors.Any(c => c.Status == "degraded" || c.Status == "unavailable" && c.Collector != "Hook")
+        string overall = captureBounded || collectors.Any(c => c.Status == "degraded" || c.Status == "unavailable" && c.Collector != "Hook")
             ? "degraded"
             : "healthy";
 

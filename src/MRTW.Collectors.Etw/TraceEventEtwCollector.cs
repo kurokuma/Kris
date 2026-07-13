@@ -25,13 +25,15 @@ public sealed class TraceEventEtwCollector
         Action<TimelineEvent>? onEvent,
         Action<NetworkSession>? onNetworkSession)
     {
+        CaptureLimits.Validate(options.MaxPersistedEvents, options.MaxPersistedNetworkSessions, options.MaxRawTraceBytes);
+        string? validatedTracePath = ValidateRawTracePath(options.RawTracePath);
         if (!OperatingSystem.IsWindows())
         {
             return new EtwCollectionResult(false, false, "ETW is only available on Windows.", Array.Empty<TimelineEvent>(), Array.Empty<NetworkSession>());
         }
 
-        var events = new ConcurrentQueue<TimelineEvent>();
-        var sessions = new ConcurrentQueue<NetworkSession>();
+        var events = new BoundedCaptureBuffer<TimelineEvent>(options.MaxPersistedEvents);
+        var sessions = new BoundedCaptureBuffer<NetworkSession>(options.MaxPersistedNetworkSessions);
         var processNames = new ConcurrentDictionary<int, string>();
         var trackedPids = new ConcurrentDictionary<int, byte>();
         if (options.TargetPid is int targetPid)
@@ -41,15 +43,40 @@ public sealed class TraceEventEtwCollector
         var startedAt = options.CaseStartedAtUtc ?? DateTimeOffset.UtcNow;
         int nextId = 1;
         string sessionName = "MRTW-" + Guid.NewGuid().ToString("N");
+        int rawLimitReached = 0;
+        string captureLimitReason = "";
 
         try
         {
-            string? tracePath = options.RawTracePath;
-            if (!string.IsNullOrWhiteSpace(tracePath)) Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(tracePath))!);
+            string? tracePath = validatedTracePath;
             using var session = string.IsNullOrWhiteSpace(tracePath) ? new TraceEventSession(sessionName) : new TraceEventSession(sessionName, tracePath)
             {
                 StopOnDispose = true
             };
+
+            bool CanCapture() => Volatile.Read(ref rawLimitReached) == 0;
+            void CaptureEvent(TimelineEvent item)
+            {
+                if (!CanCapture()) return;
+                if (events.TryAdd(item))
+                {
+                    try { onEvent?.Invoke(item); } catch { /* live callbacks must not stop ETW */ }
+                }
+            }
+            void CaptureNetworkSession(NetworkSession item)
+            {
+                if (!CanCapture()) return;
+                if (sessions.TryAdd(item))
+                {
+                    try { onNetworkSession?.Invoke(item); } catch { /* live callbacks must not stop ETW */ }
+                }
+            }
+            void StopForRawLimit()
+            {
+                if (Interlocked.CompareExchange(ref rawLimitReached, 1, 0) != 0) return;
+                captureLimitReason = $"Raw ETL exceeded {options.MaxRawTraceBytes} bytes; raw and structured ETW capture stopped.";
+                try { session.Stop(); } catch { }
+            }
 
             var keywords = KernelTraceEventParser.Keywords.None;
             if (options.ProcessEvents)
@@ -90,7 +117,7 @@ public sealed class TraceEventEtwCollector
                 }
 
                 RememberProcessName(processNames, data.ProcessID, data.ProcessName, data.ImageFileName);
-                EnqueueEvent(events, onEvent, Event(
+                CaptureEvent( Event(
                     Interlocked.Increment(ref nextId),
                     DateTimeOffset.Now - startedAt,
                     data.ProcessName,
@@ -112,7 +139,7 @@ public sealed class TraceEventEtwCollector
                 }
 
                 string processName = KnownProcessName(processNames, data.ProcessID, data.ProcessName, data.ImageFileName);
-                EnqueueEvent(events, onEvent, Event(
+                CaptureEvent( Event(
                     Interlocked.Increment(ref nextId),
                     DateTimeOffset.Now - startedAt,
                     processName,
@@ -134,7 +161,7 @@ public sealed class TraceEventEtwCollector
                 }
 
                 RememberProcessName(processNames, data.ProcessID, null, data.FileName);
-                EnqueueEvent(events, onEvent, Event(
+                CaptureEvent( Event(
                     Interlocked.Increment(ref nextId),
                     DateTimeOffset.Now - startedAt,
                     KnownProcessName(processNames, data.ProcessID, null, null),
@@ -157,7 +184,7 @@ public sealed class TraceEventEtwCollector
 
                 string remote = $"{data.daddr}:{data.dport}";
                 string process = KnownProcessName(processNames, data.ProcessID, null, null);
-                EnqueueEvent(events, onEvent, Event(
+                CaptureEvent( Event(
                     Interlocked.Increment(ref nextId),
                     DateTimeOffset.Now - startedAt,
                     process,
@@ -169,23 +196,23 @@ public sealed class TraceEventEtwCollector
                     EventSeverity.Medium,
                     "ETW",
                     data));
-                EnqueueNetworkSession(sessions, onNetworkSession, new NetworkSession(process, "-", "-", data.daddr.ToString(), data.dport, "TCP", DateTimeOffset.Now - startedAt, 0, 0, "-", "-"));
+                CaptureNetworkSession( new NetworkSession(process, "-", "-", data.daddr.ToString(), data.dport, "TCP", DateTimeOffset.Now - startedAt, 0, 0, "-", "-"));
             };
 
             session.Source.Kernel.UdpIpSend += data =>
             {
                 if (!PidMatches(options.TargetPid, trackedPids, data.ProcessID)) return;
                 string remote = $"{data.daddr}:{data.dport}"; string process = KnownProcessName(processNames, data.ProcessID, null, null);
-                EnqueueEvent(events, onEvent, Event(Interlocked.Increment(ref nextId), DateTimeOffset.UtcNow - startedAt, process, data.ProcessID, EventCategory.Network, "UDP Send", remote, "UDP metadata observed by kernel ETW", EventSeverity.Medium, "ETW", data));
-                EnqueueNetworkSession(sessions, onNetworkSession, new NetworkSession(process, "", "", data.daddr.ToString(), data.dport, "UDP", DateTimeOffset.UtcNow - startedAt, data.size, 0, "", "", Coverage: "kernel ETW UDP metadata; payload/TLS/JA3 unsupported"));
+                CaptureEvent( Event(Interlocked.Increment(ref nextId), DateTimeOffset.UtcNow - startedAt, process, data.ProcessID, EventCategory.Network, "UDP Send", remote, "UDP metadata observed by kernel ETW", EventSeverity.Medium, "ETW", data));
+                CaptureNetworkSession( new NetworkSession(process, "", "", data.daddr.ToString(), data.dport, "UDP", DateTimeOffset.UtcNow - startedAt, data.size, 0, "", "", Coverage: "kernel ETW UDP metadata; payload/TLS/JA3 unsupported"));
             };
 
             session.Source.Kernel.UdpIpRecv += data =>
             {
                 if (!PidMatches(options.TargetPid, trackedPids, data.ProcessID)) return;
                 string remote = $"{data.saddr}:{data.sport}"; string process = KnownProcessName(processNames, data.ProcessID, null, null);
-                EnqueueEvent(events, onEvent, Event(Interlocked.Increment(ref nextId), DateTimeOffset.UtcNow - startedAt, process, data.ProcessID, EventCategory.Network, "UDP Receive", remote, "UDP metadata observed by kernel ETW", EventSeverity.Low, "ETW", data));
-                EnqueueNetworkSession(sessions, onNetworkSession, new NetworkSession(process, "", "", data.saddr.ToString(), data.sport, "UDP", DateTimeOffset.UtcNow - startedAt, 0, data.size, "", "", Coverage: "kernel ETW UDP metadata; payload/TLS/JA3 unsupported"));
+                CaptureEvent( Event(Interlocked.Increment(ref nextId), DateTimeOffset.UtcNow - startedAt, process, data.ProcessID, EventCategory.Network, "UDP Receive", remote, "UDP metadata observed by kernel ETW", EventSeverity.Low, "ETW", data));
+                CaptureNetworkSession( new NetworkSession(process, "", "", data.saddr.ToString(), data.sport, "UDP", DateTimeOffset.UtcNow - startedAt, 0, data.size, "", "", Coverage: "kernel ETW UDP metadata; payload/TLS/JA3 unsupported"));
             };
 
             if (options.DnsEvents)
@@ -206,7 +233,7 @@ public sealed class TraceEventEtwCollector
                     string query = TryPayload(data, "QueryName") ?? TryPayload(data, "Name") ?? data.EventName;
                     string answers = TryPayload(data, "QueryResults") ?? TryPayload(data, "Address") ?? "";
                     string status = TryPayload(data, "Status") ?? TryPayload(data, "Result") ?? "";
-                    EnqueueEvent(events, onEvent, Event(
+                    CaptureEvent( Event(
                         Interlocked.Increment(ref nextId),
                         DateTimeOffset.Now - startedAt,
                         KnownProcessName(processNames, pid, null, null),
@@ -220,52 +247,119 @@ public sealed class TraceEventEtwCollector
                         data.PayloadString(0)));
                     if (!string.IsNullOrWhiteSpace(query))
                     {
-                        EnqueueNetworkSession(sessions, onNetworkSession, new NetworkSession(
+                        CaptureNetworkSession( new NetworkSession(
                             KnownProcessName(processNames, pid, null, null), query, answers, "", 53, "DNS",
                             DateTimeOffset.UtcNow - startedAt, 0, 0, "", "", status, answers, "DNS client ETW metadata"));
                     }
                 };
             }
 
+            using var rawLimitTimer = string.IsNullOrWhiteSpace(tracePath) ? null : new Timer(_ =>
+            {
+                try
+                {
+                    if (File.Exists(tracePath) && new FileInfo(tracePath).Length > options.MaxRawTraceBytes) StopForRawLimit();
+                }
+                catch { /* best effort only; ETW collection remains usable */ }
+            }, null, TimeSpan.FromMilliseconds(250), TimeSpan.FromMilliseconds(250));
             using var durationTimer = options.Duration is null ? null : new Timer(_ => session.Stop(), null, options.Duration.Value, Timeout.InfiniteTimeSpan);
             using var cancellationRegistration = cancellationToken.Register(() => session.Stop());
             session.Source.Process();
 
-            return new EtwCollectionResult(true, true, null, events.OrderBy(e => e.Time).ToArray(), sessions.ToArray(), tracePath);
+            long rawBytes = !string.IsNullOrWhiteSpace(tracePath) && File.Exists(tracePath) ? new FileInfo(tracePath).Length : 0;
+            if (rawLimitReached != 0)
+            {
+                rawLimitTimer?.Dispose();
+                durationTimer?.Dispose();
+                cancellationRegistration.Dispose();
+                session.Dispose();
+                captureLimitReason += " " + TryDeleteBoundedRawTrace(tracePath);
+            }
+            string? retainedRawTrace = rawLimitReached == 0 ? tracePath : null;
+            return new EtwCollectionResult(true, true, null, events.ToArray().OrderBy(e => e.Time).ToArray(), sessions.ToArray(), retainedRawTrace,
+                events.Received, events.Dropped, sessions.Received, sessions.Dropped, rawBytes, options.MaxRawTraceBytes, captureLimitReason);
         }
         catch (Exception ex)
         {
-            return new EtwCollectionResult(false, false, ex.Message, events.OrderBy(e => e.Time).ToArray(), sessions.ToArray(), options.RawTracePath);
+            long rawBytes = !string.IsNullOrWhiteSpace(validatedTracePath) && File.Exists(validatedTracePath) ? new FileInfo(validatedTracePath).Length : 0;
+            if (rawLimitReached != 0) captureLimitReason += " " + TryDeleteBoundedRawTrace(validatedTracePath);
+            string? retainedRawTrace = rawLimitReached == 0 ? validatedTracePath : null;
+            return new EtwCollectionResult(false, false, ex.Message, events.ToArray().OrderBy(e => e.Time).ToArray(), sessions.ToArray(), retainedRawTrace,
+                events.Received, events.Dropped, sessions.Received, sessions.Dropped, rawBytes, options.MaxRawTraceBytes, captureLimitReason);
         }
     }
 
     private static bool PidMatches(int? targetPid, ConcurrentDictionary<int, byte> trackedPids, int observedPid) =>
         !targetPid.HasValue || trackedPids.ContainsKey(observedPid);
 
-    private static void EnqueueEvent(ConcurrentQueue<TimelineEvent> events, Action<TimelineEvent>? onEvent, TimelineEvent timelineEvent)
+    /// <summary>Rejects raw ETL output outside MRTW's case-specific scratch area.</summary>
+    public static string? ValidateRawTracePath(string? path)
     {
-        events.Enqueue(timelineEvent);
+        if (string.IsNullOrWhiteSpace(path)) return null;
         try
         {
-            onEvent?.Invoke(timelineEvent);
+            string root = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "MRTW"));
+            string full = Path.GetFullPath(path);
+            string relative = Path.GetRelativePath(root, full);
+            string[] parts = relative.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            if (parts.Length != 3 || !parts[0].StartsWith("case-", StringComparison.Ordinal) || !parts[1].Equals("raw_evidence", StringComparison.OrdinalIgnoreCase) ||
+                relative.StartsWith("..", StringComparison.Ordinal) || Path.GetFileName(full) != parts[2])
+                throw new InvalidOperationException("Raw ETL output must be directly under %TEMP%\\MRTW\\case-*\\raw_evidence.");
+
+            string caseDirectory = Path.Combine(root, parts[0]);
+            string parent = Path.Combine(caseDirectory, parts[1]);
+            if (!Path.GetDirectoryName(full)!.Equals(parent, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("Raw ETL output must not traverse outside the trusted scratch area.");
+            EnsureTrustedDirectory(root);
+            EnsureTrustedDirectory(caseDirectory);
+            EnsureTrustedDirectory(parent);
+            if (File.Exists(full) && (File.GetAttributes(full) & FileAttributes.ReparsePoint) != 0)
+                throw new InvalidOperationException("Raw ETL output file is a reparse point.");
+            return full;
         }
-        catch
-        {
-            // UI/live callbacks must not stop the ETW session.
-        }
+        catch (InvalidOperationException) { throw; }
+        catch (Exception ex) { throw new InvalidOperationException("Raw ETL output path could not be validated.", ex); }
+        throw new InvalidOperationException("Raw ETL output is outside the trusted scratch area.");
     }
 
-    private static void EnqueueNetworkSession(ConcurrentQueue<NetworkSession> sessions, Action<NetworkSession>? onNetworkSession, NetworkSession session)
+    private static void EnsureTrustedDirectory(string path)
     {
-        sessions.Enqueue(session);
+        if (Directory.Exists(path))
+        {
+            if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
+                throw new InvalidOperationException("Raw ETL output path contains a reparse point.");
+            return;
+        }
+
+        Directory.CreateDirectory(path);
+        if (!Directory.Exists(path) || (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
+            throw new InvalidOperationException("Raw ETL output directory could not be created safely.");
+    }
+
+    private static string TryDeleteBoundedRawTrace(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return "Raw ETL cleanup skipped: no path.";
         try
         {
-            onNetworkSession?.Invoke(session);
+            string root = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "MRTW"));
+            string full = Path.GetFullPath(path);
+            string relative = Path.GetRelativePath(root, full);
+            string[] parts = relative.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            if (parts.Length != 3 || !parts[0].StartsWith("case-", StringComparison.Ordinal) || !parts[1].Equals("raw_evidence", StringComparison.OrdinalIgnoreCase) ||
+                relative.StartsWith("..", StringComparison.Ordinal) || Path.GetFileName(full) != parts[2])
+                return "Raw ETL cleanup skipped: path is outside the trusted case scratch area.";
+
+            var info = new FileInfo(full);
+            if (!info.Exists || (info.Attributes & FileAttributes.ReparsePoint) != 0) return "Raw ETL cleanup skipped: file is unavailable or unsafe.";
+            for (DirectoryInfo? directory = info.Directory; directory is not null; directory = directory.Parent)
+            {
+                if ((directory.Attributes & FileAttributes.ReparsePoint) != 0) return "Raw ETL cleanup skipped: scratch path contains a reparse point.";
+                if (directory.FullName.Equals(root, StringComparison.OrdinalIgnoreCase)) break;
+            }
+            File.Delete(full);
+            return "Raw ETL cleanup succeeded after the capture limit.";
         }
-        catch
-        {
-            // UI/live callbacks must not stop the ETW session.
-        }
+        catch (Exception ex) { return $"Raw ETL cleanup failed: {ex.Message}"; }
     }
 
     private static void RememberProcessName(ConcurrentDictionary<int, string> names, int pid, string? processName, string? imagePath)
