@@ -9,6 +9,27 @@ namespace MRTW.Collectors.Etw;
 
 public sealed class TraceEventEtwCollector
 {
+    /// <summary>Arms an ETW session before a target exists.  No event, network item, or callback is retained until BindTarget succeeds.</summary>
+    public EtwArmedCapture Arm(
+        EtwCollectorOptions options,
+        CancellationToken cancellationToken = default,
+        Action<TimelineEvent>? onEvent = null,
+        Action<NetworkSession>? onNetworkSession = null)
+    {
+        var control = new EtwCaptureControl(options.TargetPid, discardUnboundRaw: true);
+        var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var task = Task.Run(() =>
+        {
+            try { return CollectInternal(options with { TargetPid = null }, linked.Token, onEvent, onNetworkSession, control); }
+            catch (Exception ex)
+            {
+                control.SetFailed(ex);
+                return new EtwCollectionResult(false, false, "ETW pre-launch arm failed: " + ex.Message, [], []);
+            }
+        }, CancellationToken.None);
+        return new EtwArmedCapture(control, linked, task);
+    }
+
     public EtwCollectionResult Collect(EtwCollectorOptions options)
     {
         return Collect(options, CancellationToken.None);
@@ -25,21 +46,28 @@ public sealed class TraceEventEtwCollector
         Action<TimelineEvent>? onEvent,
         Action<NetworkSession>? onNetworkSession)
     {
+        return CollectInternal(options, cancellationToken, onEvent, onNetworkSession, new EtwCaptureControl(options.TargetPid));
+    }
+
+    private EtwCollectionResult CollectInternal(
+        EtwCollectorOptions options,
+        CancellationToken cancellationToken,
+        Action<TimelineEvent>? onEvent,
+        Action<NetworkSession>? onNetworkSession,
+        EtwCaptureControl control)
+    {
         CaptureLimits.Validate(options.MaxPersistedEvents, options.MaxPersistedNetworkSessions, options.MaxRawTraceBytes);
         string? validatedTracePath = ValidateRawTracePath(options.RawTracePath);
         if (!OperatingSystem.IsWindows())
         {
+            control.SetFailed(new PlatformNotSupportedException("ETW is only available on Windows."));
             return new EtwCollectionResult(false, false, "ETW is only available on Windows.", Array.Empty<TimelineEvent>(), Array.Empty<NetworkSession>());
         }
 
         var events = new BoundedCaptureBuffer<TimelineEvent>(options.MaxPersistedEvents);
         var sessions = new BoundedCaptureBuffer<NetworkSession>(options.MaxPersistedNetworkSessions);
         var processNames = new ConcurrentDictionary<int, string>();
-        var trackedPids = new ConcurrentDictionary<int, byte>();
-        if (options.TargetPid is int targetPid)
-        {
-            trackedPids[targetPid] = 0;
-        }
+        var trackedPids = new PidTreeFilter(control.TargetPid);
         var startedAt = options.CaseStartedAtUtc ?? DateTimeOffset.UtcNow;
         int nextId = 1;
         string sessionName = "MRTW-" + Guid.NewGuid().ToString("N");
@@ -53,6 +81,7 @@ public sealed class TraceEventEtwCollector
             {
                 StopOnDispose = true
             };
+            control.SetStop(() => session.Stop());
 
             bool CanCapture() => Volatile.Read(ref rawLimitReached) == 0;
             void CaptureEvent(TimelineEvent item)
@@ -104,14 +133,11 @@ public sealed class TraceEventEtwCollector
                 session.EnableProvider("Microsoft-Windows-DNS-Client");
             }
 
+            control.SetReady();
+
             session.Source.Kernel.ProcessStart += data =>
             {
-                bool parentTracked = options.FollowDescendants && trackedPids.ContainsKey(data.ParentID);
-                if (parentTracked)
-                {
-                    trackedPids[data.ProcessID] = 0;
-                }
-                if (!PidMatches(options.TargetPid, trackedPids, data.ProcessID))
+                if (!trackedPids.TrackStart(control.TargetPid, data.ParentID, data.ProcessID, options.FollowDescendants))
                 {
                     return;
                 }
@@ -133,7 +159,7 @@ public sealed class TraceEventEtwCollector
 
             session.Source.Kernel.ProcessStop += data =>
             {
-                if (!PidMatches(options.TargetPid, trackedPids, data.ProcessID))
+                if (!trackedPids.Matches(control.TargetPid, data.ProcessID))
                 {
                     return;
                 }
@@ -151,11 +177,12 @@ public sealed class TraceEventEtwCollector
                     data.ExitStatus == 0 ? EventSeverity.Informational : EventSeverity.Medium,
                     "ETW",
                     data));
+                trackedPids.Complete(control.TargetPid, data.ProcessID);
             };
 
             session.Source.Kernel.ImageLoad += data =>
             {
-                if (!PidMatches(options.TargetPid, trackedPids, data.ProcessID))
+                if (!trackedPids.Matches(control.TargetPid, data.ProcessID))
                 {
                     return;
                 }
@@ -177,7 +204,7 @@ public sealed class TraceEventEtwCollector
 
             session.Source.Kernel.TcpIpConnect += data =>
             {
-                if (!PidMatches(options.TargetPid, trackedPids, data.ProcessID))
+                if (!trackedPids.Matches(control.TargetPid, data.ProcessID))
                 {
                     return;
                 }
@@ -201,7 +228,7 @@ public sealed class TraceEventEtwCollector
 
             session.Source.Kernel.UdpIpSend += data =>
             {
-                if (!PidMatches(options.TargetPid, trackedPids, data.ProcessID)) return;
+                if (!trackedPids.Matches(control.TargetPid, data.ProcessID)) return;
                 string remote = $"{data.daddr}:{data.dport}"; string process = KnownProcessName(processNames, data.ProcessID, null, null);
                 CaptureEvent( Event(Interlocked.Increment(ref nextId), DateTimeOffset.UtcNow - startedAt, process, data.ProcessID, EventCategory.Network, "UDP Send", remote, "UDP metadata observed by kernel ETW", EventSeverity.Medium, "ETW", data));
                 CaptureNetworkSession( new NetworkSession(process, "", "", data.daddr.ToString(), data.dport, "UDP", DateTimeOffset.UtcNow - startedAt, data.size, 0, "", "", Coverage: "kernel ETW UDP metadata; payload/TLS/JA3 unsupported"));
@@ -209,7 +236,7 @@ public sealed class TraceEventEtwCollector
 
             session.Source.Kernel.UdpIpRecv += data =>
             {
-                if (!PidMatches(options.TargetPid, trackedPids, data.ProcessID)) return;
+                if (!trackedPids.Matches(control.TargetPid, data.ProcessID)) return;
                 string remote = $"{data.saddr}:{data.sport}"; string process = KnownProcessName(processNames, data.ProcessID, null, null);
                 CaptureEvent( Event(Interlocked.Increment(ref nextId), DateTimeOffset.UtcNow - startedAt, process, data.ProcessID, EventCategory.Network, "UDP Receive", remote, "UDP metadata observed by kernel ETW", EventSeverity.Low, "ETW", data));
                 CaptureNetworkSession( new NetworkSession(process, "", "", data.saddr.ToString(), data.sport, "UDP", DateTimeOffset.UtcNow - startedAt, 0, data.size, "", "", Coverage: "kernel ETW UDP metadata; payload/TLS/JA3 unsupported"));
@@ -225,7 +252,7 @@ public sealed class TraceEventEtwCollector
                     }
 
                     int pid = data.ProcessID;
-                    if (!PidMatches(options.TargetPid, trackedPids, pid))
+                    if (!trackedPids.Matches(control.TargetPid, pid))
                     {
                         return;
                     }
@@ -262,11 +289,17 @@ public sealed class TraceEventEtwCollector
                 }
                 catch { /* best effort only; ETW collection remains usable */ }
             }, null, TimeSpan.FromMilliseconds(250), TimeSpan.FromMilliseconds(250));
-            using var durationTimer = options.Duration is null ? null : new Timer(_ => session.Stop(), null, options.Duration.Value, Timeout.InfiniteTimeSpan);
+            using var durationTimer = options.Duration is null ? null : new Timer(_ => session.Stop(), null, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+            if (options.Duration is not null)
+            {
+                _ = control.Bound.ContinueWith(_ => durationTimer?.Change(options.Duration.Value, Timeout.InfiniteTimeSpan),
+                    CancellationToken.None, TaskContinuationOptions.OnlyOnRanToCompletion, TaskScheduler.Default);
+            }
             using var cancellationRegistration = cancellationToken.Register(() => session.Stop());
             session.Source.Process();
 
             long rawBytes = !string.IsNullOrWhiteSpace(tracePath) && File.Exists(tracePath) ? new FileInfo(tracePath).Length : 0;
+            bool discardUnboundRaw = control.DiscardUnboundRaw && !control.TargetPid.HasValue;
             if (rawLimitReached != 0)
             {
                 rawLimitTimer?.Dispose();
@@ -275,22 +308,27 @@ public sealed class TraceEventEtwCollector
                 session.Dispose();
                 captureLimitReason += " " + TryDeleteBoundedRawTrace(tracePath);
             }
-            string? retainedRawTrace = rawLimitReached == 0 ? tracePath : null;
+            if (discardUnboundRaw)
+            {
+                captureLimitReason += " Target PID was never bound; pre-bind raw ETL was discarded. " + TryDeleteBoundedRawTrace(tracePath);
+            }
+            string? retainedRawTrace = rawLimitReached == 0 && !discardUnboundRaw ? tracePath : null;
             return new EtwCollectionResult(true, true, null, events.ToArray().OrderBy(e => e.Time).ToArray(), sessions.ToArray(), retainedRawTrace,
-                events.Received, events.Dropped, sessions.Received, sessions.Dropped, rawBytes, options.MaxRawTraceBytes, captureLimitReason);
+                events.Received, events.Dropped, sessions.Received, sessions.Dropped, rawBytes, options.MaxRawTraceBytes, captureLimitReason, control.TargetPid.HasValue);
         }
         catch (Exception ex)
         {
+            control.SetFailed(ex);
             long rawBytes = !string.IsNullOrWhiteSpace(validatedTracePath) && File.Exists(validatedTracePath) ? new FileInfo(validatedTracePath).Length : 0;
+            bool discardUnboundRaw = control.DiscardUnboundRaw && !control.TargetPid.HasValue;
             if (rawLimitReached != 0) captureLimitReason += " " + TryDeleteBoundedRawTrace(validatedTracePath);
-            string? retainedRawTrace = rawLimitReached == 0 ? validatedTracePath : null;
+            if (discardUnboundRaw)
+                captureLimitReason += " Target PID was never bound; pre-bind raw ETL was discarded. " + TryDeleteBoundedRawTrace(validatedTracePath);
+            string? retainedRawTrace = rawLimitReached == 0 && !discardUnboundRaw ? validatedTracePath : null;
             return new EtwCollectionResult(false, false, ex.Message, events.ToArray().OrderBy(e => e.Time).ToArray(), sessions.ToArray(), retainedRawTrace,
-                events.Received, events.Dropped, sessions.Received, sessions.Dropped, rawBytes, options.MaxRawTraceBytes, captureLimitReason);
+                events.Received, events.Dropped, sessions.Received, sessions.Dropped, rawBytes, options.MaxRawTraceBytes, captureLimitReason, control.TargetPid.HasValue);
         }
     }
-
-    private static bool PidMatches(int? targetPid, ConcurrentDictionary<int, byte> trackedPids, int observedPid) =>
-        !targetPid.HasValue || trackedPids.ContainsKey(observedPid);
 
     /// <summary>Rejects raw ETL output outside MRTW's case-specific scratch area.</summary>
     public static string? ValidateRawTracePath(string? path)
@@ -442,4 +480,91 @@ public sealed class TraceEventEtwCollector
 
         return new TimelineEvent(id, time < TimeSpan.Zero ? TimeSpan.Zero : time, process, pid, category, action, obj, summary, severity, source, rawJson, CapturedAtUtc: DateTimeOffset.UtcNow);
     }
+}
+
+/// <summary>Tracks only a bound root and live descendants; exited children are removed to reject PID reuse.</summary>
+internal sealed class PidTreeFilter
+{
+    private readonly ConcurrentDictionary<int, byte> _tracked = new();
+
+    public PidTreeFilter(int? rootPid)
+    {
+        if (rootPid is int pid && pid > 0) _tracked.TryAdd(pid, 0);
+    }
+
+    public bool TrackStart(int? rootPid, int parentPid, int pid, bool followDescendants)
+    {
+        if (!rootPid.HasValue || pid <= 0) return false;
+        if (pid == rootPid.Value) _tracked.TryAdd(pid, 0);
+        else if (followDescendants && _tracked.ContainsKey(parentPid)) _tracked.TryAdd(pid, 0);
+        return _tracked.ContainsKey(pid);
+    }
+
+    public bool Matches(int? rootPid, int pid)
+    {
+        if (!rootPid.HasValue || pid <= 0) return false;
+        if (pid == rootPid.Value) _tracked.TryAdd(pid, 0);
+        return _tracked.ContainsKey(pid);
+    }
+
+    public void Complete(int? rootPid, int pid)
+    {
+        if (rootPid.HasValue && pid != rootPid.Value) _tracked.TryRemove(pid, out _);
+    }
+}
+
+/// <summary>Owns one pre-launch ETW capture. Dispose/Stop are idempotent.</summary>
+public sealed class EtwArmedCapture : IDisposable
+{
+    private readonly EtwCaptureControl _control;
+    private readonly CancellationTokenSource _cancellation;
+    private int _stopped;
+
+    internal EtwArmedCapture(EtwCaptureControl control, CancellationTokenSource cancellation, Task<EtwCollectionResult> completion)
+    {
+        _control = control;
+        _cancellation = cancellation;
+        Completion = completion;
+    }
+
+    public Task Ready => _control.Ready.Task;
+    public Task<EtwCollectionResult> Completion { get; }
+    public bool BindTarget(int pid) => _control.BindTarget(pid);
+    public void Stop()
+    {
+        if (Interlocked.Exchange(ref _stopped, 1) != 0) return;
+        _cancellation.Cancel();
+        _control.Stop();
+    }
+    public void Dispose() { Stop(); _cancellation.Dispose(); }
+}
+
+internal sealed class EtwCaptureControl
+{
+    private readonly TaskCompletionSource<bool> _ready = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<int> _bound = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private Action? _stop;
+    private int _targetPid;
+
+    public EtwCaptureControl(int? targetPid, bool discardUnboundRaw = false)
+    {
+        DiscardUnboundRaw = discardUnboundRaw;
+        if (targetPid is int pid && pid > 0) BindTarget(pid);
+    }
+    public bool DiscardUnboundRaw { get; }
+    public int? TargetPid => Volatile.Read(ref _targetPid) is int pid and > 0 ? pid : null;
+    public TaskCompletionSource<bool> Ready => _ready;
+    public Task<int> Bound => _bound.Task;
+    public bool IsBound => TargetPid.HasValue;
+    public bool BindTarget(int pid)
+    {
+        if (pid <= 0) return false;
+        if (Interlocked.CompareExchange(ref _targetPid, pid, 0) != 0) return Volatile.Read(ref _targetPid) == pid;
+        _bound.TrySetResult(pid);
+        return true;
+    }
+    public void SetStop(Action stop) { _stop = stop; }
+    public void Stop() { try { Volatile.Read(ref _stop)?.Invoke(); } catch { } }
+    public void SetReady() => _ready.TrySetResult(true);
+    public void SetFailed(Exception error) => _ready.TrySetException(error);
 }

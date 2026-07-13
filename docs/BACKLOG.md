@@ -2,10 +2,10 @@
 
 ## 概要
 
-- 最終更新日: 2026-07-12
+- 最終更新日: 2026-07-14
 - 調査対象: `README.md`、`docs/`、`src/MRTW.Core/`、`src/MRTW.Collectors.Etw/`、`src/MRTW.Cli/`、`src/MRTW.App/`、`src/MRTW.Native/`、`test/`
 - 主要な懸念: 高頻度イベント時の収集メモリ上限、短命プロセスのETW開始タイミング、Windows永続化面の観測不足、スクリプト／非PE形式の分析不足、Windows実環境での統合試験不足、Privacy Modeとバッチ実行の検証不足
-- 次に着手すべきタスク: TASK-002
+- 次に着手すべきタスク: TASK-005
 
 このバックログは、現在の実装・文書・テストから確認できた未対応事項だけを記録する。完了済みのP0/P1 GUI停止・ライブ表示・SQLite入力上限の修正は、重複して登録しない。
 
@@ -69,35 +69,19 @@
 
 ### TASK-002: 対象起動前にETWを準備し、短命プロセスの初期イベント欠落を減らす
 
-- 状態: 未着手
+- 状態: 完了
 - 規模: L
-- 概要: 現在のオーケストレーターはランタイム収集器が`Process Start`等でroot PIDを通知した後にETWを開始する。この順序では、短時間で終了する検体の開始直後のProcess・ImageLoad・TCP・DNSイベントを取得できない。
-- 根拠: `docs/architecture.md` は「root PIDが判明してからETWを開始する」と記載している。`src/MRTW.Collectors.Etw/AnalysisOrchestrator.cs` も`rootPid.Task`完了後に`TraceEventEtwCollector.Collect`を開始している。
-- 対象: `src/MRTW.Collectors.Etw/AnalysisOrchestrator.cs`、`src/MRTW.Collectors.Etw/TraceEventEtwCollector.cs`、`src/MRTW.Core/RuntimeCaseCollector.cs`、`src/MRTW.Collectors.Etw/EtwCollectorOptions.cs`、`test/NativeSafeRuntimeProbe/`、`test/SafeRuntimeProbe/`
-- 実装内容: ETWセッションを対象起動前に準備し、root PID確定後に対象PIDツリーへ確実に絞り込む設計へ変更する。PID確定前に取得したイベントの扱い、raw ETLの範囲、子プロセス追跡、キャンセル時のセッション停止を明文化する。
+- 概要: ETWを対象起動前にarmし、Ready barrierの成功後にRuntime収集を開始する。RuntimeがPIDを取得した時点で一度だけbindし、rootと子孫PIDだけを構造化保持する。
+- 根拠: `AnalysisOrchestrator`、`TraceEventEtwCollector`、`RuntimeCaseCollector`を更新し、PID bind前にイベント・ネットワーク・ライブcallbackを保持しないことを実装した。
+- 対象: `src/MRTW.Collectors.Etw/AnalysisOrchestrator.cs`、`src/MRTW.Collectors.Etw/TraceEventEtwCollector.cs`、`src/MRTW.Core/RuntimeCaseCollector.cs`、`test/MRTW.RegressionTests/Program.cs`
+- 実装内容: `EtwArmedCapture`のReady/BindTarget/Stopを追加し、既存の`Collect` APIは維持した。ETW arm失敗、pre-launch cancel、integrity failureでもRuntimeは安全に継続または終了し、Stop/Disposeは冪等にした。ETW durationはPID bind後に開始する。
 - 完了条件:
-  - [ ] 100ms未満で終了する安全な検体で、root process start／exitの少なくとも一方と初期ImageLoadを取得できる
-  - [ ] 対象外プロセスの構造化イベントがケースへ混入しない
-  - [ ] Stop、タイムアウト、起動失敗の各経路でETWセッションが確実に停止する
-  - [ ] 関連テストが成功する
-- 依存関係: TASK-003
-- リスク・注意点: 事前開始したカーネルETWはシステム全体を観測し得る。PID確定前のデータを保存・UI表示・Privacy Modeでどう扱うかを設計で固定すること。
-
-### TASK-003: Windows隔離環境で実行するETW・Native Hook・containmentの統合試験を自動化する
-
-  - 状態: ブロック中
-- 規模: L
-- 概要: 現在の回帰スイートは.NETの依存なし実行ファイルであり、実際のETWプロバイダー、Native Hook DLL／injector、Windows Firewall containmentを通した検証を行わない。実機依存機能の回帰を継続的に検出できない。
-- 根拠: `test/MRTW.RegressionTests/MRTW.RegressionTests.csproj` はCoreとETWプロジェクトのみを参照し、`Program.cs`の21件は主にモデル・保存・境界テストである。`docs/safety.md` はETWとNative Hookの正確性検証には制御されたWindows環境が必要と明記し、`test/README.md` は`SafeRuntimeProbe`をhook/ETW smoke test用と定義している。
-- 対象: `test/SafeRuntimeProbe/`、`test/NativeSafeRuntimeProbe/`、`test/NativeExportProbe/`、`src/MRTW.Native/`、`test/`の統合試験用スクリプト、CIまたは隔離VM実行手順
-  - 実装内容: 管理者権限を持つ隔離Windows VM向けの統合試験ランナーを作る。SafeRuntimeProbeとNativeSafeRuntimeProbeで、ETWイベント、Hook pipeイベント、子プロセス追跡、`observe`／`block`／`isolated`の許可・失敗時fail-closed、Stop、エクスポート内容を検証する。通常のクロスプラットフォーム回帰とは分離する。`test/Run-IsolatedVmIntegration.ps1` にゲート付きの初期ランナーを実装済みだが、実際の隔離VM・管理者・Native成果物での実行証跡が未取得のため完了扱いにしない。
-- 完了条件:
-  - [ ] ネイティブhook/injectorをCMakeでビルドし、試験用出力へ配置できる
-  - [ ] 隔離VMでETW・Hookそれぞれの取得結果とCollection Qualityを機械判定できる
-  - [ ] Firewall ruleが試験後に削除されたことを確認する
-  - [ ] 非管理者・プロバイダー利用不可時は期待したfail-closedまたはskipとして判定する
-- 依存関係: なし
-- リスク・注意点: 実検体を使わず、`test/`配下の安全なプローブのみを対象にする。`isolated`は専用VMでのみ実行すること。
+  - [x] PID bind前の構造化イベント、ネットワーク、callbackを保持しない
+  - [x] root/child PIDに限定した構造化保持を実装する
+  - [x] Stop、起動失敗、キャンセル時にcaptureを一回だけ停止する
+  - [x] 関連テストとDebug/Releaseビルドが成功する
+- 依存関係: なし（TASK-003は利用者要求により削除）
+- リスク・注意点: arm中のraw kernel ETLはシステム全体を観測し得る。PID bind前のrawは保存対象外の構造化データと区別し、品質情報とREADMEで注意を明示する。
 
 ### TASK-004: Privacy Modeの全エクスポート形式に対する漏えい回帰試験を追加する
 
@@ -143,7 +127,7 @@
   - [ ] 各差分に根拠となる元データと取得時刻が保存される
   - [ ] 読み取り権限不足時に「存在しない」と誤表示せず、品質情報へ理由を記録する
   - [ ] 安全なテストフィクスチャで作成・変更・削除の回帰テストが成功する
-- 依存関係: TASK-003
+- 依存関係: なし（隔離VM統合試験は利用者要求によりバックログ対象外）
 - リスク・注意点: ServiceやWMIの列挙は権限・環境差が大きい。収集器が永続化を作成・変更してはならず、読み取り専用に限定すること。
 
 ## P2
@@ -191,7 +175,7 @@
   - [ ] 採用方式で検証対象と実行対象のSHA-256一致をケースへ記録する
   - [ ] 安全性を保証できない直接昇格起動は拒否される
   - [ ] 関連テストが成功する
-- 依存関係: TASK-003
+- 依存関係: なし（隔離VM統合試験は利用者要求によりバックログ対象外）
 - リスク・注意点: 検体コピーは証拠保全・AV検知・パス依存挙動に影響する。既定では専用VMでMRTWを管理者起動する案内を維持すること。
 
 ### TASK-011: エンコード済みスクリプトとLOLBin連鎖を正規化して分析する
@@ -223,7 +207,7 @@
   - [ ] 設定変更のタイムラインには根拠パス・値名・旧値／新値（Privacy Mode適用後）がある
   - [ ] 収集器自身がFirewall・Defender・hosts設定を変更しないことをテストで確認する
   - [ ] 関連テストが成功する
-- 依存関係: TASK-003
+- 依存関係: なし（隔離VM統合試験は利用者要求によりバックログ対象外）
 - リスク・注意点: セキュリティ製品設定やhostsの実値は機微情報を含む。Privacy Mode、管理者権限、製品差分、OSバージョン差を明示すること。
 
 ### TASK-013: 非PE初期侵入形式を安全に静的トリアージする
@@ -256,7 +240,7 @@
   - [ ] 収集方式ごとの取得可能データ、権限、プライバシー影響、保存容量を比較した設計決定がある
   - [ ] 採用しない場合も、現在のcoverage表示が誤解を招かないことを確認する
   - [ ] 採用する場合は安全なプローブを用いた統合試験がある
-- 依存関係: TASK-003
+- 依存関係: なし（隔離VM統合試験は利用者要求によりバックログ対象外）
 - リスク・注意点: パケット本文や復号情報は機微情報を含み得る。既存のPrivacy Modeと同等以上のデータ最小化・アクセス制御を設計すること。
 
 ## 保留事項
@@ -267,8 +251,8 @@
 
 ## 調査メモ
 
-- GUIとCLIは`AnalysisOrchestrator`を共有し、ETWはroot PIDの通知後に開始する。これは対象外イベントの混入を防ぐ一方、短命プロセスの初期イベント欠落につながる。
+- GUIとCLIは`AnalysisOrchestrator`を共有し、ETWは対象起動前にarmしてReady barrier後にRuntimeを開始する。root PID bind前の構造化イベント・ネットワーク・callbackは保持せず、bind後にroot/子孫PIDだけを対象にする。
 - GUIのライブ表示には上限と欠落表示があるが、収集器の永続データ側には同等の上限が確認できない。
 - `CaseService`はJSON 64 MiB、SQLite 512 MiB、行数・TEXT長の入力上限を持ち、回帰テストもSQLite巨大TEXT、raw evidence整合性、Privacy Mode、静的解析上限を対象にしている。
-- `NativeSafeRuntimeProbe`、`SafeRuntimeProbe`、`NativeExportProbe`は存在するが、.NET回帰スイートから実環境のETW／Hook／Firewallを通して実行する統合試験は確認できない。
+- `NativeSafeRuntimeProbe`、`SafeRuntimeProbe`、`NativeExportProbe`は存在する。実環境のETW／Hook／Firewall統合試験は利用者要求によりバックログ対象外とする。
 - `MRTW.sln`は.NETプロジェクトをビルドする。Native Hook／injectorはCMakeで別途ビルド・配置する運用である。

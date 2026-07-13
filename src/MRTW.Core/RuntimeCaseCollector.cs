@@ -26,7 +26,7 @@ public sealed class RuntimeCaseCollector
         return Collect(profile, staticAnalysis, cancellationToken, onEvent, null);
     }
 
-    public CaseData Collect(ExecutionProfile profile, StaticAnalysisResult? staticAnalysis, CancellationToken cancellationToken, Action<TimelineEvent>? onEvent, CollectionRunContext? runContext)
+    public CaseData Collect(ExecutionProfile profile, StaticAnalysisResult? staticAnalysis, CancellationToken cancellationToken, Action<TimelineEvent>? onEvent, CollectionRunContext? runContext, Action<int>? onProcessBound = null)
     {
         CaptureLimits.ValidatePersisted(profile.MaxPersistedEvents, profile.MaxPersistedNetworkSessions);
         runContext ??= CollectionRunContext.Create();
@@ -38,6 +38,14 @@ public sealed class RuntimeCaseCollector
         int nextId = 1;
         HookPipeServer? hookPipe = null;
         int callbackFailures = 0;
+        int boundPid = 0;
+
+        void BindProcess(int candidatePid)
+        {
+            if (candidatePid <= 0 || Interlocked.CompareExchange(ref boundPid, candidatePid, 0) != 0) return;
+            try { onProcessBound?.Invoke(candidatePid); }
+            catch { callbackFailures++; }
+        }
 
         var beforeCapture = profile.SnapshotBefore ? _snapshot.Capture(profile, cancellationToken) : new SnapshotCaptureResult(EmptySnapshot(), true, false, false, "Pre-execution snapshot disabled.");
         SnapshotData before = beforeCapture.Data;
@@ -81,7 +89,7 @@ public sealed class RuntimeCaseCollector
             if (!events.TryAdd(timelineEvent)) return;
             try
             {
-                onEvent?.Invoke(timelineEvent);
+                DeliverForLiveCallback(timelineEvent, BindProcess, onEvent);
             }
             catch
             {
@@ -181,6 +189,7 @@ public sealed class RuntimeCaseCollector
                         if (observedInjectedPid > 0 && process is null)
                         {
                             pid = observedInjectedPid;
+                            BindProcess(pid.Value);
                             process = TryGetProcessById(observedInjectedPid);
                             if (process is not null)
                             {
@@ -241,12 +250,14 @@ public sealed class RuntimeCaseCollector
                         verifiedTarget?.Dispose();
                         verifiedTarget = null;
                         pid = process.Id;
+                        BindProcess(pid.Value);
                         processStarted = DateTimeOffset.Now;
                     }
 
                     if (injectedPid > 0 && process is null)
                     {
                         pid = injectedPid;
+                        BindProcess(pid.Value);
                         process = TryGetProcessById(injectedPid);
                         if (process is null)
                         {
@@ -258,12 +269,14 @@ public sealed class RuntimeCaseCollector
                     else if (injectedPid > 0)
                     {
                         pid = injectedPid;
+                        BindProcess(pid.Value);
                     }
 
                     process ??= TryFindLaunchedProcess(profile, processStarted.Value);
                     if (process is not null && !processAttachedReported)
                     {
                         pid = process.Id;
+                        BindProcess(pid.Value);
                         Add(Event(nextId++, DateTimeOffset.Now - started, SafeProcessName(process, profile), pid.Value, EventCategory.Process, "Process Attached", profile.CommandLine, "Target process located after native injection", EventSeverity.Informational, "ExecutionManager"));
                     }
 
@@ -323,6 +336,7 @@ public sealed class RuntimeCaseCollector
                     verifiedTarget?.Dispose();
                     verifiedTarget = null;
                     pid = process.Id;
+                    BindProcess(pid.Value);
                     processStarted = DateTimeOffset.Now;
                     Add(Event(nextId++, processStarted.Value - started, SafeProcessName(process, profile), pid.Value, EventCategory.Process, "Process Start", profile.CommandLine, "Process started", EventSeverity.Informational, "ExecutionManager"));
 
@@ -440,6 +454,16 @@ public sealed class RuntimeCaseCollector
             notes,
             Quality: RuntimeQuality(events, networks, started),
             PreservedFiles: preservedFiles) { TrustedEvidenceRoot = EvidencePathPolicy.Root(caseId) };
+    }
+
+    internal static bool IsPidBindingEvent(TimelineEvent timelineEvent) =>
+        timelineEvent.Pid > 0 && timelineEvent.Category == EventCategory.Process &&
+        timelineEvent.Action is "Process Start" or "Process Attached";
+
+    internal static void DeliverForLiveCallback(TimelineEvent timelineEvent, Action<int>? bindProcess, Action<TimelineEvent>? publish)
+    {
+        if (IsPidBindingEvent(timelineEvent)) bindProcess?.Invoke(timelineEvent.Pid);
+        publish?.Invoke(timelineEvent);
     }
 
     private static Process StartProcess(ExecutionProfile profile, CancellationToken cancellationToken = default, VerifiedTargetHandle? verifiedTarget = null)

@@ -16,6 +16,7 @@
 - 対象プロセスの起動、終了、タイムアウト、プロセスツリー制御
 - GUI/CLI共通の収集オーケストレーター
 - ETW（TraceEvent）による対象プロセスと子孫プロセスのProcess・ImageLoad・TCP・DNSイベント収集
+- ETWは対象の起動前にarmしてReady barrierを確認し、Runtimeが取得したroot PIDへbindしてからroot/子孫PIDだけを構造化保持。PID bind前のETW由来イベント、ネットワーク、ライブcallbackは保存・表示しない
 - 実行前後のファイル、レジストリ、TCP接続スナップショット差分
 - x64 Native Hookによるファイル、レジストリ、プロセス、ネットワーク、認証情報、回避・探索系APIなどの観測
 - Named Pipe経由のHookイベント取り込み
@@ -24,6 +25,7 @@
 - Runtime / Hook / ETWごとの収集状態、受信数、欠落数、上限、打切り理由を含むCollection Quality
 - 永続イベントはRuntime/ETWとも既定50,000件、ネットワークセッションは10,000件の先着保持上限。後続分は破棄数と理由を品質情報へ記録し、Runtimeは上限後も停止・スナップショット処理を継続
 - raw ETLは既定512 MiBで上限に達すると、rawと構造化ETW収集をともに停止し、未完了のraw ETLをケースのraw evidenceとして採用しない。raw出力先は`%TEMP%\MRTW\case-*\raw_evidence`直下だけを受理し、既存ディレクトリを検証してから段階的に作成・再検証するためreparse pointを経由しない。サイズ監視は250msポーリングのため厳密なバイト境界ではなく、超過検出後は信頼済みケースscratch配下のETLだけをbest-effortで削除する
+- 注意: pre-launch arm中のraw kernel ETLはOS全体を一時的に観測し得る。MRTWはPID bind前のETW由来構造化データを保持せず、PIDがbindされないまま停止・失敗・取消となったraw ETLは証拠として返さず、信頼済みscratch配下だけを削除する。PID bind後からETWの収集時間を開始する。ETWの準備に失敗してもRuntime収集は継続し、Collection Qualityへ理由とraw cleanup結果を記録する
 - Windows Firewallによる `observe` / `block` / `isolated` ネットワークモード
 - EXE、DLL（既定では `rundll32`）、任意コマンドラインの実行
 - `--execute off` による非実行分析

@@ -27,50 +27,53 @@ public sealed class AnalysisOrchestrator
         var context = CollectionRunContext.Create();
         DateTimeOffset orchestrationStarted = DateTimeOffset.UtcNow;
         using var containment = NetworkContainmentService.Apply(profile);
-        var rootPid = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
         var liveEventKeys = new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
+        EtwArmedCapture? armedEtw = null;
+        EtwCollectionResult? etw = null;
 
         void Publish(TimelineEvent item)
         {
             liveEventKeys.TryAdd(EventKey(item), 0);
             onEvent?.Invoke(item);
-            if (item.Pid > 0 && item.Category == EventCategory.Process &&
-                item.Action is "Process Start" or "Process Attached" or "Hooked Process Start")
+        }
+
+        DateTimeOffset etwStarted = DateTimeOffset.UtcNow;
+        if (profile.EnableEtw && profile.ExecuteTarget && !cancellationToken.IsCancellationRequested)
+        {
+            TimeSpan? duration = profile.DurationSeconds is int seconds ? TimeSpan.FromSeconds(Math.Max(1, seconds)) : null;
+            try
             {
-                rootPid.TrySetResult(item.Pid);
+                armedEtw = new TraceEventEtwCollector().Arm(
+                    new EtwCollectorOptions(null, duration, FollowDescendants: true, CaseStartedAtUtc: context.StartedAtUtc,
+                        RawTracePath: profile.PrivacyMode ? null : Path.Combine(Path.GetTempPath(), "MRTW", context.CaseId, "raw_evidence", "network-process.etl"),
+                        MaxPersistedEvents: profile.MaxPersistedEvents, MaxPersistedNetworkSessions: profile.MaxPersistedNetworkSessions),
+                    cancellationToken,
+                    item => { if (liveEventKeys.TryAdd(EventKey(item), 0)) onEvent?.Invoke(item); },
+                    onNetworkSession);
+                await armedEtw.Ready.WaitAsync(TimeSpan.FromSeconds(10), cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                // ETW is best-effort: a failed ready barrier must not prevent safe runtime collection.
+                etw = new EtwCollectionResult(false, false, "ETW pre-launch arm failed: " + ex.Message, [], []);
+                armedEtw?.Stop();
+                armedEtw?.Dispose();
+                armedEtw = null;
             }
         }
 
         Task<CaseData> runtimeTask = Task.Run(
-            () => _runtime.Collect(profile, staticAnalysis, cancellationToken, Publish, context),
+            () => _runtime.Collect(profile, staticAnalysis, cancellationToken, Publish, context,
+                pid => armedEtw?.BindTarget(pid)),
             CancellationToken.None);
 
-        Task completed = await Task.WhenAny(rootPid.Task, runtimeTask).ConfigureAwait(false);
-        Task<EtwCollectionResult>? etwTask = null;
-        using var etwStop = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        DateTimeOffset etwStarted = DateTimeOffset.UtcNow;
-        if (profile.EnableEtw && completed == rootPid.Task && rootPid.Task.IsCompletedSuccessfully)
-        {
-            int pid = await rootPid.Task.ConfigureAwait(false);
-            TimeSpan? duration = profile.DurationSeconds is int seconds ? TimeSpan.FromSeconds(Math.Max(1, seconds)) : null;
-            etwTask = Task.Run(() => new TraceEventEtwCollector().Collect(
-                new EtwCollectorOptions(pid, duration, FollowDescendants: true, CaseStartedAtUtc: context.StartedAtUtc,
-                    RawTracePath: profile.PrivacyMode ? null : Path.Combine(Path.GetTempPath(), "MRTW", context.CaseId, "raw_evidence", "network-process.etl"),
-                    MaxPersistedEvents: profile.MaxPersistedEvents, MaxPersistedNetworkSessions: profile.MaxPersistedNetworkSessions),
-                etwStop.Token,
-                item =>
-                {
-                    if (liveEventKeys.TryAdd(EventKey(item), 0))
-                    {
-                        onEvent?.Invoke(item);
-                    }
-                },
-                onNetworkSession), CancellationToken.None);
-        }
-
         CaseData data = await runtimeTask.ConfigureAwait(false);
-        etwStop.Cancel();
-        EtwCollectionResult? etw = etwTask is null ? null : await etwTask.ConfigureAwait(false);
+        if (armedEtw is not null)
+        {
+            armedEtw.Stop();
+            etw = await armedEtw.Completion.ConfigureAwait(false);
+            armedEtw.Dispose();
+        }
         DateTimeOffset ended = DateTimeOffset.UtcNow;
         return FinalizeCase(data, etw, profile, containment, orchestrationStarted, etwStarted, ended);
     }
@@ -116,7 +119,7 @@ public sealed class AnalysisOrchestrator
             combined.Any(e => e.Action is "Hook Injection Failed" or "Hook Injection Timeout" or "Hook Unavailable");
         bool hookObserved = combined.Any(e => e.Source.Equals("Hook", StringComparison.OrdinalIgnoreCase));
         string hookStatus = !hookRequested ? "disabled" : !profile.ExecuteTarget ? "skipped" : hookFailed ? "degraded" : hookObserved ? "healthy" : "unavailable";
-        string etwStatus = !profile.EnableEtw ? "disabled" : !profile.ExecuteTarget ? "skipped" : etw is null ? "unavailable" : etw.Started && etw.Completed ? "healthy" : "degraded";
+        string etwStatus = !profile.EnableEtw ? "disabled" : !profile.ExecuteTarget ? "skipped" : etw is null ? "unavailable" : !etw.TargetBound ? "degraded" : etw.Started && etw.Completed ? "healthy" : "degraded";
         bool runtimeFailed = combined.Any(e => e.Action is "Execution Failed" or "Live Callback Failures");
         CollectorHealth? runtimeCapture = data.Quality?.Collectors.FirstOrDefault(c => c.Collector == "Runtime");
         CollectorHealth? runtimeNetworkCapture = data.Quality?.Collectors.FirstOrDefault(c => c.Collector == "RuntimeNetwork");
@@ -133,7 +136,7 @@ public sealed class AnalysisOrchestrator
                 hookFailed ? "One or more hook adapters or injection operations failed." : ""),
             new("ETW", captureBounded && (!string.IsNullOrWhiteSpace(etw?.CaptureLimitReason) || (etw?.EventsDropped ?? 0) > 0) ? "degraded" : etwStatus,
                 etwStarted, ended, etw?.EventsReceived ?? 0, etw?.EventsDropped ?? 0,
-                (etw?.ErrorMessage ?? "") + " " + (etw?.CaptureLimitReason ?? "") + $" event_limit={profile.MaxPersistedEvents};network_limit={profile.MaxPersistedNetworkSessions};raw_etl_limit={(etw?.RawTraceByteLimit ?? 0)}. Raw kernel ETL is system-wide; persisted structured events are filtered to the target PID tree.")
+                (etw?.ErrorMessage ?? "") + " " + (etw?.CaptureLimitReason ?? "") + (etw is { TargetBound: false } ? " Target PID was never bound; no structured ETW data was retained." : "") + $" event_limit={profile.MaxPersistedEvents};network_limit={profile.MaxPersistedNetworkSessions};raw_etl_limit={(etw?.RawTraceByteLimit ?? 0)}. Raw kernel ETL is system-wide before PID bind; persisted structured events, callbacks, and network sessions are discarded until the target PID tree is bound.")
             ,new("ETWNetwork", (etw?.NetworkSessionsDropped ?? 0) > 0 || !string.IsNullOrWhiteSpace(etw?.CaptureLimitReason) ? "degraded" : etwStatus,
                 etwStarted, ended, etw?.NetworkSessionsReceived ?? 0, etw?.NetworkSessionsDropped ?? 0,
                 (etw?.CaptureLimitReason ?? "") + $" network_limit={profile.MaxPersistedNetworkSessions};network_received={(etw?.NetworkSessionsReceived ?? 0)};network_dropped={(etw?.NetworkSessionsDropped ?? 0)}.")

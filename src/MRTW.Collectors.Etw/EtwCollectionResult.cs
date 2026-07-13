@@ -15,4 +15,5 @@ public sealed record EtwCollectionResult(
     long NetworkSessionsDropped = 0,
     long RawTraceBytes = 0,
     long RawTraceByteLimit = 0,
-    string CaptureLimitReason = "");
+    string CaptureLimitReason = "",
+    bool TargetBound = false);

@@ -33,6 +33,13 @@ var tests = new List<(string Name, Action Body)>
     ,("bounded capture preserves first items and exports loss quality", TestBoundedCaptureQualityRoundTrip)
     ,("capture limits reject unsafe values", TestCaptureLimitValidation)
     ,("raw ETL path accepts only trusted case scratch", TestRawTracePathPolicy)
+    ,("pre-launch ETW does not retain data before PID bind and stops idempotently", TestPrelaunchEtwSafety)
+    ,("PID tree filter removes exited children and rejects PID reuse", TestPidTreeFilter)
+    ,("runtime PID binding precedes the live Process Start callback", TestRuntimePidBindingOrder)
+    ,("hook Process Start is eligible for pre-callback PID binding", TestHookPidBindingEligibility)
+    ,("unbound pre-launch raw ETL is discarded", TestUnboundPrelaunchRawDiscard)
+    ,("cancelled pre-launch raw ETL is discarded", TestCanceledPrelaunchRawDiscard)
+    ,("pre-launch arm failure completes without raw evidence", TestPrelaunchArmFailure)
 };
 
 int failures = 0;
@@ -57,6 +64,110 @@ static void TestNetworkModes()
     Equal("observe", NetworkContainmentService.NormalizeMode("on"));
     Equal("block", NetworkContainmentService.NormalizeMode("off"));
     Equal("isolated", NetworkContainmentService.NormalizeMode("isolate"));
+}
+
+static void TestPrelaunchEtwSafety()
+{
+    using var armed = new TraceEventEtwCollector().Arm(new EtwCollectorOptions(null, null, RawTracePath: null));
+    try { armed.Ready.Wait(TimeSpan.FromSeconds(10)); } catch { /* unavailable ETW is an expected platform/permission outcome */ }
+    armed.Stop();
+    armed.Stop();
+    EtwCollectionResult result = armed.Completion.GetAwaiter().GetResult();
+    True(!result.TargetBound, "ETW capture reported a target bind that was never requested");
+    True(result.Events.Count == 0 && result.NetworkSessions.Count == 0, "pre-bind ETW retained structured data");
+}
+
+static void TestPidTreeFilter()
+{
+    var filter = new PidTreeFilter(100);
+    True(filter.TrackStart(100, 0, 100, true), "root process was not accepted");
+    True(filter.TrackStart(100, 100, 101, true), "child process was not accepted");
+    True(filter.Matches(100, 101), "tracked child event was rejected");
+    filter.Complete(100, 101);
+    True(!filter.Matches(100, 101), "exited child PID was retained and could accept PID reuse");
+    True(!filter.TrackStart(100, 101, 102, true), "descendant of exited/reused PID was accepted");
+    True(filter.Matches(100, 100), "root should remain tracked until capture ends");
+}
+
+static void TestRuntimePidBindingOrder()
+{
+    if (!OperatingSystem.IsWindows()) return;
+    string command = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "cmd.exe");
+    int bound = 0;
+    bool startArrivedAfterBind = false;
+    var profile = new ExecutionProfile(command, "exe", "none", null, "/d /c exit 0", Path.GetDirectoryName(command)!, 2,
+        false, false, false, false, "observe");
+    _ = new RuntimeCaseCollector().Collect(profile, null, CancellationToken.None,
+        item =>
+        {
+            if (item.Action == "Process Start" && item.Pid > 0)
+                startArrivedAfterBind = Volatile.Read(ref bound) == item.Pid;
+        }, null, pid => Interlocked.CompareExchange(ref bound, pid, 0));
+    True(bound > 0, "runtime did not publish the launched PID");
+    True(startArrivedAfterBind, "live Process Start callback preceded PID binding");
+}
+
+static void TestHookPidBindingEligibility()
+{
+    var hookStart = new TimelineEvent(1, TimeSpan.Zero, "probe.exe", 4242, EventCategory.Process,
+        "Process Start", "probe.exe", "simulated native hook pipe event", EventSeverity.Informational, "Hook", "{}");
+    var hookAttached = hookStart with { Action = "Process Attached" };
+    var order = new List<string>();
+    RuntimeCaseCollector.DeliverForLiveCallback(hookStart, pid => order.Add($"bind:{pid}"), _ => order.Add("callback"));
+    True(RuntimeCaseCollector.IsPidBindingEvent(hookAttached), "hook Process Attached was not recognized for PID bind");
+    Equal("bind:4242", order[0]);
+    Equal("callback", order[1]);
+}
+
+static void TestUnboundPrelaunchRawDiscard()
+{
+    string caseId = "case-" + Guid.NewGuid().ToString("N");
+    string raw = Path.Combine(Path.GetTempPath(), "MRTW", caseId, "raw_evidence", "prebind.etl");
+    try
+    {
+        using var armed = new TraceEventEtwCollector().Arm(new EtwCollectorOptions(null, null, RawTracePath: raw));
+        try { armed.Ready.Wait(TimeSpan.FromSeconds(10)); } catch { /* ETW provider may be unavailable */ }
+        armed.Stop();
+        EtwCollectionResult result = armed.Completion.GetAwaiter().GetResult();
+        True(result.RawTracePath is null, "unbound pre-launch ETL was returned as evidence");
+        True(!File.Exists(raw), "unbound pre-launch ETL was not removed from trusted scratch");
+        True(result.CaptureLimitReason.Contains("never bound", StringComparison.OrdinalIgnoreCase), "unbound raw discard was not recorded");
+    }
+    finally
+    {
+        string directory = Path.GetDirectoryName(Path.GetDirectoryName(raw)!)!;
+        if (Directory.Exists(directory)) Directory.Delete(directory, true);
+    }
+}
+
+static void TestCanceledPrelaunchRawDiscard()
+{
+    string caseId = "case-" + Guid.NewGuid().ToString("N");
+    string raw = Path.Combine(Path.GetTempPath(), "MRTW", caseId, "raw_evidence", "cancelled.etl");
+    try
+    {
+        using var canceled = new CancellationTokenSource();
+        using var armed = new TraceEventEtwCollector().Arm(new EtwCollectorOptions(null, null, RawTracePath: raw), canceled.Token);
+        canceled.Cancel();
+        EtwCollectionResult result = armed.Completion.GetAwaiter().GetResult();
+        True(result.RawTracePath is null && !File.Exists(raw), "cancelled unbound ETL was retained");
+        True(result.CaptureLimitReason.Contains("never bound", StringComparison.OrdinalIgnoreCase), "cancelled raw discard was not recorded");
+    }
+    finally
+    {
+        string directory = Path.GetDirectoryName(Path.GetDirectoryName(raw)!)!;
+        if (Directory.Exists(directory)) Directory.Delete(directory, true);
+    }
+}
+
+static void TestPrelaunchArmFailure()
+{
+    string outside = Path.Combine(Path.GetTempPath(), "mrtw-untrusted-" + Guid.NewGuid().ToString("N") + ".etl");
+    using var armed = new TraceEventEtwCollector().Arm(new EtwCollectorOptions(null, null, RawTracePath: outside));
+    try { armed.Ready.Wait(TimeSpan.FromSeconds(2)); } catch { }
+    EtwCollectionResult result = armed.Completion.GetAwaiter().GetResult();
+    True(!result.Started && result.RawTracePath is null, "arm failure returned raw evidence");
+    True(result.ErrorMessage?.Contains("failed", StringComparison.OrdinalIgnoreCase) == true, "arm failure was not surfaced through the result");
 }
 
 static void TestInvalidNetworkMode()
