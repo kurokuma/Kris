@@ -42,6 +42,11 @@ var tests = new List<(string Name, Action Body)>
     ,("pre-launch arm failure completes without raw evidence", TestPrelaunchArmFailure)
     ,("batch summary uses a stable partial-failure exit code", TestBatchSummary)
     ,("batch rejects command overrides before target execution", TestBatchCommandOverride)
+    ,("persistence snapshot diffs and exports are normalized", TestPersistenceSnapshotDiffAndExport)
+    ,("persistence surface timeout cancels an in-flight read", TestPersistenceSurfaceTimeout)
+    ,("persistence surface entry limits retain a bounded result", TestPersistenceSurfaceLimit)
+    ,("persistence timeout quality degrades the case", TestPersistenceTimeoutQuality)
+    ,("WMI binding references normalize before matching", TestWmiBindingNormalization)
 };
 
 int failures = 0;
@@ -660,6 +665,96 @@ static void TestSyntheticPersistenceConfigRoundTrip()
         True(loaded.Events.All(e => e.Source == "Synthetic"), "synthetic state roundtrip changed source");
     }
     finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
+}
+
+static void TestPersistenceSnapshotDiffAndExport()
+{
+    string root = Path.Combine(Path.GetTempPath(), "mrtw-persistence-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        var before = new SnapshotData(DateTimeOffset.UtcNow, [], [], [],
+            [new("StartupFolder", "C:\\Startup\\old.lnk", "old.lnk", "C:\\old.exe", "a"),
+             new("ScheduledTask", "\\Old", "Old", "C:\\old.exe", "a"),
+             new("WindowsService", "OldSvc", "OldSvc", "C:\\old.exe", "a"),
+             new("WmiSubscription", "binding:__eventfilter.name=\"old\"|commandlineeventconsumer.name=\"old\"", "OldFilter -> OldConsumer", "C:\\old.exe", "a"),
+             new("WmiSubscription", "binding:__eventfilter.name=\"changed\"|commandlineeventconsumer.name=\"changed\"", "ChangedFilter -> ChangedConsumer", "C:\\old-wmi.exe", "a")]);
+        var after = new SnapshotData(DateTimeOffset.UtcNow, [], [], [],
+            [new("StartupFolder", "C:\\Startup\\new.lnk", "new.lnk", "C:\\Users\\alice\\new.exe", "b"),
+             new("ScheduledTask", "\\Old", "Old", "C:\\changed.exe", "changed"),
+             new("WindowsService", "OldSvc", "OldSvc", "C:\\old.exe", "changed"),
+             new("WmiSubscription", "binding:__eventfilter.name=\"new\"|commandlineeventconsumer.name=\"new\"", "NewFilter -> NewConsumer", "C:\\Users\\alice\\new-wmi.exe", "b"),
+             new("WmiSubscription", "binding:__eventfilter.name=\"changed\"|commandlineeventconsumer.name=\"changed\"", "ChangedFilter -> ChangedConsumer", "C:\\Users\\alice\\changed-wmi.exe", "changed")],
+            [new CollectorHealth("StartupFolder", "degraded", DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, 513, 1, "read-only; limit=512; reason=entry-limit; retained=512; dropped=1"),
+             new CollectorHealth("ScheduledTask", "access-denied", DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, 0, 0),
+             new CollectorHealth("WindowsService", "available", DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, 1, 0),
+             new CollectorHealth("WmiSubscription", "unavailable", DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, 0, 0)]);
+        var diff = new SnapshotService().Diff(before, after);
+        Equal(2, diff.AddedPersistenceEntries!.Count); Equal(3, diff.ModifiedPersistenceEntries!.Count); Equal(2, diff.DeletedPersistenceEntries!.Count);
+        Equal(1, diff.AddedPersistenceEntries.Count(e => e.Surface == "WmiSubscription"));
+        Equal(1, diff.ModifiedPersistenceEntries.Count(e => e.Surface == "WmiSubscription"));
+        Equal(1, diff.DeletedPersistenceEntries.Count(e => e.Surface == "WmiSubscription"));
+        var events = new[]
+        {
+            new TimelineEvent(1, TimeSpan.Zero, "snapshot", 0, EventCategory.Registry, "Persistence Created", "C:\\Users\\alice\\new.exe", "StartupFolder persistence target: C:\\Users\\alice\\new.exe", EventSeverity.High, "PersistenceSnapshot", "{}"),
+            new TimelineEvent(2, TimeSpan.FromSeconds(1), "snapshot", 0, EventCategory.Task, "Persistence Modified", "\\Old", "ScheduledTask persistence target: C:\\changed.exe", EventSeverity.High, "PersistenceSnapshot", "{}"),
+            new TimelineEvent(3, TimeSpan.FromSeconds(2), "snapshot", 0, EventCategory.Service, "Persistence Modified", "OldSvc", "WindowsService persistence target: C:\\old.exe", EventSeverity.High, "PersistenceSnapshot", "{}"),
+            new TimelineEvent(4, TimeSpan.FromSeconds(3), "snapshot", 0, EventCategory.Registry, "Persistence Modified", "WMI ChangedFilter -> ChangedConsumer", "WmiSubscription persistence target: C:\\Users\\alice\\changed-wmi.exe", EventSeverity.High, "PersistenceSnapshot", "{}")
+        };
+        var correlated = BehaviorCorrelator.Correlate(events);
+        True(correlated.Any(e => e.Action == "Persistence Established"), "persistence behavior was not correlated");
+        var artifacts = correlated.Where(e => e.Category is EventCategory.Registry or EventCategory.Task or EventCategory.Service).GroupBy(e => e.Category).Select(g => new ArtifactItem(g.Key.ToString(), string.Join(',', g.Select(e => e.ObjectValue)), DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, g.Count(), "snapshot", EventSeverity.High)).ToArray();
+        var data = new CaseData("p", "p", "sample", "C:\\Users\\alice\\sample.exe", "hash", DateTimeOffset.UtcNow, TimeSpan.Zero, null, [], correlated, artifacts, [], "", new CaseQuality("degraded", after.PersistenceQuality!, "not-applied", true));
+        new CaseExportService().WriteCaseBundle(data, root, new ExportOptions("json,sqlite,html", PrivacyMode: true, Compress: false));
+        foreach (string file in new[] { "case.json", "case.sqlite", "report.html" }) True(File.Exists(Path.Combine(root, file)), "missing persistence export " + file);
+        string json = File.ReadAllText(Path.Combine(root, "case.json"));
+        True(json.Contains("Persistence Established"), "JSON omitted persistence behavior");
+        True(json.Contains("entry-limit"), "JSON omitted persistence limit quality");
+        True(!json.Contains("alice", StringComparison.OrdinalIgnoreCase), "privacy export leaked persistence target user");
+        True(File.ReadAllText(Path.Combine(root, "report.html")).Contains("access-denied"), "HTML omitted persistence quality");
+        using var connection = new SqliteConnection($"Data Source={Path.Combine(root, "case.sqlite")};Pooling=False"); connection.Open();
+        using var command = connection.CreateCommand(); command.CommandText = "SELECT COUNT(*) FROM events WHERE action='Persistence Modified'";
+        True(Convert.ToInt32(command.ExecuteScalar()) >= 1, "SQLite omitted persistence events");
+        command.CommandText = "SELECT json FROM case_quality";
+        True((Convert.ToString(command.ExecuteScalar()) ?? "").Contains("entry-limit"), "SQLite omitted persistence limit quality");
+    }
+    finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
+}
+
+static void TestPersistenceSurfaceTimeout()
+{
+    int canceled = 0;
+    var result = SnapshotService.CapturePersistenceSurfaceForTest("FakeWmi", token =>
+    {
+        token.WaitHandle.WaitOne();
+        Interlocked.Exchange(ref canceled, 1);
+        token.ThrowIfCancellationRequested();
+        return [];
+    }, TimeSpan.FromMilliseconds(25));
+    Equal("timeout", result.Health.Status);
+    True(SpinWait.SpinUntil(() => Volatile.Read(ref canceled) == 1, TimeSpan.FromSeconds(1)), "timed-out persistence read continued after cancellation");
+}
+
+static void TestPersistenceSurfaceLimit()
+{
+    var fixture = Enumerable.Range(0, 513).Select(i => new PersistenceSnapshotEntry("Fixture", i.ToString(), i.ToString(), "target", i.ToString())).ToArray();
+    foreach (string surface in new[] { "StartupFolder", "ScheduledTask", "WindowsService", "WmiSubscription" })
+    {
+        var result = SnapshotService.CapturePersistenceSurfaceForTest(surface, _ => fixture, TimeSpan.FromSeconds(1));
+        Equal(512, result.Entries.Count); Equal("degraded", result.Health.Status); Equal(1L, result.Health.EventsDropped);
+        True(result.Health.Message.Contains("reason=entry-limit"), surface + " omitted entry-limit reason");
+    }
+}
+
+static void TestPersistenceTimeoutQuality()
+{
+    True(RuntimeCaseCollector.IsDegradedCollectorStatus("timeout"), "timeout must degrade collection quality");
+    True(!RuntimeCaseCollector.IsDegradedCollectorStatus("available"), "available must not degrade collection quality");
+}
+
+static void TestWmiBindingNormalization()
+{
+    Equal("__eventfilter.name=\"mrtw\"", SnapshotService.NormalizeWmiReference("\\\\.\\root\\subscription:__EventFilter.Name=\"MRTW\""));
+    Equal("commandlineeventconsumer.name=\"mrtw\"", SnapshotService.NormalizeWmiReference("CommandLineEventConsumer.Name=\"MRTW\""));
 }
 
 static void AssertNoSecrets(IEnumerable<string> paths, params string[] secrets)

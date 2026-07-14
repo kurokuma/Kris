@@ -5,7 +5,7 @@
 - 最終更新日: 2026-07-14
 - 調査対象: `README.md`、`docs/`、`src/MRTW.Core/`、`src/MRTW.Collectors.Etw/`、`src/MRTW.Cli/`、`src/MRTW.App/`、`src/MRTW.Native/`、`test/`
 - 主要な懸念: 高頻度イベント時の収集メモリ上限、短命プロセスのETW開始タイミング、Windows永続化面の観測不足、スクリプト／非PE形式の分析不足、Windows実環境での統合試験不足、Privacy Modeとバッチ実行の検証不足
-- 次に着手すべきタスク: TASK-010
+- 次に着手すべきタスク: TASK-011
 
 このバックログは、現在の実装・文書・テストから確認できた未対応事項だけを記録する。完了済みのP0/P1 GUI停止・ライブ表示・SQLite入力上限の修正は、重複して登録しない。
 
@@ -116,19 +116,19 @@
 
 ### TASK-010: Windows永続化面（Startup・Task・Service・WMI）を状態差分として収集する
 
-- 状態: 未着手
+- 状態: 完了
 - 規模: L
 - 概要: 現在のランタイム収集はHKCU Run/RunOnceを中心としたレジストリ差分であり、Startup Folder、Task Scheduler、Windows Service、WMI permanent event subscriptionの新規・変更・削除をケースの状態差分として確認できない。これらは実際のマルウェアで用いられる代表的な永続化経路である。
 - 根拠: `docs/architecture.md`はruntime collectionのレジストリ取得をHKCU Run/RunOnceと説明し、`src/MRTW.Core/SnapshotService.cs`もその範囲を取得する。MITRE ATT&CKは、[Boot or Logon Autostart Execution (T1547)](https://attack.mitre.org/techniques/T1547/)にRegistry Run Keys / Startup Folder・Active Setup等を、[Scheduled Task (T1053.005)](https://attack.mitre.org/techniques/T1053/005/)にスケジュールタスクを、[Windows Service (T1543.003)](https://attack.mitre.org/techniques/T1543/003/)にサービス永続化を定義している。
 - 対象: `src/MRTW.Core/SnapshotService.cs`、`src/MRTW.Core/RuntimeCaseCollector.cs`、`src/MRTW.Core/BehaviorCorrelator.cs`、`src/MRTW.Core/Models.cs`、`src/MRTW.Core/CaseExportService.cs`、`test/SafeRuntimeProbe/`、`test/MRTW.RegressionTests/Program.cs`
-- 実装内容: 各永続化面をbefore/afterで正規化して取得し、作成・変更・削除と実行先（コマンド、DLL、service binary、WMI consumer）をタイムラインとArtifactsへ出力する。アクセス拒否・未対応OS・収集上限はCollection Qualityへ残す。管理者権限が必要な面は読み取り不可を明示し、推測結果を生成しない。
+- 実装内容: 各永続化面をbefore/afterで正規化して取得し、作成・変更・削除と実行先（コマンド、DLL、service binary、WMI consumer）をタイムラインとArtifactsへ出力する。WMIは`__FilterToConsumerBinding`を根拠にFilter／Consumerを正規化して対応付け、孤立した片側を永続化成立として出力しない。アクセス拒否・未対応OS・収集上限はCollection Qualityへ残す。管理者権限が必要な面は読み取り不可を明示し、推測結果を生成しない。
 - 完了条件:
-  - [ ] Startup Folder、Task Scheduler、Windows Service、WMI permanent subscriptionの差分を個別に識別できる
-  - [ ] 各差分に根拠となる元データと取得時刻が保存される
-  - [ ] 読み取り権限不足時に「存在しない」と誤表示せず、品質情報へ理由を記録する
-  - [ ] 安全なテストフィクスチャで作成・変更・削除の回帰テストが成功する
+  - [x] Startup Folder、Task Scheduler、Windows Service、WMI permanent subscriptionの差分を個別に識別できる
+  - [x] 各差分に根拠となる正規化データと取得時刻がTimeline／ケース出力に保存される
+  - [x] 読み取り権限不足時に「存在しない」と誤表示せず、面別品質情報へ理由を記録する。512件上限では破棄数と`entry-limit`理由を記録する
+  - [x] 安全なテストフィクスチャで作成・変更・削除、Privacy Modeを含む回帰テストが成功する
 - 依存関係: なし（隔離VM統合試験は利用者要求によりバックログ対象外）
-- リスク・注意点: ServiceやWMIの列挙は権限・環境差が大きい。収集器が永続化を作成・変更してはならず、読み取り専用に限定すること。
+- リスク・注意点: ServiceやWMIの列挙は権限・環境差が大きい。収集器はCOM／レジストリ読み取りだけに限定し、Task XMLやWMIスクリプト本文を保存・実行しない。
 
 ## P2
 

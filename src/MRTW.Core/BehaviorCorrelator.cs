@@ -146,11 +146,12 @@ public static class BehaviorCorrelator
     {
         var persistenceEvents = events.Where(e =>
             e.Action is "CreateServiceW" or "ChangeServiceConfigW" ||
+            e.Action is "Persistence Created" or "Persistence Modified" ||
             (e.Action is "RegSetValueExW" or "RegSetKeyValueW" or "RegCreateKeyExW" &&
             ContainsAny(e.RawJson + " " + e.ObjectValue + " " + e.Summary, "Run", "RunOnce", "Services", "Winlogon", "AppInit_DLLs", "Image File Execution Options", "Active Setup"))).ToArray();
         if (persistenceEvents.Length > 0)
         {
-            AddBehavior(output, persistenceEvents, ref nextId, "Persistence Established", "A registry or service change associated with autostart persistence was observed.", EventSeverity.High, "T1547", "Boot or Logon Autostart Execution", "Medium");
+            AddBehavior(output, persistenceEvents, ref nextId, "Persistence Established", "A read-only snapshot diff or runtime event identified an autostart persistence change.", EventSeverity.High, "T1547", "Boot or Logon Autostart Execution", "Medium");
         }
     }
 

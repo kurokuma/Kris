@@ -26,6 +26,7 @@ public sealed class SnapshotService
             files.AddRange(CaptureFiles(root, state));
         }
 
+        var persistence = CapturePersistence(cancellationToken);
         var data = new SnapshotData(
             DateTimeOffset.UtcNow,
             files
@@ -34,7 +35,9 @@ public sealed class SnapshotService
                 .OrderBy(f => f.Path, StringComparer.OrdinalIgnoreCase)
                 .ToArray(),
             CaptureRegistry(state),
-            CaptureTcpConnections());
+            CaptureTcpConnections(),
+            persistence.Entries,
+            persistence.Quality);
         bool canceled = cancellationToken.IsCancellationRequested;
         bool bounded = !canceled && (state.ItemLimitReached || stopwatch.Elapsed >= state.TimeLimit);
         string note = canceled ? "Snapshot canceled by user." : bounded ? $"Snapshot bounded after {state.VisitedFiles} files or {state.TimeLimit.TotalSeconds:0}s." : "Snapshot completed.";
@@ -61,7 +64,14 @@ public sealed class SnapshotService
         var beforeTcp = before.TcpConnections.ToHashSet(StringComparer.OrdinalIgnoreCase);
         var newTcp = after.TcpConnections.Where(c => !beforeTcp.Contains(c)).ToArray();
 
-        return new SnapshotDiff(addedFiles, modifiedFiles, deletedFiles, addedReg, modifiedReg, deletedReg, newTcp);
+        var beforePersistence = PersistenceEntriesOrEmpty(before).ToDictionary(PersistenceId, StringComparer.OrdinalIgnoreCase);
+        var afterPersistence = PersistenceEntriesOrEmpty(after).ToDictionary(PersistenceId, StringComparer.OrdinalIgnoreCase);
+        var addedPersistence = PersistenceEntriesOrEmpty(after).Where(v => !beforePersistence.ContainsKey(PersistenceId(v))).ToArray();
+        var modifiedPersistence = PersistenceEntriesOrEmpty(after).Where(v => beforePersistence.TryGetValue(PersistenceId(v), out var old) && !string.Equals(old.Fingerprint, v.Fingerprint, StringComparison.Ordinal)).ToArray();
+        var deletedPersistence = PersistenceEntriesOrEmpty(before).Where(v => !afterPersistence.ContainsKey(PersistenceId(v))).ToArray();
+
+        return new SnapshotDiff(addedFiles, modifiedFiles, deletedFiles, addedReg, modifiedReg, deletedReg, newTcp,
+            addedPersistence, modifiedPersistence, deletedPersistence);
     }
 
     public IReadOnlyList<PreservedFile> PreserveChangedFiles(SnapshotDiff diff, string caseId, string generation = "after", CancellationToken cancellationToken = default)
@@ -301,6 +311,220 @@ public sealed class SnapshotService
     }
 
     private static string RegistryKeyId(RegistrySnapshotEntry value) => $"{value.KeyPath}\\{value.Name}";
+    private static string PersistenceId(PersistenceSnapshotEntry value) => $"{value.Surface}|{value.Identity}";
+    private static IReadOnlyList<PersistenceSnapshotEntry> PersistenceEntriesOrEmpty(SnapshotData data) => data.PersistenceEntries ?? [];
+
+    private static (IReadOnlyList<PersistenceSnapshotEntry> Entries, IReadOnlyList<CollectorHealth> Quality) CapturePersistence(CancellationToken cancellationToken)
+    {
+        DateTimeOffset started = DateTimeOffset.UtcNow;
+        if (!OperatingSystem.IsWindows())
+        {
+            return ([], [new CollectorHealth("Persistence", "unavailable", started, DateTimeOffset.UtcNow, 0, 0, "Windows-only read-only persistence capture is unavailable on this OS.")]);
+        }
+
+        return CaptureWindowsPersistence(cancellationToken, started);
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static (IReadOnlyList<PersistenceSnapshotEntry> Entries, IReadOnlyList<CollectorHealth> Quality) CaptureWindowsPersistence(CancellationToken cancellationToken, DateTimeOffset started)
+    {
+        const int surfaceLimit = 512;
+        var entries = new List<PersistenceSnapshotEntry>();
+        var health = new List<CollectorHealth>();
+        CapturePersistenceSurface("StartupFolder", token => CaptureStartupFolders(surfaceLimit, token), entries, health, cancellationToken, surfaceLimit, TimeSpan.FromSeconds(2));
+        CapturePersistenceSurface("ScheduledTask", token => CaptureScheduledTasks(surfaceLimit, token), entries, health, cancellationToken, surfaceLimit, TimeSpan.FromSeconds(2));
+        CapturePersistenceSurface("WindowsService", token => CaptureServices(surfaceLimit, token), entries, health, cancellationToken, surfaceLimit, TimeSpan.FromSeconds(2));
+        CapturePersistenceSurface("WmiSubscription", token => CaptureWmiSubscriptions(surfaceLimit, token), entries, health, cancellationToken, surfaceLimit, TimeSpan.FromSeconds(2));
+        return (entries.OrderBy(PersistenceId, StringComparer.OrdinalIgnoreCase).ToArray(), health);
+    }
+
+    private static void CapturePersistenceSurface(string name, Func<CancellationToken, IReadOnlyList<PersistenceSnapshotEntry>> capture, List<PersistenceSnapshotEntry> entries, List<CollectorHealth> health, CancellationToken cancellationToken, int limit, TimeSpan timeout)
+    {
+        DateTimeOffset started = DateTimeOffset.UtcNow;
+        if (cancellationToken.IsCancellationRequested) { health.Add(new CollectorHealth(name, "canceled", started, DateTimeOffset.UtcNow, 0, 0, "Snapshot canceled.")); return; }
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        try
+        {
+            // Capture implementations only query Windows APIs; no process, shell, or command interpreter is invoked.
+            var task = Task.Run(() => capture(linked.Token), CancellationToken.None);
+            if (!task.Wait(timeout))
+            {
+                linked.Cancel();
+                try { task.Wait(TimeSpan.FromMilliseconds(250)); } catch (AggregateException) { /* Cancellation is expected; discard all results. */ }
+                health.Add(new CollectorHealth(name, "timeout", started, DateTimeOffset.UtcNow, 0, 0, $"Read-only surface query exceeded {timeout.TotalSeconds:0.#} seconds; no partial result was retained."));
+                return;
+            }
+            if (cancellationToken.IsCancellationRequested) { linked.Cancel(); health.Add(new CollectorHealth(name, "canceled", started, DateTimeOffset.UtcNow, 0, 0, "Snapshot canceled; no partial result was retained.")); return; }
+            var allCaptured = task.GetAwaiter().GetResult();
+            var captured = allCaptured.Take(limit).ToArray();
+            long dropped = Math.Max(0, allCaptured.Count - captured.Length);
+            entries.AddRange(captured);
+            string status = dropped > 0 ? "degraded" : "available";
+            string message = dropped > 0 ? $"read-only; limit={limit}; reason=entry-limit; retained={captured.Length}; dropped={dropped}" : $"read-only; limit={limit}";
+            health.Add(new CollectorHealth(name, status, started, DateTimeOffset.UtcNow, captured.Length + dropped, dropped, message));
+        }
+        catch (UnauthorizedAccessException ex) { health.Add(new CollectorHealth(name, "access-denied", started, DateTimeOffset.UtcNow, 0, 0, ex.GetType().Name)); }
+        catch (System.Security.SecurityException ex) { health.Add(new CollectorHealth(name, "access-denied", started, DateTimeOffset.UtcNow, 0, 0, ex.GetType().Name)); }
+        catch (OperationCanceledException) when (linked.IsCancellationRequested) { health.Add(new CollectorHealth(name, "canceled", started, DateTimeOffset.UtcNow, 0, 0, "Snapshot canceled; no partial result was retained.")); }
+        catch (Exception ex) { health.Add(new CollectorHealth(name, "unavailable", started, DateTimeOffset.UtcNow, 0, 0, ex.GetType().Name)); }
+    }
+
+    internal static (IReadOnlyList<PersistenceSnapshotEntry> Entries, CollectorHealth Health) CapturePersistenceSurfaceForTest(string name, Func<CancellationToken, IReadOnlyList<PersistenceSnapshotEntry>> capture, TimeSpan timeout)
+    {
+        var entries = new List<PersistenceSnapshotEntry>(); var quality = new List<CollectorHealth>();
+        CapturePersistenceSurface(name, capture, entries, quality, CancellationToken.None, 512, timeout);
+        return (entries, quality.Single());
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static IReadOnlyList<PersistenceSnapshotEntry> CaptureStartupFolders(int limit, CancellationToken cancellationToken)
+    {
+        var output = new List<PersistenceSnapshotEntry>();
+        string[] roots = [Environment.GetFolderPath(Environment.SpecialFolder.Startup), Environment.GetFolderPath(Environment.SpecialFolder.CommonStartup)];
+        foreach (string root in roots.Where(Directory.Exists).Distinct(StringComparer.OrdinalIgnoreCase))
+            foreach (string path in Directory.EnumerateFiles(root).Take(limit + 1 - output.Count))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var info = new FileInfo(path);
+                output.Add(Persistence("StartupFolder", path, info.Name, path, $"{info.Length}|{info.LastWriteTimeUtc.Ticks}"));
+                if (output.Count >= limit + 1) return output;
+            }
+        return output;
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static IReadOnlyList<PersistenceSnapshotEntry> CaptureServices(int limit, CancellationToken cancellationToken)
+    {
+        var output = new List<PersistenceSnapshotEntry>();
+        using var root = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services", false);
+        if (root is null) return output;
+        foreach (string name in root.GetSubKeyNames().OrderBy(x => x, StringComparer.OrdinalIgnoreCase).Take(limit + 1))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            using var key = root.OpenSubKey(name, false); if (key is null) continue;
+            string image = Convert.ToString(key.GetValue("ImagePath", null, RegistryValueOptions.DoNotExpandEnvironmentNames)) ?? "";
+            string start = Convert.ToString(key.GetValue("Start")) ?? "";
+            output.Add(Persistence("WindowsService", name, name, image, $"{image}|start={start}"));
+        }
+        return output;
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static IReadOnlyList<PersistenceSnapshotEntry> CaptureScheduledTasks(int limit, CancellationToken cancellationToken)
+    {
+        Type? type = Type.GetTypeFromProgID("Schedule.Service");
+        if (type is null) throw new PlatformNotSupportedException("Task Scheduler COM is unavailable.");
+        dynamic service = Activator.CreateInstance(type) ?? throw new InvalidOperationException("Task Scheduler COM activation failed.");
+        try
+        {
+            service.Connect(); dynamic folder = service.GetFolder("\\");
+            var output = new List<PersistenceSnapshotEntry>();
+            var folders = new Stack<dynamic>(); folders.Push(folder);
+            while (folders.Count > 0 && output.Count < limit + 1)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                dynamic current = folders.Pop();
+                var children = new List<dynamic>();
+                try { foreach (dynamic task in current.GetTasks(1))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    string path = Convert.ToString(task.Path) ?? ""; string name = Convert.ToString(task.Name) ?? path;
+                    // Do not request task XML. Action metadata is a read-only summary only.
+                    string target = ""; dynamic? actions = null; dynamic? action = null;
+                    try { actions = task.Definition.Actions; if (actions.Count > 0) { action = actions.Item(1); target = Convert.ToString(action.Path) ?? ""; } } catch { }
+                    finally { ReleaseComObject(action); ReleaseComObject(actions); }
+                    output.Add(Persistence("ScheduledTask", path, name, target, $"{target}|enabled={task.Enabled}"));
+                    ReleaseComObject(task);
+                    if (output.Count >= limit + 1) break;
+                }
+                if (output.Count < limit + 1) foreach (dynamic child in current.GetFolders(0)) children.Add(child);
+                } finally { ReleaseComObject(current); }
+                if (output.Count >= limit + 1) break;
+                foreach (dynamic child in children) folders.Push(child);
+            }
+            return output;
+        }
+        finally { try { Marshal.FinalReleaseComObject(service); } catch { } }
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static IReadOnlyList<PersistenceSnapshotEntry> CaptureWmiSubscriptions(int limit, CancellationToken cancellationToken)
+    {
+        Type? type = Type.GetTypeFromProgID("WbemScripting.SWbemLocator");
+        if (type is null) throw new PlatformNotSupportedException("WMI COM is unavailable.");
+        dynamic locator = Activator.CreateInstance(type) ?? throw new InvalidOperationException("WMI COM activation failed.");
+        try
+        {
+            dynamic service = locator.ConnectServer(".", "root\\subscription");
+            try
+            {
+                var filters = new Dictionary<string, (string Name, string Fingerprint)>(StringComparer.OrdinalIgnoreCase);
+                foreach (dynamic filter in service.ExecQuery("SELECT __RELPATH, Name, Query, EventNamespace FROM __EventFilter"))
+                {
+                    try
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        string reference = NormalizeWmiReference(Convert.ToString(filter.__RELPATH) ?? "");
+                        string name = Convert.ToString(filter.Name) ?? ""; string query = Convert.ToString(filter.Query) ?? "";
+                        filters[reference] = (name, Hash($"{Hash(query)}|namespace={filter.EventNamespace}"));
+                    }
+                    finally { ReleaseComObject(filter); }
+                }
+                var consumers = new Dictionary<string, (string Name, string Target, string Fingerprint)>(StringComparer.OrdinalIgnoreCase);
+                foreach (dynamic consumer in service.ExecQuery("SELECT __RELPATH, Name FROM __EventConsumer"))
+                {
+                    try { cancellationToken.ThrowIfCancellationRequested(); consumers[NormalizeWmiReference(Convert.ToString(consumer.__RELPATH) ?? "")] = (Convert.ToString(consumer.Name) ?? "", "WMI event consumer", ""); }
+                    finally { ReleaseComObject(consumer); }
+                }
+                foreach (dynamic consumer in service.ExecQuery("SELECT __RELPATH, Name, CommandLineTemplate FROM CommandLineEventConsumer"))
+                {
+                    try { cancellationToken.ThrowIfCancellationRequested(); string command = Convert.ToString(consumer.CommandLineTemplate) ?? ""; consumers[NormalizeWmiReference(Convert.ToString(consumer.__RELPATH) ?? "")] = (Convert.ToString(consumer.Name) ?? "", command, Hash(command)); }
+                    finally { ReleaseComObject(consumer); }
+                }
+                foreach (dynamic consumer in service.ExecQuery("SELECT __RELPATH, Name, ScriptingEngine, ScriptText FROM ActiveScriptEventConsumer"))
+                {
+                    try { cancellationToken.ThrowIfCancellationRequested(); string engine = Convert.ToString(consumer.ScriptingEngine) ?? ""; string script = Convert.ToString(consumer.ScriptText) ?? ""; consumers[NormalizeWmiReference(Convert.ToString(consumer.__RELPATH) ?? "")] = (Convert.ToString(consumer.Name) ?? "", $"ActiveScriptEventConsumer ({engine}); script_sha256={Hash(script)}", Hash(script)); }
+                    finally { ReleaseComObject(consumer); }
+                }
+
+                var output = new List<PersistenceSnapshotEntry>();
+                foreach (dynamic binding in service.ExecQuery("SELECT Filter, Consumer FROM __FilterToConsumerBinding"))
+                {
+                    try
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        string filterRef = NormalizeWmiReference(Convert.ToString(binding.Filter) ?? "");
+                        string consumerRef = NormalizeWmiReference(Convert.ToString(binding.Consumer) ?? "");
+                        if (!filters.TryGetValue(filterRef, out var filter) || !consumers.TryGetValue(consumerRef, out var consumer)) continue;
+                        string identity = $"binding:{filterRef}|{consumerRef}";
+                        string display = $"{filter.Name} -> {consumer.Name}";
+                        output.Add(Persistence("WmiSubscription", identity, display, consumer.Target, $"filter={filter.Fingerprint}|consumer={consumer.Fingerprint}|{identity}"));
+                        if (output.Count >= limit + 1) break;
+                    }
+                    finally { ReleaseComObject(binding); }
+                }
+                return output;
+            }
+            finally { ReleaseComObject(service); }
+        }
+        finally { ReleaseComObject(locator); }
+    }
+
+    internal static string NormalizeWmiReference(string value)
+    {
+        string normalized = value.Trim().Replace('/', '\\');
+        int colon = normalized.IndexOf(':'); if (colon >= 0) normalized = normalized[(colon + 1)..];
+        return normalized.Trim().ToLowerInvariant();
+    }
+    private static void ReleaseComObject(object? value)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        if (value is not null && Marshal.IsComObject(value)) try { Marshal.FinalReleaseComObject(value); } catch { }
+    }
+
+    private static PersistenceSnapshotEntry Persistence(string surface, string identity, string display, string target, string fingerprint) =>
+        new(surface, identity, display, target, Hash(fingerprint));
+    private static string Hash(string value) => Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(value ?? ""))).ToLowerInvariant();
 
     private sealed class CaptureState(CancellationToken cancellationToken, int fileLimit, TimeSpan timeLimit, System.Diagnostics.Stopwatch stopwatch)
     {

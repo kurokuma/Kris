@@ -287,6 +287,12 @@ dotnet run --project test\MRTW.ProbeTests -c Release
 
 回帰テストには、永続化バッファの先着順、上限超過時の受信数・破棄数・理由、およびCollection QualityのJSON／SQLite／HTML出力を検証するケースを含みます。
 
+### 永続化状態差分
+
+実行前後のスナップショットでは、Startup Folder、Task Scheduler、Windows Service、WMI permanent subscriptionを読み取り専用で正規化し、作成・変更・削除をTimeline、Artifacts、Behavior相関へ出力します。WMIは`__FilterToConsumerBinding`でFilterとConsumerの参照を正規化して対応付け、bindingがある組だけを永続化として出力します。孤立したFilter／Consumerは永続化成立として扱いません。Task SchedulerはCOM API、ServiceはSCM登録情報、WMIはCOM APIだけを照会し、`schtasks`、`sc`、`wmic`、PowerShellやシェルは起動しません。Task XMLとWMIスクリプト本文は保存・実行せず、WMI Active Scriptはハッシュだけを記録します。
+
+各面は512件・2秒で打ち切ります。513件目を検出した場合は先着512件だけを保持し、`degraded`、破棄数、`reason=entry-limit`をCollection Qualityへ記録します。`available`、`access-denied`、`unavailable`、`timeout`も面ごとに区別します。非Windowsでは収集を行わず`unavailable`として記録します。Privacy ModeではTimeline、Artifacts、JSON、SQLite、HTMLに含まれる対象パス・コマンドを通常のマスキング規則で出力します。
+
 隔離VMでのみ実行するETW/containment統合試験は `test\Run-IsolatedVmIntegration.ps1`、対話デスクトップでのみ実行するGUI smoke testは `test\Run-GuiSmoke.ps1` を使います。どちらも環境変数による明示的なopt-inが必要で、通常のビルドやテストでは実行されません。対話デスクトップでGUI smoke testを実行し、静的ターゲット選択、Start/Stop、タイムライン、Collection Quality、合成ケース読込、Privacy Modeエクスポートが成功することを確認済みです。詳細は [`test/README.md`](test/README.md) を参照してください。
 
 詳細は [`test/README.md`](test/README.md) を参照してください。

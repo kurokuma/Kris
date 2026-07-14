@@ -23,6 +23,8 @@ This folder contains benign validation helpers for MRTW.
 - `Run-CliBatchIntegration.ps1`: runs the built CLI against a benign DLL and a deliberately unreadable EXE with execution disabled. It verifies per-target failure isolation, exit code 10, per-target JSON events plus final summary equivalence, Privacy Mode masking, and rejection of `batch --cmd` before a command or target can run.
 
 Use `SafeRuntimeProbe` as a real target for hook/ETW smoke tests. Use `SyntheticBehaviorCase` for UI, filtering, and behavior-correlation validation.
+
+`MRTW.RegressionTests`には、4つの永続化面（Startup Folder、Scheduled Task、Windows Service、WMI subscription）の安全な合成before/afterデータを用いる差分回帰を含みます。実OSの永続化設定は作成・変更・削除しません。create/modify/delete、面別quality、Artifacts/Behavior相関、Privacy ModeのJSON/SQLite/HTML出力を検証します。
 Use `StaticAnalysisProbe` as a stable target for `mrtw static` and string/classification checks. For this .NET sample, point static analysis at `bin\Release\net9.0\StaticAnalysisProbe.dll`; the generated `.exe` is the .NET apphost and mostly contains host/runtime strings.
 
 Run the regression suite with:

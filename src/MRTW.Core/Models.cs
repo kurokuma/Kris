@@ -215,11 +215,21 @@ public sealed record FileSnapshotEntry(string Path, long Size, DateTimeOffset La
 
 public sealed record RegistrySnapshotEntry(string KeyPath, string Name, string Value);
 
+/// <summary>Read-only, normalized representation of an autostart mechanism.</summary>
+public sealed record PersistenceSnapshotEntry(
+    string Surface,
+    string Identity,
+    string DisplayName,
+    string ExecutionTarget,
+    string Fingerprint);
+
 public sealed record SnapshotData(
     DateTimeOffset CapturedAt,
     IReadOnlyList<FileSnapshotEntry> Files,
     IReadOnlyList<RegistrySnapshotEntry> RegistryValues,
-    IReadOnlyList<string> TcpConnections);
+    IReadOnlyList<string> TcpConnections,
+    IReadOnlyList<PersistenceSnapshotEntry>? PersistenceEntries = null,
+    IReadOnlyList<CollectorHealth>? PersistenceQuality = null);
 
 /// <summary>Bounded snapshot result used by interactive collection.</summary>
 public sealed record SnapshotCaptureResult(SnapshotData Data, bool Completed, bool Canceled, bool Bounded, string Note);
@@ -231,7 +241,10 @@ public sealed record SnapshotDiff(
     IReadOnlyList<RegistrySnapshotEntry> AddedRegistryValues,
     IReadOnlyList<RegistrySnapshotEntry> ModifiedRegistryValues,
     IReadOnlyList<string> DeletedRegistryValues,
-    IReadOnlyList<string> NewTcpConnections);
+    IReadOnlyList<string> NewTcpConnections,
+    IReadOnlyList<PersistenceSnapshotEntry>? AddedPersistenceEntries = null,
+    IReadOnlyList<PersistenceSnapshotEntry>? ModifiedPersistenceEntries = null,
+    IReadOnlyList<PersistenceSnapshotEntry>? DeletedPersistenceEntries = null);
 
 public sealed record ExecutionProfile(
     string TargetPath,

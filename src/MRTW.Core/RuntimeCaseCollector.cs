@@ -416,6 +416,7 @@ public sealed class RuntimeCaseCollector
             Add(Event(nextId++, DateTimeOffset.UtcNow - started, "snapshot", 0, EventCategory.Api, afterCapture.Canceled ? "Post Snapshot Skipped" : "Snapshot Bounded", "after", afterCapture.Note, EventSeverity.Low, "Snapshot"));
         }
         AddSnapshotEvents(Add, diff, started, ref nextId);
+        AddPersistenceEvents(Add, diff, started, ref nextId);
         AddNetworkEvents(Add, item => networks.TryAdd(item), diff, seenTcpConnections, started, ref nextId);
         if (callbackFailures > 0)
         {
@@ -452,7 +453,7 @@ public sealed class RuntimeCaseCollector
             artifacts,
             networks.ToArray(),
             notes,
-            Quality: RuntimeQuality(events, networks, started),
+            Quality: RuntimeQuality(events, networks, started, before.PersistenceQuality, after.PersistenceQuality),
             PreservedFiles: preservedFiles) { TrustedEvidenceRoot = EvidencePathPolicy.Root(caseId) };
     }
 
@@ -1079,6 +1080,25 @@ public sealed class RuntimeCaseCollector
         }
     }
 
+    private static void AddPersistenceEvents(Action<TimelineEvent> add, SnapshotDiff diff, DateTimeOffset started, ref int nextId)
+    {
+        foreach (var item in diff.AddedPersistenceEntries ?? [])
+            add(Event(nextId++, DateTimeOffset.UtcNow - started, "snapshot", 0, PersistenceCategory(item.Surface), "Persistence Created", item.Identity, PersistenceSummary(item), EventSeverity.High, "PersistenceSnapshot"));
+        foreach (var item in diff.ModifiedPersistenceEntries ?? [])
+            add(Event(nextId++, DateTimeOffset.UtcNow - started, "snapshot", 0, PersistenceCategory(item.Surface), "Persistence Modified", item.Identity, PersistenceSummary(item), EventSeverity.High, "PersistenceSnapshot"));
+        foreach (var item in diff.DeletedPersistenceEntries ?? [])
+            add(Event(nextId++, DateTimeOffset.UtcNow - started, "snapshot", 0, PersistenceCategory(item.Surface), "Persistence Deleted", item.Identity, $"{item.Surface} persistence entry removed.", EventSeverity.Medium, "PersistenceSnapshot"));
+    }
+
+    private static EventCategory PersistenceCategory(string surface) => surface switch
+    {
+        "ScheduledTask" => EventCategory.Task,
+        "WindowsService" => EventCategory.Service,
+        _ => EventCategory.Registry
+    };
+    private static string PersistenceSummary(PersistenceSnapshotEntry item) =>
+        string.IsNullOrWhiteSpace(item.ExecutionTarget) ? $"{item.Surface} persistence entry observed." : $"{item.Surface} persistence target: {item.ExecutionTarget}";
+
     private static (string RemoteHost, int RemotePort) ParseConnection(string connection)
     {
         int arrow = connection.IndexOf("->", StringComparison.Ordinal);
@@ -1097,22 +1117,30 @@ public sealed class RuntimeCaseCollector
         return (endpoint, 0);
     }
 
-    private static CaseQuality RuntimeQuality(BoundedCaptureBuffer<TimelineEvent> events, BoundedCaptureBuffer<NetworkSession> networks, DateTimeOffset started)
+    private static CaseQuality RuntimeQuality(BoundedCaptureBuffer<TimelineEvent> events, BoundedCaptureBuffer<NetworkSession> networks, DateTimeOffset started, params IReadOnlyList<CollectorHealth>?[] persistenceQuality)
     {
         DateTimeOffset ended = DateTimeOffset.UtcNow;
         bool bounded = events.Dropped > 0 || networks.Dropped > 0;
         string message = $"event_limit={events.Capacity};event_received={events.Received};event_dropped={events.Dropped};network_limit={networks.Capacity};network_received={networks.Received};network_dropped={networks.Dropped}";
         if (bounded) message += "; persisted runtime capture reached its first-in limit; later items were discarded while monitoring continued.";
-        return new CaseQuality(bounded ? "degraded" : "healthy",
-            [new CollectorHealth("Runtime", bounded ? "degraded" : "healthy", started, ended, events.Received, events.Dropped, message),
-             new CollectorHealth("RuntimeNetwork", bounded ? "degraded" : "healthy", started, ended, networks.Received, networks.Dropped, message)],
+        var collectors = new List<CollectorHealth>
+        {
+            new("Runtime", bounded ? "degraded" : "healthy", started, ended, events.Received, events.Dropped, message),
+            new("RuntimeNetwork", bounded ? "degraded" : "healthy", started, ended, networks.Received, networks.Dropped, message)
+        };
+        foreach (var quality in persistenceQuality.Where(q => q is not null).SelectMany(q => q!))
+            collectors.Add(quality);
+        return new CaseQuality(collectors.Any(c => IsDegradedCollectorStatus(c.Status)) || bounded ? "degraded" : "healthy",
+            collectors,
             "not-applied", true);
     }
+
+    internal static bool IsDegradedCollectorStatus(string status) => status is "access-denied" or "unavailable" or "timeout" or "degraded";
 
     private static IReadOnlyList<ArtifactItem> BuildArtifacts(IReadOnlyList<TimelineEvent> events, IReadOnlyList<ProcessNode> processes, DateTimeOffset started)
     {
         return events
-            .Where(e => e.Category is EventCategory.File or EventCategory.Registry or EventCategory.Network or EventCategory.Dns or EventCategory.Api)
+            .Where(e => e.Category is EventCategory.File or EventCategory.Registry or EventCategory.Network or EventCategory.Dns or EventCategory.Api or EventCategory.Task or EventCategory.Service)
             .GroupBy(e => e.Category)
             .Select(g => new ArtifactItem(
                 g.Key.ToString(),
