@@ -96,16 +96,22 @@ internal static class CliApp
         string output = Get(options, "out") ?? config.Exports;
         string formats = Get(options, "format") ?? "html,json";
         string? caseName = Get(options, "case-name");
+        bool privacyMode = GetOnOff(options, "privacy-mode", false);
 
-        var result = new CaseRunner().Static(target, output, formats, caseName);
+        var result = new CaseRunner().Static(target, output, formats, caseName, privacyMode);
+        var redactor = privacyMode ? new PrivacyRedactor() : null;
+        var loggedResult = redactor is null ? result : redactor.Redact(result);
+        string loggedTarget = redactor?.RedactText(target) ?? target;
+        string loggedOutput = redactor?.RedactText(output) ?? output;
         Log(json, "static_completed", new Dictionary<string, object?>
         {
-            ["target"] = target,
-            ["sha256"] = result.Sha256,
-            ["file_type"] = result.FileType,
-            ["architecture"] = result.Architecture,
-            ["out"] = output
-        }, $"[+] Static analysis completed: {Path.GetFileName(target)}\n[+] SHA256: {result.Sha256}\n[+] Output: {output}");
+            ["target"] = loggedTarget,
+            ["sha256"] = loggedResult.Sha256,
+            ["file_type"] = loggedResult.FileType,
+            ["architecture"] = loggedResult.Architecture,
+            ["initial_access_triage"] = loggedResult.NonPeTriage,
+            ["out"] = loggedOutput
+        }, $"[+] Static analysis completed: {Path.GetFileName(loggedTarget)}\n[+] SHA256: {loggedResult.Sha256}\n{(loggedResult.NonPeTriage is null ? string.Empty : $"[+] Initial Access Triage: {loggedResult.NonPeTriage.Format} (read-only; runtime start disabled)\n")}[+] Output: {loggedOutput}");
         return 0;
     }
 
@@ -123,6 +129,11 @@ internal static class CliApp
         if (!string.IsNullOrWhiteSpace(target) && !File.Exists(target))
         {
             throw new FileNotFoundException("Target file was not found.", target);
+        }
+
+        if (!string.IsNullOrWhiteSpace(target) && !IsRunnablePeTarget(target))
+        {
+            throw new ArgumentException("run accepts only EXE or DLL targets. Use `static --target <path>` for read-only non-PE Initial Access Triage.");
         }
 
         string effectiveTarget = string.IsNullOrWhiteSpace(target) ? "command.exe" : target;
@@ -486,6 +497,9 @@ internal static class CliApp
             _ => "command"
         };
     }
+
+    private static bool IsRunnablePeTarget(string target) => Path.GetExtension(target) is var extension &&
+        (extension.Equals(".exe", StringComparison.OrdinalIgnoreCase) || extension.Equals(".dll", StringComparison.OrdinalIgnoreCase));
 
     private static string BuildCommandLine(string target, string type, string runner, string? exportFunc) =>
         type == "dll" && runner == "rundll32"

@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$Target,
-    [string]$Case
+    [string]$Case,
+    [string]$NonPeTarget
 )
 
 $ErrorActionPreference = 'Stop'
@@ -9,6 +10,7 @@ if ($env:MRTW_GUI_TESTS -ne '1') { throw 'Refusing to run: set MRTW_GUI_TESTS=1 
 if (-not [Environment]::UserInteractive) { throw 'GUI smoke test requires an interactive Windows desktop.' }
 $root = Split-Path -Parent $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($Target)) { $Target = Join-Path $PSScriptRoot 'StaticAnalysisProbe\bin\Release\net9.0\StaticAnalysisProbe.dll' }
+if ([string]::IsNullOrWhiteSpace($NonPeTarget)) { $NonPeTarget = Join-Path ([IO.Path]::GetTempPath()) ('mrtw-nonpe-smoke-' + [guid]::NewGuid().ToString('N') + '.ps1'); Set-Content -LiteralPath $NonPeTarget -Value "# harmless GUI smoke fixture`nhttps://example.invalid/" -NoNewline }
 if ([string]::IsNullOrWhiteSpace($Case)) { $Case = Join-Path $PSScriptRoot 'synthetic-gui-case\case.json' }
 if (-not (Test-Path -LiteralPath $Target)) { throw "Target missing: $Target" }
 $app = Join-Path $root 'src\MRTW.App\bin\Release\net9.0-windows\MRTW.App.exe'
@@ -64,6 +66,15 @@ try {
     Write-Host 'PASS GUI runtime: static selection, Start/Stop terminal state, timeline control and quality visibility.'
 }
 finally { Close-App $proc }
+
+$nonPeProc = Start-Process -FilePath $app -ArgumentList @('--smoke-target', $NonPeTarget) -PassThru
+try {
+    $nonPeWindow = Get-WindowElement $nonPeProc; $nonPeStart = Find-Id $nonPeWindow 'StartAnalysisButton'; $nonPeSample = Find-Id $nonPeWindow 'CurrentSampleText'
+    $deadline = (Get-Date).AddSeconds(15); do { Start-Sleep -Milliseconds 250 } while (($nonPeSample.Current.Name -notmatch 'mrtw-nonpe-smoke' -or $nonPeStart.Current.IsEnabled) -and (Get-Date) -lt $deadline)
+    if ($nonPeSample.Current.Name -notmatch 'mrtw-nonpe-smoke' -or $nonPeStart.Current.IsEnabled) { throw 'Non-PE target was not reflected as a read-only, Start-disabled triage target.' }
+    Write-Host 'PASS GUI non-PE: target is shown and Start is disabled.'
+}
+finally { Close-App $nonPeProc; if (Test-Path -LiteralPath $NonPeTarget) { Remove-Item -LiteralPath $NonPeTarget -Force } }
 
 $exportRoot = Join-Path ([IO.Path]::GetTempPath()) ('mrtw-gui-export-' + [guid]::NewGuid().ToString('N'))
 $caseProc = Start-Process -FilePath $app -ArgumentList @('--smoke-case', $Case, '--smoke-export', $exportRoot) -PassThru

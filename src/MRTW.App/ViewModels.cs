@@ -117,7 +117,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
         }
     }
 
-    public bool CanStart => !IsMonitoring;
+    public bool CanStart => !IsMonitoring && (string.IsNullOrWhiteSpace(SamplePath) || StaticAnalysis.NonPeTriage is null);
     public bool CanStop => IsMonitoring;
     public bool CanChangeRunConfiguration => !IsMonitoring;
     public string LiveCaptureSummary => _liveQueueDropCount + _liveHistoryDropCount == 0 ? "Live capture queue: no dropped UI updates" : $"Live capture display: {_liveQueueDropCount} queued and {_liveHistoryDropCount} historical UI updates dropped; the final case still contains collector data.";
@@ -411,7 +411,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
             StaticAnalysis = StaticAnalysis
         };
         SelectedEvent = null;
-        StatusText = "Target selected";
+        StatusText = StaticAnalysis.NonPeTriage is null ? "Target selected" : "Initial Access Triage completed (non-PE targets cannot be started)";
         ResetRunDuration();
         RefreshCaseBindings();
     }
@@ -421,6 +421,11 @@ public sealed class MainViewModel : INotifyPropertyChanged
         if (string.IsNullOrWhiteSpace(SamplePath))
         {
             throw new InvalidOperationException("No target file is selected.");
+        }
+
+        if (StaticAnalysis.NonPeTriage is not null)
+        {
+            throw new InvalidOperationException("Runtime analysis is limited to EXE/DLL targets. This non-PE target is available only for Initial Access Triage.");
         }
 
         StatusText = "Running";
@@ -627,6 +632,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
     private void RefreshCaseBindings()
     {
         OnPropertyChanged(nameof(CurrentCase));
+        OnPropertyChanged(nameof(CanStart));
         OnPropertyChanged(nameof(FilteredEvents));
         OnPropertyChanged(nameof(TimelineDisplayEvents));
         OnPropertyChanged(nameof(ProcessFilterOptions));

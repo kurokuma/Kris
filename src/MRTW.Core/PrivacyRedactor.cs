@@ -7,6 +7,8 @@ public sealed class PrivacyRedactor
 {
     private static readonly Regex UserPath = new(@"C:\\Users\\([^\\]+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex PrivateIp = new(@"\b(10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})\b", RegexOptions.Compiled);
+    private static readonly Regex UncPath = new(@"\\\\[^\\/\s]+\\[^\s\""']*", RegexOptions.Compiled);
+    private static readonly Regex Url = new(@"https?://[^\s\""'<>]+", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     public CaseData Redact(CaseData data)
     {
@@ -46,6 +48,8 @@ public sealed class PrivacyRedactor
     {
         string text = UserPath.Replace(value, @"C:\Users\<USER>");
         text = PrivateIp.Replace(text, "<PRIVATE_IP>");
+        text = UncPath.Replace(text, "<UNC_PATH>");
+        text = Url.Replace(text, "<URL>");
         text = text.Replace(Environment.UserName, "<USER>", StringComparison.OrdinalIgnoreCase);
         string host = Dns.GetHostName();
         if (!string.IsNullOrWhiteSpace(host))
@@ -56,10 +60,20 @@ public sealed class PrivacyRedactor
         return text;
     }
 
-    private StaticAnalysisResult Redact(StaticAnalysisResult result) => result with
+    public StaticAnalysisResult Redact(StaticAnalysisResult result) => result with
     {
         FullPath = RedactText(result.FullPath),
         SuspiciousStrings = result.SuspiciousStrings.Select(RedactText).ToArray(),
-        PdbPath = RedactText(result.PdbPath)
+        PdbPath = RedactText(result.PdbPath),
+        NonPeTriage = result.NonPeTriage is null ? null : result.NonPeTriage with
+        {
+            Format = RedactText(result.NonPeTriage.Format),
+            Indicators = result.NonPeTriage.Indicators.Select(RedactText).ToArray(),
+            UrlCandidates = result.NonPeTriage.UrlCandidates.Select(RedactText).ToArray(),
+            CommandCandidates = result.NonPeTriage.CommandCandidates.Select(RedactText).ToArray(),
+            EncodedContentMarkers = result.NonPeTriage.EncodedContentMarkers.Select(RedactText).ToArray(),
+            ContainerEntries = result.NonPeTriage.ContainerEntries.Select(RedactText).ToArray(),
+            SafetyWarnings = result.NonPeTriage.SafetyWarnings.Select(RedactText).ToArray()
+        }
     };
 }

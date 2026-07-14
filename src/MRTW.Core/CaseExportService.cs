@@ -211,6 +211,7 @@ public sealed class CaseExportService
             $"<tr><td>{H(a.Type)}</td><td>{H(a.Value)}</td><td>{a.EventCount}</td><td>{a.Severity}</td></tr>"));
         string qualityRows = string.Join(Environment.NewLine, (data.Quality?.Collectors ?? [])
             .Select(c => $"<tr><td>{H(c.Collector)}</td><td>{H(c.Status)}</td><td>{c.EventsReceived}</td><td>{c.EventsDropped}</td><td>{H(c.Message)}</td></tr>"));
+        string triage = BuildNonPeTriageHtml(data.StaticAnalysis?.NonPeTriage);
 
         return $$"""
 <!doctype html>
@@ -246,11 +247,23 @@ th,td{padding:9px 10px;border-bottom:1px solid #1f3044;text-align:left}th{backgr
 <h2>Collection Quality</h2>
 <p>Overall: {{H(data.Quality?.OverallStatus ?? "not recorded")}} | Network: {{H(data.Quality?.NetworkContainment ?? "not recorded")}}</p>
 <table><thead><tr><th>Collector</th><th>Status</th><th>Events</th><th>Dropped</th><th>Message</th></tr></thead><tbody>{{qualityRows}}</tbody></table>
+{{triage}}
 <h2>Analyst Notes</h2><p>{{H(data.AnalystNotes)}}</p>
 </main>
 </body>
 </html>
 """;
+    }
+
+    private static string BuildNonPeTriageHtml(NonPeTriageResult? triage)
+    {
+        if (triage is null) return string.Empty;
+        string List(string title, IEnumerable<string> values) => $"<h3>{H(title)}</h3><ul>" + string.Join(string.Empty, values.Select(v => $"<li>{H(v)}</li>")) + "</ul>";
+        return "<section><h2>Initial Access Triage</h2>" +
+            $"<p><strong>Format:</strong> {H(triage.Format)} | <strong>Runtime start:</strong> {triage.CanExecute}</p>" +
+            List("Indicators", triage.Indicators) + List("URL candidates", triage.UrlCandidates) +
+            List("Command candidates", triage.CommandCandidates) + List("Encoded-content markers", triage.EncodedContentMarkers) +
+            List("Container entries", triage.ContainerEntries) + List("Safety warnings", triage.SafetyWarnings) + "</section>";
     }
 
     private static void WriteSqliteBundle(CaseData data, string path)

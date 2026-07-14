@@ -124,6 +124,12 @@ dotnet run --project src\MRTW.Cli -- static `
   --format html,json,csv
 ```
 
+### Non-PE Initial Access Triage
+
+`static` and **File > Open Target** also accept LNK, PowerShell, JavaScript/VBScript, MSI/CFBF, ZIP, OOXML, and legacy Office files. These targets are analyzed read-only and cannot be started from MRTW. GUI/CLI checks are backed by a Core launch boundary that independently rejects non-PE content even if a caller falsely labels it as `exe` or supplies it beside `--cmd`. `--cmd` without `--target` remains a command-only workflow; an existing supplied target must validate as PE. The triage records only bounded format metadata, URL/command candidates, encoded-content markers (without decoding), and safe container-entry metadata. It never uses shell/link resolution, COM/Office/MSI automation, extraction to disk, or execution. ZIP/OOXML inspection is in-memory and rejects traversal, oversized, high-ratio, and nested entries.
+
+When Privacy Mode is enabled, the same redaction policy applies to every non-PE triage string (including indicators, URLs, command candidates, encoded-content markers, container entries, and warnings) before JSON, CSV/HTML, SQLite, and ZIP outputs are written. The static triage CSV contains each category, including `encoded_marker`. User paths, private IP addresses, UNC paths, URLs, local user names, and host names are not retained in the portable export.
+
 ### 動的解析
 
 ```powershell

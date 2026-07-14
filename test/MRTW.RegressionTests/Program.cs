@@ -2,6 +2,8 @@ using MRTW.Collectors.Etw;
 using MRTW.Core;
 using Microsoft.Data.Sqlite;
 using System.IO.Compression;
+using System.Text;
+using System.Diagnostics;
 
 var tests = new List<(string Name, Action Body)>
 {
@@ -47,6 +49,18 @@ var tests = new List<(string Name, Action Body)>
     ,("persistence surface entry limits retain a bounded result", TestPersistenceSurfaceLimit)
     ,("persistence timeout quality degrades the case", TestPersistenceTimeoutQuality)
     ,("WMI binding references normalize before matching", TestWmiBindingNormalization)
+    ,("non-PE scripts produce bounded read-only triage", TestNonPeScriptTriage)
+    ,("non-PE containers reject unsafe archive entries", TestNonPeZipSafety)
+    ,("non-PE LNK and CFBF formats remain read-only", TestNonPeLnkAndCompoundTriage)
+    ,("non-PE static output and privacy export preserve triage safely", TestNonPeStaticExport)
+    ,("privacy export redacts every non-PE triage field", TestNonPeTriagePrivacyAcrossExports)
+    ,("core execution boundary rejects a non-PE target disguised as exe", TestCoreRejectsNonPeExecution)
+    ,("command mode cannot use a non-PE supplied target", TestCommandModeRejectsNonPeTarget)
+    ,("PE header requires complete PE signature", TestMalformedPeIsNonPe)
+    ,("UTF-16 LNK candidates are read without resolution", TestUtf16LnkTriage)
+    ,("static privacy mode redacts non-PE outputs and HTML triage", TestStaticPrivacyNonPeOutputs)
+    ,("CLI static privacy JSON log redacts non-PE findings", TestCliStaticPrivacyJsonLog)
+    ,("GUI initial-access triage binds encoded-content markers", TestGuiEncodedMarkerBinding)
 };
 
 int failures = 0;
@@ -755,6 +769,238 @@ static void TestWmiBindingNormalization()
 {
     Equal("__eventfilter.name=\"mrtw\"", SnapshotService.NormalizeWmiReference("\\\\.\\root\\subscription:__EventFilter.Name=\"MRTW\""));
     Equal("commandlineeventconsumer.name=\"mrtw\"", SnapshotService.NormalizeWmiReference("CommandLineEventConsumer.Name=\"MRTW\""));
+}
+
+static void TestNonPeScriptTriage()
+{
+    string path = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N") + ".ps1");
+    try
+    {
+        File.WriteAllText(path, "powershell -EncodedCommand QUJD\n$u='https://example.invalid/a'\n");
+        var result = new StaticAnalysisService().Analyze(path);
+        True(result.NonPeTriage is not null, "script did not receive triage");
+        Equal("Script (PS1)", result.NonPeTriage!.Format);
+        True(result.NonPeTriage.UrlCandidates.Single().Contains("example.invalid"), "script URL missing");
+        True(result.NonPeTriage.EncodedContentMarkers.Count > 0, "encoded marker missing");
+        True(!result.NonPeTriage.CanExecute, "script triage incorrectly allows execution");
+    }
+    finally { File.Delete(path); }
+}
+
+static void TestNonPeZipSafety()
+{
+    string path = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N") + ".zip");
+    try
+    {
+        using (var stream = File.Create(path)) using (var zip = new ZipArchive(stream, ZipArchiveMode.Create))
+        {
+            using (var safe = new StreamWriter(zip.CreateEntry("safe.txt").Open())) safe.Write("safe");
+            using (var unsafeWriter = new StreamWriter(zip.CreateEntry("../escape.txt").Open())) unsafeWriter.Write("no");
+        }
+        var triage = new StaticAnalysisService().Analyze(path).NonPeTriage!;
+        True(triage.ContainerEntries.Any(x => x.StartsWith("safe.txt")), "safe ZIP entry missing");
+        True(triage.SafetyWarnings.Any(x => x.Contains("Unsafe entry path")), "traversal ZIP entry was not rejected");
+    }
+    finally { File.Delete(path); }
+}
+
+static void TestNonPeLnkAndCompoundTriage()
+{
+    string lnk = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N") + ".lnk");
+    string msi = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N") + ".msi");
+    string doc = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N") + ".doc");
+    try
+    {
+        File.WriteAllBytes(lnk, Encoding.UTF8.GetBytes("L\0\0\0https://example.invalid/link cmd.exe /c harmless"));
+        byte[] cfbf = new byte[512]; new byte[] { 0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1 }.CopyTo(cfbf, 0);
+        File.WriteAllBytes(msi, cfbf); File.WriteAllBytes(doc, cfbf);
+        var lnkResult = new StaticAnalysisService().Analyze(lnk).NonPeTriage!;
+        True(lnkResult.Format.Contains("LNK"), "LNK format missing"); True(!lnkResult.CanExecute, "LNK is executable");
+        True(new StaticAnalysisService().Analyze(msi).NonPeTriage!.Format.Contains("MSI"), "MSI CFBF format missing");
+        True(new StaticAnalysisService().Analyze(doc).NonPeTriage!.Format.Contains("Office"), "legacy Office CFBF format missing");
+    }
+    finally { File.Delete(lnk); File.Delete(msi); File.Delete(doc); }
+}
+
+static void TestNonPeStaticExport()
+{
+    string source = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N") + ".vbs");
+    string root = Path.Combine(Path.GetTempPath(), "mrtw-nonpe-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        File.WriteAllText(source, "CreateObject(\"WScript.Shell\").Run \"cmd.exe /c echo test\"");
+        var result = new CaseRunner().Static(source, root, "json,csv");
+        True(File.Exists(Path.Combine(root, Path.GetFileName(source) + "_" + result.Sha256[..8] + "_static", "initial_access_triage.json")), "non-PE JSON export missing");
+        var redacted = new PrivacyRedactor().Redact(DemoCaseFactory.Create(source, result, 0));
+        True(redacted.StaticAnalysis?.NonPeTriage is not null, "privacy transformation removed triage model");
+    }
+    finally { File.Delete(source); if (Directory.Exists(root)) Directory.Delete(root, true); }
+}
+
+static void TestNonPeTriagePrivacyAcrossExports()
+{
+    const string userPath = @"C:\Users\triage-user\payload.ps1";
+    const string privateIp = "10.23.45.67";
+    const string unc = @"\\triage-host\share\dropper.zip";
+    const string url = "https://triage.example.invalid/private";
+    string root = Path.Combine(Path.GetTempPath(), "mrtw-nonpe-privacy-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        var triage = new NonPeTriageResult("Script metadata " + userPath, false,
+            ["indicator " + privateIp], [url], ["powershell " + unc + " " + url], ["base64 " + userPath], ["entry " + unc], ["warning " + privateIp + " " + url]);
+        var staticResult = new StaticAnalysisResult("sample.ps1", userPath, 1, "m", "s1", "s256", "Script", "", null, "", [], [], [], [url, unc], false, false, 0, NonPeTriage: triage);
+        var data = DemoCaseFactory.Create(userPath, staticResult, 0);
+        new CaseExportService().WriteCaseBundle(data, root, new ExportOptions("all", PrivacyMode: true, Compress: true));
+        string[] secrets = ["triage-user", privateIp, "triage-host", "triage.example.invalid"];
+        foreach (string path in Directory.GetFiles(root, "*", SearchOption.AllDirectories).Where(p => !p.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))) AssertNoSecretBytes(path, secrets);
+        using var zip = ZipFile.OpenRead(Path.Combine(root, "case_export.zip"));
+        foreach (var entry in zip.Entries)
+        {
+            using var reader = new StreamReader(entry.Open(), Encoding.UTF8, detectEncodingFromByteOrderMarks: true, leaveOpen: false);
+            string content = reader.ReadToEnd();
+            foreach (string secret in secrets) True(!content.Contains(secret, StringComparison.OrdinalIgnoreCase), "privacy ZIP leaked " + secret + " in " + entry.FullName);
+        }
+        using var connection = new SqliteConnection($"Data Source={Path.Combine(root, "case.sqlite")};Pooling=False"); connection.Open();
+        using var command = connection.CreateCommand(); command.CommandText = "SELECT json FROM static_analysis";
+        string sqliteJson = Convert.ToString(command.ExecuteScalar()) ?? string.Empty;
+        foreach (string secret in secrets) True(!sqliteJson.Contains(secret, StringComparison.OrdinalIgnoreCase), "privacy SQLite leaked " + secret);
+    }
+    finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
+}
+
+static void TestCoreRejectsNonPeExecution()
+{
+    string target = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N") + ".com");
+    try
+    {
+        File.WriteAllBytes(target, [0x90, 0x90, 0xC3]); // inert DOS-like bytes; never executed.
+        var analysis = new StaticAnalysisService().Analyze(target);
+        True(analysis.NonPeTriage is not null, "fixture was not classified as non-PE");
+        var profile = new ExecutionProfile(target, "exe", "none", null, $"\"{target}\"", Path.GetDirectoryName(target)!, 1,
+            false, false, false, false, "observe", ExecuteTarget: true);
+        try
+        {
+            new RuntimeCaseCollector().Collect(profile, analysis);
+            throw new InvalidOperationException("Core accepted a non-PE target disguised as exe.");
+        }
+        catch (InvalidOperationException ex)
+        {
+            True(ex.Message.StartsWith("Execution skipped:", StringComparison.Ordinal), "Core rejection was not explicit.");
+        }
+        Throws<InvalidOperationException>(() => new CaseRunner().Run(profile, Path.Combine(Path.GetTempPath(), "mrtw-nonpe-exec-" + Guid.NewGuid().ToString("N")), "json"));
+    }
+    finally { File.Delete(target); }
+}
+
+static void TestCommandModeRejectsNonPeTarget()
+{
+    string target = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N") + ".ps1");
+    try
+    {
+        File.WriteAllText(target, "Write-Output harmless");
+        var profile = new ExecutionProfile(target, "command", "none", null, "powershell -NoProfile -File \"" + target + "\"", Path.GetDirectoryName(target)!, 1,
+            false, false, false, false, "observe", ExecuteTarget: true);
+        var analysis = new StaticAnalysisService().Analyze(target);
+        Throws<InvalidOperationException>(() => new RuntimeCaseCollector().Collect(profile, analysis));
+        Throws<InvalidOperationException>(() => new CaseRunner().Run(profile, Path.Combine(Path.GetTempPath(), "mrtw-command-nonpe-" + Guid.NewGuid().ToString("N")), "json"));
+    }
+    finally { File.Delete(target); }
+}
+
+static void TestMalformedPeIsNonPe()
+{
+    string path = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N") + ".exe");
+    try
+    {
+        byte[] data = new byte[512]; data[0] = (byte)'M'; data[1] = (byte)'Z'; BitConverter.GetBytes(0x80).CopyTo(data, 0x3c); data[0x80] = (byte)'P'; data[0x81] = (byte)'E'; data[0x82] = (byte)'X'; data[0x83] = (byte)'X';
+        File.WriteAllBytes(path, data);
+        var result = new StaticAnalysisService().Analyze(path);
+        True(result.NonPeTriage is not null, "malformed PE signature was accepted as PE");
+        var profile = new ExecutionProfile(path, "exe", "none", null, "\"" + path + "\"", Path.GetDirectoryName(path)!, 1, false, false, false, false, "observe", ExecuteTarget: true);
+        Throws<InvalidOperationException>(() => new RuntimeCaseCollector().Collect(profile, result));
+    }
+    finally { File.Delete(path); }
+}
+
+static void TestUtf16LnkTriage()
+{
+    string path = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N") + ".lnk");
+    try
+    {
+        byte[] prefix = new byte[] { 0x4c, 0, 0, 0 };
+        byte[] content = Encoding.Unicode.GetBytes(" https://utf16.example.invalid/a powershell.exe -NoProfile -Command harmless\0");
+        File.WriteAllBytes(path, prefix.Concat(content).ToArray());
+        var triage = new StaticAnalysisService().Analyze(path).NonPeTriage!;
+        True(triage.UrlCandidates.Any(x => x.Contains("utf16.example.invalid")), "UTF-16 LNK URL candidate missing");
+        True(triage.CommandCandidates.Any(x => x.Contains("powershell.exe", StringComparison.OrdinalIgnoreCase)), "UTF-16 LNK command candidate missing");
+    }
+    finally { File.Delete(path); }
+}
+
+static void TestStaticPrivacyNonPeOutputs()
+{
+    const string url = "https://static-private.example.invalid/a";
+    const string user = "static-private-user";
+    const string privateIp = "192.168.88.77";
+    string source = Path.Combine(Path.GetTempPath(), "mrtw-static-private-" + Guid.NewGuid().ToString("N") + ".ps1");
+    string root = Path.Combine(Path.GetTempPath(), "mrtw-static-privacy-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        File.WriteAllText(source, $"# C:\\Users\\{user}\\a.ps1\npowershell -EncodedCommand {url} {privateIp}");
+        new CaseRunner().Static(source, root, "csv", "raw-static", privacyMode: false);
+        string rawCsv = File.ReadAllText(Path.Combine(root, "raw-static", "initial_access_triage.csv"));
+        True(rawCsv.Contains("encoded_marker", StringComparison.Ordinal) && rawCsv.Contains("-EncodedCommand", StringComparison.OrdinalIgnoreCase), "normal static CSV omitted encoded-content marker");
+        new CaseRunner().Static(source, root, "all", "privacy-static", privacyMode: true);
+        string directory = Path.Combine(root, "privacy-static");
+        True(File.ReadAllText(Path.Combine(directory, "static_report.html")).Contains("Initial Access Triage"), "static HTML omitted Initial Access Triage");
+        True(File.ReadAllText(Path.Combine(directory, "initial_access_triage.csv")).Contains("encoded_marker", StringComparison.Ordinal), "privacy static CSV omitted encoded-content marker");
+        string[] secrets = [user, "static-private.example.invalid", privateIp];
+        foreach (string path in Directory.GetFiles(directory, "*", SearchOption.AllDirectories).Where(p => !p.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))) AssertNoSecretBytes(path, secrets);
+        using var zip = ZipFile.OpenRead(Path.Combine(directory, "case_export.zip"));
+        foreach (var entry in zip.Entries)
+        {
+            using var reader = new StreamReader(entry.Open(), Encoding.UTF8, detectEncodingFromByteOrderMarks: true, leaveOpen: false);
+            string content = reader.ReadToEnd();
+            foreach (string secret in secrets) True(!content.Contains(secret, StringComparison.OrdinalIgnoreCase), "static privacy ZIP leaked " + secret + " in " + entry.FullName);
+        }
+    }
+    finally { File.Delete(source); if (Directory.Exists(root)) Directory.Delete(root, true); }
+}
+
+static void TestCliStaticPrivacyJsonLog()
+{
+    const string url = "https://cli-private.example.invalid/a";
+    const string privateIp = "10.99.88.77";
+    const string unc = @"\\cli-private-host\share\payload";
+    string source = Path.Combine(Path.GetTempPath(), "mrtw-cli-private-" + Guid.NewGuid().ToString("N") + ".ps1");
+    string root = Path.Combine(Path.GetTempPath(), "mrtw-cli-static-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        File.WriteAllText(source, $"powershell -Command \"{url} {privateIp} {unc}\"");
+        string cli = Path.Combine(FindRepositoryRoot(), "src", "MRTW.Cli", "bin", "Release", "net9.0", "MRTW.Cli.dll");
+        True(File.Exists(cli), "CLI binary was not built for the integration check");
+        using var process = Process.Start(new ProcessStartInfo
+        {
+            FileName = "dotnet", UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true,
+            ArgumentList = { cli, "static", "--target", source, "--out", root, "--format", "json", "--privacy-mode", "on", "--log-format", "json" }
+        }) ?? throw new InvalidOperationException("Could not start CLI privacy integration check.");
+        string stdout = process.StandardOutput.ReadToEnd(); string stderr = process.StandardError.ReadToEnd(); process.WaitForExit();
+        Equal(0, process.ExitCode); True(string.IsNullOrWhiteSpace(stderr), "CLI emitted unexpected stderr: " + stderr);
+        foreach (string secret in new[] { "cli-private.example.invalid", privateIp, "cli-private-host", Environment.UserName }) True(!stdout.Contains(secret, StringComparison.OrdinalIgnoreCase), "privacy JSON log leaked " + secret);
+    }
+    finally { File.Delete(source); if (Directory.Exists(root)) Directory.Delete(root, true); }
+}
+
+static void TestGuiEncodedMarkerBinding()
+{
+    string xaml = File.ReadAllText(Path.Combine(FindRepositoryRoot(), "src", "MRTW.App", "MainWindow.xaml"));
+    True(xaml.Contains("StaticAnalysis.NonPeTriage.EncodedContentMarkers", StringComparison.Ordinal), "GUI triage omits encoded-content marker binding");
+}
+
+static void AssertNoSecretBytes(string path, IEnumerable<string> secrets)
+{
+    string content = Encoding.UTF8.GetString(File.ReadAllBytes(path));
+    foreach (string secret in secrets) True(!content.Contains(secret, StringComparison.OrdinalIgnoreCase), "privacy export leaked " + secret + " in " + Path.GetFileName(path));
 }
 
 static void AssertNoSecrets(IEnumerable<string> paths, params string[] secrets)

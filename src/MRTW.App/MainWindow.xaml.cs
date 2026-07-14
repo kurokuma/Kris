@@ -67,7 +67,7 @@ public partial class MainWindow : Window
         var dialog = new OpenFileDialog
         {
             Title = "Open analysis target",
-            Filter = "Executable files (*.exe;*.dll)|*.exe;*.dll|All files (*.*)|*.*"
+            Filter = "Analysis targets (*.exe;*.dll;*.lnk;*.ps1;*.js;*.vbs;*.msi;*.zip;*.doc;*.xls;*.ppt;*.docx;*.xlsx;*.pptx)|*.exe;*.dll;*.lnk;*.ps1;*.js;*.vbs;*.msi;*.zip;*.doc;*.xls;*.ppt;*.docx;*.xlsx;*.pptx|All files (*.*)|*.*"
         };
 
         if (dialog.ShowDialog(this) == true)

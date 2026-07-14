@@ -37,14 +37,15 @@ public sealed class StaticAnalysisService
         using var sha256 = SHA256.Create();
 
         var pe = TryReadPe(data);
+        var nonPeTriage = pe.IsPe ? null : NonPeTriageService.Analyze(path, data);
         var strings = ExtractStrings(data, minStringLength)
             .Where(s => InterestingStringPattern.IsMatch(s))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .Take(80)
             .ToArray();
 
-        var signature = ReadSignature(path, pe);
-        var version = ReadVersionInfo(path);
+        var signature = pe.IsPe ? ReadSignature(path, pe) : (Status: "Not applicable", Subject: "");
+        var version = pe.IsPe ? ReadVersionInfo(path) : new Dictionary<string, string>();
         var packer = DetectPackerIndicators(pe.Sections, pe.Imports, pe.EntryPoint);
         var embedded = FindEmbeddedPeFiles(data);
         return new StaticAnalysisResult(
@@ -54,7 +55,7 @@ public sealed class StaticAnalysisService
             Convert.ToHexString(md5.ComputeHash(data)).ToLowerInvariant(),
             Convert.ToHexString(sha1.ComputeHash(data)).ToLowerInvariant(),
             Convert.ToHexString(sha256.ComputeHash(data)).ToLowerInvariant(),
-            pe.IsPe ? "PE executable" : "Binary/data",
+            pe.IsPe ? "PE executable" : nonPeTriage!.Format,
             pe.Architecture,
             pe.Timestamp,
             pe.EntryPoint,
@@ -78,7 +79,8 @@ public sealed class StaticAnalysisService
             version,
             ReadDotNetMetadata(path, data),
             packer,
-            embedded);
+            embedded,
+            nonPeTriage);
     }
 
     private static IEnumerable<string> ExtractStrings(byte[] data, int minLength)
@@ -135,7 +137,7 @@ public sealed class StaticAnalysisService
             }
 
             int peOffset = BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(0x3C, 4));
-            if (peOffset < 0 || peOffset + 0x108 >= data.Length || data[peOffset] != 'P' || data[peOffset + 1] != 'E')
+            if (peOffset < 0 || peOffset + 0x108 >= data.Length || data[peOffset] != 'P' || data[peOffset + 1] != 'E' || data[peOffset + 2] != 0 || data[peOffset + 3] != 0)
             {
                 return PeReadResult.NotPe;
             }

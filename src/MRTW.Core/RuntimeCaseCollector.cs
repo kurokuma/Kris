@@ -28,6 +28,10 @@ public sealed class RuntimeCaseCollector
 
     public CaseData Collect(ExecutionProfile profile, StaticAnalysisResult? staticAnalysis, CancellationToken cancellationToken, Action<TimelineEvent>? onEvent, CollectionRunContext? runContext, Action<int>? onProcessBound = null)
     {
+        if (profile.ExecuteTarget)
+        {
+            ExecutionTargetPolicy.EnsureRunnable(profile, staticAnalysis);
+        }
         CaptureLimits.ValidatePersisted(profile.MaxPersistedEvents, profile.MaxPersistedNetworkSessions);
         runContext ??= CollectionRunContext.Create();
         string caseId = runContext.CaseId;
@@ -470,6 +474,7 @@ public sealed class RuntimeCaseCollector
     private static Process StartProcess(ExecutionProfile profile, CancellationToken cancellationToken = default, VerifiedTargetHandle? verifiedTarget = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        ExecutionTargetPolicy.EnsureRunnable(profile, null);
         var startInfo = new ProcessStartInfo
         {
             WorkingDirectory = Directory.Exists(profile.WorkingDirectory) ? profile.WorkingDirectory : Environment.CurrentDirectory,

@@ -142,7 +142,19 @@ public sealed record StaticAnalysisResult(
     IReadOnlyDictionary<string, string>? VersionInfo = null,
     IReadOnlyList<string>? DotNetMetadata = null,
     IReadOnlyList<string>? PackerIndicators = null,
-    IReadOnlyList<EmbeddedPeInfo>? EmbeddedPeFiles = null);
+    IReadOnlyList<EmbeddedPeInfo>? EmbeddedPeFiles = null,
+    NonPeTriageResult? NonPeTriage = null);
+
+/// <summary>Read-only, bounded first-look findings for a non-PE target.  No finding is executed or resolved.</summary>
+public sealed record NonPeTriageResult(
+    string Format,
+    bool CanExecute,
+    IReadOnlyList<string> Indicators,
+    IReadOnlyList<string> UrlCandidates,
+    IReadOnlyList<string> CommandCandidates,
+    IReadOnlyList<string> EncodedContentMarkers,
+    IReadOnlyList<string> ContainerEntries,
+    IReadOnlyList<string> SafetyWarnings);
 
 public sealed record CaseData(
     string CaseId,

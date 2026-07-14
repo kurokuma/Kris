@@ -1,8 +1,10 @@
 # Backlog
 
+> 2026-07-15 update: TASK-013 is complete. `NonPeTriage` now safely provides read-only initial-access static triage for LNK, scripts, MSI/CFBF, ZIP/OOXML, and legacy Office formats. TASK-011 remains unstarted; it covers decoding and cross-artifact chain normalization, neither of which is part of TASK-013.
+
 ## 概要
 
-- 最終更新日: 2026-07-14
+- 最終更新日: 2026-07-15
 - 調査対象: `README.md`、`docs/`、`src/MRTW.Core/`、`src/MRTW.Collectors.Etw/`、`src/MRTW.Cli/`、`src/MRTW.App/`、`src/MRTW.Native/`、`test/`
 - 主要な懸念: 高頻度イベント時の収集メモリ上限、短命プロセスのETW開始タイミング、Windows永続化面の観測不足、スクリプト／非PE形式の分析不足、Windows実環境での統合試験不足、Privacy Modeとバッチ実行の検証不足
 - 次に着手すべきタスク: TASK-011
@@ -212,18 +214,18 @@
 
 ### TASK-013: 非PE初期侵入形式を安全に静的トリアージする
 
-- 状態: 未着手
+- 状態: 完了
 - 規模: M
 - 概要: GUIとCLIの主な対象はEXE/DLLであり、LNK、PowerShell、JavaScript/VBScript、MSI、Office由来のコマンド、ZIP内の一次ファイルなど、マルウェア配布で頻出する非PE形式を実行せずに統一表示する機能がない。
 - 根拠: READMEのGUI操作とCLI `run`はEXE/DLLを対象とし、`src/MRTW.Cli/Program.cs`の`batch`も`.exe`と`.dll`だけを列挙する。MITRE ATT&CKの[T1027](https://attack.mitre.org/techniques/T1027/)は圧縮・暗号化・エンコードされたファイルを、[T1140](https://attack.mitre.org/techniques/T1140/)は復号後の実行を分析対象として挙げている。
 - 対象: `src/MRTW.Core/StaticAnalysisService.cs`、`src/MRTW.Cli/Program.cs`、`src/MRTW.App/`、`src/MRTW.Core/Models.cs`、`test/StaticAnalysisProbe/`、追加する安全なフィクスチャ
 - 実装内容: ファイル種別判定をPE前提から分離し、LNK、PowerShell、JS/VBS、MSI、ZIPを検出して、メタデータ、埋込コマンド、URL、親ファイル、ハッシュ、展開候補を静的結果として出す。アーカイブ展開はファイル数・深さ・合計サイズ・パス走査の上限を持たせ、既定では実行しない。
 - 完了条件:
-  - [ ] 各対応形式を実行せずに種別・主要IOC・抽出コマンドを表示できる
-  - [ ] ZIPのパストラバーサル、暗号化、深い入れ子、過大展開を安全に拒否または警告する
-  - [ ] EXE/DLLの既存静的解析出力との互換性を維持する
-  - [ ] 安全な各形式のフィクスチャで回帰テストが成功する
-- 依存関係: TASK-011
+  - [x] 各対応形式を実行せずに種別・主要IOC・抽出コマンドを表示できる
+  - [x] ZIPのパストラバーサル、暗号化、深い入れ子、過大展開を安全に拒否または警告する
+  - [x] EXE/DLLの既存静的解析出力との互換性を維持する
+  - [x] 安全な各形式のフィクスチャで回帰テストが成功する
+- 依存関係: なし（TASK-011は復号とLOLBin連鎖強化の後続タスク）
 - リスク・注意点: 非PE解析は「実行可能性」を判定してはならない。Officeやスクリプトの内容は機微情報を含み得るため、エクスポートとPrivacy Modeの扱いを同時に定義すること。
 
 ## P3
