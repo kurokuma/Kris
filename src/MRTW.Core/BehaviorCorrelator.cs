@@ -1,10 +1,11 @@
 using System.Text.Json;
+using System.Text.Json.Nodes;
 
 namespace MRTW.Core;
 
 public static class BehaviorCorrelator
 {
-    public static IReadOnlyList<TimelineEvent> Correlate(IReadOnlyList<TimelineEvent> events)
+    public static IReadOnlyList<TimelineEvent> Correlate(IReadOnlyList<TimelineEvent> events, CommandNormalizationBudget? commandBudget = null)
     {
         if (events.Count == 0)
         {
@@ -12,6 +13,7 @@ public static class BehaviorCorrelator
         }
 
         var output = events.OrderBy(e => e.Time).ToList();
+        commandBudget ??= new CommandNormalizationBudget();
         int nextId = output.Count == 0 ? 1 : output.Max(e => e.Id) + 1;
         // Configurable rules are untrusted input.  Keep their total work bounded across
         // all process groups; built-in correlations below remain complete.
@@ -32,6 +34,7 @@ public static class BehaviorCorrelator
             AddTokenManipulation(output, group.ToArray(), ref nextId);
             AddStealerBehavior(output, group.ToArray(), ref nextId);
             AddLolbinExecution(output, group.ToArray(), ref nextId);
+            AddEncodedCommand(output, group.ToArray(), ref nextId, commandBudget);
             AddAmsiEtwTamper(output, group.ToArray(), ref nextId);
             AddIpcActivity(output, group.ToArray(), ref nextId);
             AddComWmiActivity(output, group.ToArray(), ref nextId);
@@ -42,7 +45,67 @@ public static class BehaviorCorrelator
             AddConfiguredRules(output, group.ToArray(), ref nextId, ruleBudget, configuredRules);
         }
 
-        return output.OrderBy(e => e.Time).Select((e, index) => e with { Id = index + 1 }).ToArray();
+        var ordered = output.OrderBy(e => e.Time).ToArray();
+        var idMap = ordered
+            .Select((timelineEvent, index) => (timelineEvent.Id, NewId: index + 1))
+            .GroupBy(value => value.Id)
+            .ToDictionary(group => group.Key, group => group.First().NewId);
+        return ordered.Select((timelineEvent, index) => timelineEvent with
+        {
+            Id = index + 1,
+            RawJson = timelineEvent.Category == EventCategory.Behavior
+                ? RewriteEvidenceEventIds(timelineEvent.RawJson, idMap)
+                : timelineEvent.RawJson
+        }).ToArray();
+    }
+
+    private static void AddEncodedCommand(List<TimelineEvent> output, IReadOnlyList<TimelineEvent> events, ref int nextId, CommandNormalizationBudget budget)
+    {
+        foreach (var e in events)
+        {
+            var command = CommandNormalizationService.Normalize(e.ObjectValue, budget).Concat(CommandNormalizationService.Normalize(e.Summary, budget)).FirstOrDefault(c => c.Status == "decoded");
+            if (command is null) continue;
+            string raw = JsonSerializer.Serialize(new { finding = "encoded_command_decoded", evidence_event_ids = new[] { e.Id }, decoder = command.Decoder, status = command.Status, lolbin = command.LolBin });
+            output.Add(new TimelineEvent(nextId++, e.Time, e.Process, e.Pid, EventCategory.Behavior, "Encoded Command Decoded", command.Normalized, "Bounded Base64 text decoding evidence; content was not executed.", EventSeverity.Medium, "Behavior", raw, "T1140", "Deobfuscate/Decode Files or Information", "Medium", e.ProcessGuid, e.CapturedAtUtc));
+            break;
+        }
+    }
+
+    private static string RewriteEvidenceEventIds(string rawJson, IReadOnlyDictionary<int, int> idMap)
+    {
+        try
+        {
+            if (JsonNode.Parse(rawJson) is not JsonObject document || document["evidence_event_ids"] is not JsonArray evidenceIds)
+                return rawJson;
+
+            var rewritten = new JsonArray();
+            foreach (var value in evidenceIds)
+            {
+                if (value is JsonValue jsonValue)
+                {
+                    try
+                    {
+                        int oldId = jsonValue.GetValue<int>();
+                        if (idMap.TryGetValue(oldId, out int newId))
+                        {
+                            rewritten.Add(newId);
+                            continue;
+                        }
+                    }
+                    catch (InvalidOperationException)
+                    {
+                        // Preserve malformed or non-integer evidence values verbatim.
+                    }
+                }
+                rewritten.Add(value?.DeepClone());
+            }
+            document["evidence_event_ids"] = rewritten;
+            return document.ToJsonString(JsonDefaults.Options);
+        }
+        catch (JsonException)
+        {
+            return rawJson;
+        }
     }
 
     private static void AddConfiguredRules(List<TimelineEvent> output, IReadOnlyList<TimelineEvent> events, ref int nextId, RuleEvaluationBudget budget, IReadOnlyList<BehaviorRule> rules)

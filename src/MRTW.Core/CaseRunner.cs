@@ -84,7 +84,7 @@ public sealed class CaseRunner
         return value;
     }
 
-    private static string Csv(string value) => "\"" + value.Replace("\"", "\"\"") + "\"";
+    private static string Csv(string value) { if (value.Length > 0 && value[0] is '=' or '+' or '-' or '@') value = "'" + value; return "\"" + value.Replace("\"", "\"\"") + "\""; }
 
     private static string ClassifyString(string value)
     {

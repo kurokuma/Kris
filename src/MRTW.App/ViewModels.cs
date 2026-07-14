@@ -408,7 +408,10 @@ public sealed class MainViewModel : INotifyPropertyChanged
         {
             SampleName = Path.GetFileName(path),
             SamplePath = path,
-            StaticAnalysis = StaticAnalysis
+            StaticAnalysis = StaticAnalysis,
+            NormalizedCommands = StaticAnalysis.NonPeTriage?.CommandCandidates
+                .SelectMany(candidate => CommandNormalizationService.Normalize(candidate))
+                .ToArray() ?? Array.Empty<NormalizedCommand>()
         };
         SelectedEvent = null;
         StatusText = StaticAnalysis.NonPeTriage is null ? "Target selected" : "Initial Access Triage completed (non-PE targets cannot be started)";
@@ -450,7 +453,12 @@ public sealed class MainViewModel : INotifyPropertyChanged
             Array.Empty<TimelineEvent>(),
             Array.Empty<ArtifactItem>(),
             Array.Empty<NetworkSession>(),
-            "Analysis is running. Timeline events are appended as they are captured.");
+            "Analysis is running. Timeline events are appended as they are captured.")
+        {
+            NormalizedCommands = StaticAnalysis.NonPeTriage?.CommandCandidates
+                .SelectMany(candidate => CommandNormalizationService.Normalize(candidate))
+                .ToArray() ?? Array.Empty<NormalizedCommand>()
+        };
         SelectedEvent = null;
         SetLiveQueueDropCount(0);
         _liveEventBuffer.Clear();

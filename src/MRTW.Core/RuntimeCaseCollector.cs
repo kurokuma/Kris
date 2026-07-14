@@ -432,8 +432,16 @@ public sealed class RuntimeCaseCollector
         processes.AddRange(BuildProcessNodes(caseId, capturedEvents, profile, pid ?? 0, processStarted ?? started, processExited));
         var eventsWithProcessGuids = AttachProcessGuids(capturedEvents, processes, caseId, started);
 
-        var correlatedEvents = BehaviorCorrelator.Correlate(eventsWithProcessGuids);
+        var commandBudget = new CommandNormalizationBudget();
+        var correlatedEvents = BehaviorCorrelator.Correlate(eventsWithProcessGuids, commandBudget);
         correlatedEvents = AttachProcessGuids(correlatedEvents, processes, caseId, started);
+        var normalizedCommands = correlatedEvents
+            .Where(e => e.Category == EventCategory.Process || e.Source.Equals("Hook", StringComparison.OrdinalIgnoreCase))
+            .SelectMany(e => CommandNormalizationService.Normalize(e.ObjectValue, commandBudget).Concat(CommandNormalizationService.Normalize(e.Summary, commandBudget))
+                .Where(c => c.Status != "not-encoded" || !string.IsNullOrWhiteSpace(c.LolBin))
+                .Where(c => commandBudget.TryAddFinding())
+                .Select(c => c with { ProcessGuid = e.ProcessGuid, Pid = e.Pid, Time = e.Time, EvidenceEventIds = [e.Id] }))
+            .Take(256).ToArray();
         var artifacts = BuildArtifacts(correlatedEvents, processes, started);
         string sampleName = Path.GetFileName(profile.TargetPath);
         string sha = staticAnalysis?.Sha256 ?? "unknown";
@@ -457,8 +465,14 @@ public sealed class RuntimeCaseCollector
             artifacts,
             networks.ToArray(),
             notes,
-            Quality: RuntimeQuality(events, networks, started, before.PersistenceQuality, after.PersistenceQuality),
-            PreservedFiles: preservedFiles) { TrustedEvidenceRoot = EvidencePathPolicy.Root(caseId) };
+            Quality: AddCommandNormalizationQuality(RuntimeQuality(events, networks, started, before.PersistenceQuality, after.PersistenceQuality), commandBudget, started),
+            PreservedFiles: preservedFiles) { TrustedEvidenceRoot = EvidencePathPolicy.Root(caseId), NormalizedCommands = normalizedCommands };
+    }
+
+    private static CaseQuality AddCommandNormalizationQuality(CaseQuality quality, CommandNormalizationBudget budget, DateTimeOffset started)
+    {
+        if (!budget.Exhausted) return quality;
+        return quality with { OverallStatus = "degraded", Collectors = quality.Collectors.Concat([new CollectorHealth("CommandNormalization", "degraded", started, DateTimeOffset.UtcNow, CommandNormalizationBudget.MaxFindings, budget.Dropped, "command-normalization-limit")]).ToArray() };
     }
 
     internal static bool IsPidBindingEvent(TimelineEvent timelineEvent) =>

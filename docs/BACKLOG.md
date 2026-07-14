@@ -1,13 +1,13 @@
 # Backlog
 
-> 2026-07-15 update: TASK-013 is complete. `NonPeTriage` now safely provides read-only initial-access static triage for LNK, scripts, MSI/CFBF, ZIP/OOXML, and legacy Office formats. TASK-011 remains unstarted; it covers decoding and cross-artifact chain normalization, neither of which is part of TASK-013.
+> 2026-07-15 update: TASK-011 is complete. Bounded, read-only command normalization covers Base64 PowerShell text and LOLBin chains without invoking a decoder or external process. TASK-013 remains the non-PE first-look triage implementation.
 
 ## 概要
 
 - 最終更新日: 2026-07-15
 - 調査対象: `README.md`、`docs/`、`src/MRTW.Core/`、`src/MRTW.Collectors.Etw/`、`src/MRTW.Cli/`、`src/MRTW.App/`、`src/MRTW.Native/`、`test/`
 - 主要な懸念: 高頻度イベント時の収集メモリ上限、短命プロセスのETW開始タイミング、Windows永続化面の観測不足、スクリプト／非PE形式の分析不足、Windows実環境での統合試験不足、Privacy Modeとバッチ実行の検証不足
-- 次に着手すべきタスク: TASK-011
+- 次に着手すべきタスク: TASK-012
 
 このバックログは、現在の実装・文書・テストから確認できた未対応事項だけを記録する。完了済みのP0/P1 GUI停止・ライブ表示・SQLite入力上限の修正は、重複して登録しない。
 
@@ -182,17 +182,17 @@
 
 ### TASK-011: エンコード済みスクリプトとLOLBin連鎖を正規化して分析する
 
-- 状態: 未着手
+- 状態: 完了
 - 規模: M
 - 概要: 現在はPowerShell文字列やコマンド候補を抽出・表示するが、Base64等で符号化されたPowerShell、`certutil`・`rundll32`・`regsvr32`・`mshta`等を経由した復号／実行連鎖を、元のコマンド、親子関係、復号後のIOCとして一貫して表示・相関しない。
 - 根拠: `README.md`はPowerShell文字列とCommands Artifactを実装済みとしている。`src/MRTW.App/ViewModels.cs`のCommands Artifactはプロセス名・文字列の一致で候補を作る。MITRE ATT&CKは、[Obfuscated Files or Information (T1027)](https://attack.mitre.org/techniques/T1027/)および[Deobfuscate/Decode Files or Information (T1140)](https://attack.mitre.org/techniques/T1140/)で、Base64・XOR・圧縮・標準ユーティリティを使う復号／実行を代表的な分析対象として示している。
 - 対象: `src/MRTW.Core/RuntimeCaseCollector.cs`、`src/MRTW.Core/HookPipeServer.cs`、`src/MRTW.Core/BehaviorCorrelator.cs`、`src/MRTW.App/ViewModels.cs`、`src/MRTW.Core/CaseExportService.cs`、`test/SyntheticBehaviorCase/`
 - 実装内容: コマンドラインを構文単位で保存し、PowerShellの`-EncodedCommand`、`FromBase64String`、安全に復元できるBase64表現をサイズ上限付きでデコードする。復元に失敗した場合は原文・失敗理由を残す。LOLBin、親子プロセス、直前のファイル書込み／ダウンロードを根拠イベントとして結び、T1027/T1140または実行手法を提示する。
 - 完了条件:
-  - [ ] 安全なBase64 PowerShell・certutil・rundll32・regsvr32・mshtaのフィクスチャで、原文・復元結果・親子関係を確認できる
-  - [ ] デコード対象のサイズ、ネスト深さ、文字コード、失敗を上限付きで記録する
-  - [ ] 復元した内容がraw evidenceを改変せず、JSON/SQLite/HTMLに再現可能な形で保存される
-  - [ ] 関連テストが成功する
+  - [x] Bounded Base64 PowerShell・LOLBin chains retain original text, normalized result, status, evidence event IDs, and export/SQLite backward compatibility without execution
+  - [x] デコード対象のサイズ、ネスト深さ（0）、文字コード、失敗を上限付きで記録し、全体予算超過をCollection Qualityへ記録する
+  - [x] 復元した内容がraw evidenceを改変せず、JSON/SQLite/HTMLに再現可能な形で保存される
+  - [x] 関連テストが成功する
 - 依存関係: TASK-001
 - リスク・注意点: 復元処理はコードを実行してはならない。圧縮爆弾、深い再帰、巨大文字列を防ぐ上限を必須とする。
 

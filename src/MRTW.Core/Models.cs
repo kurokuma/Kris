@@ -156,6 +156,19 @@ public sealed record NonPeTriageResult(
     IReadOnlyList<string> ContainerEntries,
     IReadOnlyList<string> SafetyWarnings);
 
+/// <summary>Read-only bounded command normalization evidence. Decoded text is never executed.</summary>
+public sealed record NormalizedCommand(
+    string Original,
+    string Normalized,
+    string Decoder,
+    string Status,
+    string FailureReason = "",
+    string LolBin = "",
+    string ProcessGuid = "",
+    int? Pid = null,
+    TimeSpan? Time = null,
+    IReadOnlyList<int>? EvidenceEventIds = null);
+
 public sealed record CaseData(
     string CaseId,
     string CaseName,
@@ -177,6 +190,8 @@ public sealed record CaseData(
     [JsonIgnore]
     public string TrustedEvidenceRoot { get; init; } = "";
     public IReadOnlyList<RawEvidenceFile> RawEvidence { get; init; } = [];
+    // Appended for JSON/SQLite backward compatibility with existing case bundles.
+    public IReadOnlyList<NormalizedCommand> NormalizedCommands { get; init; } = [];
     [JsonIgnore]
     public int HighCount => Events.Count(e => e.Severity is EventSeverity.Critical or EventSeverity.High);
 

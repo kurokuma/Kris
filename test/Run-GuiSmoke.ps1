@@ -53,8 +53,8 @@ function Close-App([Diagnostics.Process]$Process) { if (-not $Process.HasExited)
 
 $proc = Start-Process -FilePath $app -ArgumentList @('--smoke-target', $Target) -PassThru
 try {
-    $rootElement = Get-WindowElement $proc; $start = Find-Id $rootElement 'StartAnalysisButton'; $stop = Find-Id $rootElement 'StopAnalysisButton'; $timeline = Find-Id $rootElement 'TimelineGrid'; $sample = Find-Id $rootElement 'CurrentSampleText'; $quality = Find-Id $rootElement 'CollectionQualityText'
-    if ($null -eq $start -or $null -eq $stop -or $null -eq $timeline) { throw 'Required UI Automation identifiers were not found.' }
+    $rootElement = Get-WindowElement $proc; $start = Find-Id $rootElement 'StartAnalysisButton'; $stop = Find-Id $rootElement 'StopAnalysisButton'; $timeline = Find-Id $rootElement 'TimelineGrid'; $sample = Find-Id $rootElement 'CurrentSampleText'; $quality = Find-Id $rootElement 'CollectionQualityText'; $normalizedCommands = Find-Id $rootElement 'NormalizedCommandsGrid'
+    if ($null -eq $start -or $null -eq $stop -or $null -eq $timeline -or $null -eq $normalizedCommands) { throw 'Required UI Automation identifiers were not found.' }
     if (-not $start.Current.IsEnabled -or $sample.Current.Name -notmatch 'StaticAnalysisProbe') { throw 'Static target selection was not reflected in the UI.' }
     $pattern = $start.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern); ([System.Windows.Automation.InvokePattern]$pattern).Invoke()
     $deadline = (Get-Date).AddSeconds(10); do { Start-Sleep -Milliseconds 250 } while (-not $stop.Current.IsEnabled -and (Get-Date) -lt $deadline)

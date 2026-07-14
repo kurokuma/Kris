@@ -97,6 +97,7 @@ public sealed class CaseExportService
             File.WriteAllText(Path.Combine(caseDirectory, "artifacts.csv"), ToCsv(data.Artifacts), Encoding.UTF8);
             File.WriteAllText(Path.Combine(caseDirectory, "processes.csv"), ToCsv(data.Processes), Encoding.UTF8);
             File.WriteAllText(Path.Combine(caseDirectory, "network.csv"), ToCsv(data.NetworkSessions), Encoding.UTF8);
+            File.WriteAllText(Path.Combine(caseDirectory, "normalized_commands.csv"), ToCsv(data.NormalizedCommands), Encoding.UTF8);
         }
 
         if (requested.Contains("html") || requested.Contains("all"))
@@ -196,10 +197,18 @@ public sealed class CaseExportService
         }
         return sb.ToString();
     }
+    private static string ToCsv(IEnumerable<NormalizedCommand> commands)
+    {
+        var sb = new StringBuilder("original,normalized,decoder,status,failure_reason,lolbin,process_guid,pid,time,evidence_event_ids\r\n");
+        foreach (var c in commands) sb.AppendLine(string.Join(',', Csv(c.Original), Csv(c.Normalized), Csv(c.Decoder), Csv(c.Status), Csv(c.FailureReason), Csv(c.LolBin), Csv(c.ProcessGuid), c.Pid, Csv(c.Time), Csv(string.Join(';', c.EvidenceEventIds ?? []))));
+        return sb.ToString();
+    }
 
     private static string Csv(object? value)
     {
         string text = Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty;
+        // Spreadsheet applications evaluate leading formula markers even in quoted cells.
+        if (text.Length > 0 && text[0] is '=' or '+' or '-' or '@') text = "'" + text;
         return "\"" + text.Replace("\"", "\"\"") + "\"";
     }
 
@@ -212,6 +221,7 @@ public sealed class CaseExportService
         string qualityRows = string.Join(Environment.NewLine, (data.Quality?.Collectors ?? [])
             .Select(c => $"<tr><td>{H(c.Collector)}</td><td>{H(c.Status)}</td><td>{c.EventsReceived}</td><td>{c.EventsDropped}</td><td>{H(c.Message)}</td></tr>"));
         string triage = BuildNonPeTriageHtml(data.StaticAnalysis?.NonPeTriage);
+        string commands = "<h2>Normalized Command Chains</h2><table><thead><tr><th>Status</th><th>LOLBin</th><th>Original</th><th>Normalized</th><th>Evidence</th></tr></thead><tbody>" + string.Join(string.Empty, data.NormalizedCommands.Select(c => $"<tr><td>{H(c.Status)}</td><td>{H(c.LolBin)}</td><td>{H(c.Original)}</td><td>{H(c.Normalized)}</td><td>{H(string.Join(',', c.EvidenceEventIds ?? []))}</td></tr>")) + "</tbody></table>";
 
         return $$"""
 <!doctype html>
@@ -248,6 +258,7 @@ th,td{padding:9px 10px;border-bottom:1px solid #1f3044;text-align:left}th{backgr
 <p>Overall: {{H(data.Quality?.OverallStatus ?? "not recorded")}} | Network: {{H(data.Quality?.NetworkContainment ?? "not recorded")}}</p>
 <table><thead><tr><th>Collector</th><th>Status</th><th>Events</th><th>Dropped</th><th>Message</th></tr></thead><tbody>{{qualityRows}}</tbody></table>
 {{triage}}
+{{commands}}
 <h2>Analyst Notes</h2><p>{{H(data.AnalystNotes)}}</p>
 </main>
 </body>
@@ -288,6 +299,7 @@ CREATE TABLE network_sessions(process TEXT, domain TEXT, resolved_ip TEXT, remot
 CREATE TABLE case_quality(json TEXT);
 CREATE TABLE raw_evidence(json TEXT);
 CREATE TABLE preserved_files(json TEXT);
+CREATE TABLE normalized_commands(json TEXT);
 CREATE INDEX ix_events_time ON events(time);
 CREATE INDEX ix_events_process ON events(process);
 CREATE INDEX ix_events_category ON events(category);
@@ -317,6 +329,7 @@ CREATE INDEX ix_events_category ON events(category);
             }
             Execute(connection, transaction, "INSERT INTO raw_evidence VALUES($json)", ("$json", JsonSerializer.Serialize(data.RawEvidence, JsonDefaults.Options)));
             Execute(connection, transaction, "INSERT INTO preserved_files VALUES($json)", ("$json", JsonSerializer.Serialize(data.PreservedFiles ?? [], JsonDefaults.Options)));
+            foreach (var item in data.NormalizedCommands) Execute(connection, transaction, "INSERT INTO normalized_commands VALUES($json)", ("$json", JsonSerializer.Serialize(item, JsonDefaults.Options)));
 
             foreach (var p in data.Processes)
             {

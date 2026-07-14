@@ -38,6 +38,11 @@ public sealed class PrivacyRedactor
                 RemoteIp = RedactText(n.RemoteIp)
             }).ToArray(),
             AnalystNotes = RedactText(data.AnalystNotes)
+            ,NormalizedCommands = data.NormalizedCommands.Select(c => c with
+            {
+                Original = RedactText(c.Original), Normalized = RedactText(c.Normalized),
+                FailureReason = RedactText(c.FailureReason), LolBin = RedactText(c.LolBin), ProcessGuid = RedactText(c.ProcessGuid)
+            }).ToArray()
             ,RawEvidenceFiles = Array.Empty<string>(),
             PreservedFiles = Array.Empty<PreservedFile>()
             ,RawEvidence = Array.Empty<RawEvidenceFile>()
