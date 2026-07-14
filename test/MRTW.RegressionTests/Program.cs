@@ -72,6 +72,9 @@ var tests = new List<(string Name, Action Body)>
     ,("command normalization rejects malformed UTF text", TestCommandNormalizationMalformedUtf)
     ,("behavior evidence IDs follow final chronological event IDs", TestBehaviorEvidenceIdsAfterReindex)
     ,("command normalization degraded quality persists through JSON and SQLite", TestCommandNormalizationQualityRoundTrip)
+    ,("runtime normalized commands report the 257th finding as dropped", TestRuntimeNormalizedCommandFindingLimit)
+    ,("final ETW correlation preserves and combines command-normalization quality", TestFinalizeCaseCommandNormalizationQuality)
+    ,("existing behavior evidence JSON is not rewritten during correlation", TestExistingBehaviorRawJsonPreserved)
 };
 
 int failures = 0;
@@ -1175,6 +1178,58 @@ static void TestCommandNormalizationQualityRoundTrip()
         True(File.ReadAllText(Path.Combine(root, "case.json")).Contains("command-normalization-limit", StringComparison.Ordinal), "quality missing from JSON");
     }
     finally { SqliteConnection.ClearAllPools(); if (Directory.Exists(root)) Directory.Delete(root, true); }
+}
+
+static void TestRuntimeNormalizedCommandFindingLimit()
+{
+    string command = "powershell -enc " + Convert.ToBase64String(Encoding.Unicode.GetBytes("Get-Date"));
+    var events = Enumerable.Range(1, CommandNormalizationBudget.MaxFindings + 1)
+        .Select(id => new TimelineEvent(id, TimeSpan.FromSeconds(id), "powershell.exe", id, EventCategory.Process,
+            "Process Start", command, "", EventSeverity.Low, "Hook", "{}"))
+        .ToArray();
+    var budget = new CommandNormalizationBudget();
+    var commands = RuntimeCaseCollector.NormalizeCapturedCommands(events, budget);
+    Equal(CommandNormalizationBudget.MaxFindings, commands.Count);
+    True(budget.Exhausted && budget.Dropped == 1, "the 257th normalized finding was silently truncated");
+    var quality = RuntimeCaseCollector.AddCommandNormalizationQuality(
+        new CaseQuality("healthy", [], "observe", true), budget, DateTimeOffset.UtcNow);
+    var health = quality.Collectors.Single(collector => collector.Collector == "CommandNormalization");
+    Equal("degraded", quality.OverallStatus); Equal(1L, health.EventsDropped);
+}
+
+static void TestFinalizeCaseCommandNormalizationQuality()
+{
+    DateTimeOffset started = DateTimeOffset.UtcNow;
+    string sample = Environment.ProcessPath ?? typeof(AnalysisOrchestrator).Assembly.Location;
+    var profile = new ExecutionProfile(sample, "exe", "none", null, $"\"{sample}\"", Path.GetDirectoryName(sample)!, 1, true, false, false, false, "observe", ExecuteTarget: false);
+    var prior = new CollectorHealth("CommandNormalization", "degraded", started, started,
+        CommandNormalizationBudget.MaxFindings, 3, "command-normalization-limit");
+    var data = new CaseData("quality-merge", "quality-merge", "sample.exe", sample, "hash", started,
+        TimeSpan.Zero, null, [], [], [], [], "", new CaseQuality("degraded", [prior], "observe", true));
+    var etwEvents = Enumerable.Range(1, CommandNormalizationBudget.MaxInputs + 1)
+        .Select(id => new TimelineEvent(id, TimeSpan.FromMilliseconds(id), "etw.exe", id, EventCategory.Process,
+            "Process Start", "not-encoded", "", EventSeverity.Low, "ETW", "{}", CapturedAtUtc: started.AddMilliseconds(id)))
+        .ToArray();
+    var etw = new EtwCollectionResult(true, true, null, etwEvents, [], EventsReceived: etwEvents.Length, TargetBound: true);
+    using var containment = NetworkContainmentService.Apply(profile);
+    var finalized = AnalysisOrchestrator.FinalizeCase(data, etw, profile, containment, started, started, started.AddSeconds(2));
+    var health = finalized.Quality!.Collectors.Single(collector => collector.Collector == "CommandNormalization");
+    Equal("degraded", finalized.Quality.OverallStatus);
+    True(health.EventsDropped > prior.EventsDropped, "ETW correlation budget exhaustion was not combined with runtime quality");
+    True(health.Message.Contains("runtime and ETW", StringComparison.Ordinal), "combined normalization quality message missing");
+}
+
+static void TestExistingBehaviorRawJsonPreserved()
+{
+    string legacyRaw = "{\"evidence_event_ids\":[999],\"imported\":true}";
+    string command = "powershell -enc " + Convert.ToBase64String(Encoding.Unicode.GetBytes("Get-Date"));
+    var importedBehavior = new TimelineEvent(90, TimeSpan.Zero, "legacy.exe", 7, EventCategory.Behavior,
+        "Imported Finding", "", "", EventSeverity.Low, "Imported", legacyRaw);
+    var raw = new TimelineEvent(2, TimeSpan.FromSeconds(1), "powershell.exe", 7, EventCategory.Process,
+        "Process Start", command, "", EventSeverity.Low, "Hook", "{}");
+    var correlated = BehaviorCorrelator.Correlate([importedBehavior, raw]);
+    Equal(legacyRaw, correlated.Single(item => item.Action == "Imported Finding").RawJson);
+    True(correlated.Any(item => item.Action == "Encoded Command Decoded"), "new behavior was not produced for the control event");
 }
 
 static void True(bool condition, string message)

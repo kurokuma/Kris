@@ -435,13 +435,7 @@ public sealed class RuntimeCaseCollector
         var commandBudget = new CommandNormalizationBudget();
         var correlatedEvents = BehaviorCorrelator.Correlate(eventsWithProcessGuids, commandBudget);
         correlatedEvents = AttachProcessGuids(correlatedEvents, processes, caseId, started);
-        var normalizedCommands = correlatedEvents
-            .Where(e => e.Category == EventCategory.Process || e.Source.Equals("Hook", StringComparison.OrdinalIgnoreCase))
-            .SelectMany(e => CommandNormalizationService.Normalize(e.ObjectValue, commandBudget).Concat(CommandNormalizationService.Normalize(e.Summary, commandBudget))
-                .Where(c => c.Status != "not-encoded" || !string.IsNullOrWhiteSpace(c.LolBin))
-                .Where(c => commandBudget.TryAddFinding())
-                .Select(c => c with { ProcessGuid = e.ProcessGuid, Pid = e.Pid, Time = e.Time, EvidenceEventIds = [e.Id] }))
-            .Take(256).ToArray();
+        var normalizedCommands = NormalizeCapturedCommands(correlatedEvents, commandBudget);
         var artifacts = BuildArtifacts(correlatedEvents, processes, started);
         string sampleName = Path.GetFileName(profile.TargetPath);
         string sha = staticAnalysis?.Sha256 ?? "unknown";
@@ -469,7 +463,19 @@ public sealed class RuntimeCaseCollector
             PreservedFiles: preservedFiles) { TrustedEvidenceRoot = EvidencePathPolicy.Root(caseId), NormalizedCommands = normalizedCommands };
     }
 
-    private static CaseQuality AddCommandNormalizationQuality(CaseQuality quality, CommandNormalizationBudget budget, DateTimeOffset started)
+    // Do not add a downstream Take(MaxFindings) here. TryAddFinding must see the
+    // first rejected item so that analysts are told the normalized-command view is
+    // incomplete rather than silently receiving a truncated result.
+    internal static IReadOnlyList<NormalizedCommand> NormalizeCapturedCommands(IReadOnlyList<TimelineEvent> events, CommandNormalizationBudget commandBudget) =>
+        events
+            .Where(e => e.Category == EventCategory.Process || e.Source.Equals("Hook", StringComparison.OrdinalIgnoreCase))
+            .SelectMany(e => CommandNormalizationService.Normalize(e.ObjectValue, commandBudget).Concat(CommandNormalizationService.Normalize(e.Summary, commandBudget))
+                .Where(c => c.Status != "not-encoded" || !string.IsNullOrWhiteSpace(c.LolBin))
+                .Where(c => commandBudget.TryAddFinding())
+                .Select(c => c with { ProcessGuid = e.ProcessGuid, Pid = e.Pid, Time = e.Time, EvidenceEventIds = [e.Id] }))
+            .ToArray();
+
+    internal static CaseQuality AddCommandNormalizationQuality(CaseQuality quality, CommandNormalizationBudget budget, DateTimeOffset started)
     {
         if (!budget.Exhausted) return quality;
         return quality with { OverallStatus = "degraded", Collectors = quality.Collectors.Concat([new CollectorHealth("CommandNormalization", "degraded", started, DateTimeOffset.UtcNow, CommandNormalizationBudget.MaxFindings, budget.Dropped, "command-normalization-limit")]).ToArray() };

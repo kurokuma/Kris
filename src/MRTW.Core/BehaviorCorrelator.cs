@@ -13,6 +13,10 @@ public static class BehaviorCorrelator
         }
 
         var output = events.OrderBy(e => e.Time).ToList();
+        // Only findings created during this invocation own evidence references that
+        // need rebasing. Existing case behavior can be imported from another case
+        // and must remain byte-for-byte intact.
+        int inputEventCount = output.Count;
         commandBudget ??= new CommandNormalizationBudget();
         int nextId = output.Count == 0 ? 1 : output.Max(e => e.Id) + 1;
         // Configurable rules are untrusted input.  Keep their total work bounded across
@@ -50,10 +54,14 @@ public static class BehaviorCorrelator
             .Select((timelineEvent, index) => (timelineEvent.Id, NewId: index + 1))
             .GroupBy(value => value.Id)
             .ToDictionary(group => group.Key, group => group.First().NewId);
+        var generatedBehaviorIds = output.Skip(inputEventCount)
+            .Where(timelineEvent => timelineEvent.Category == EventCategory.Behavior)
+            .Select(timelineEvent => timelineEvent.Id)
+            .ToHashSet();
         return ordered.Select((timelineEvent, index) => timelineEvent with
         {
             Id = index + 1,
-            RawJson = timelineEvent.Category == EventCategory.Behavior
+            RawJson = generatedBehaviorIds.Contains(timelineEvent.Id)
                 ? RewriteEvidenceEventIds(timelineEvent.RawJson, idMap)
                 : timelineEvent.RawJson
         }).ToArray();

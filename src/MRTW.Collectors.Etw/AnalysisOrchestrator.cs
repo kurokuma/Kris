@@ -78,7 +78,7 @@ public sealed class AnalysisOrchestrator
         return FinalizeCase(data, etw, profile, containment, orchestrationStarted, etwStarted, ended);
     }
 
-    private static CaseData FinalizeCase(
+    internal static CaseData FinalizeCase(
         CaseData data,
         EtwCollectionResult? etw,
         ExecutionProfile profile,
@@ -103,7 +103,8 @@ public sealed class AnalysisOrchestrator
 
         var processes = MergeProcessNodes(data, combined);
         combined = AttachProcessGuids(combined, processes, data).ToArray();
-        combined = BehaviorCorrelator.Correlate(combined).ToArray();
+        var combinedCommandBudget = new CommandNormalizationBudget();
+        combined = BehaviorCorrelator.Correlate(combined, combinedCommandBudget).ToArray();
         var artifacts = BuildArtifacts(combined, processes, data.StartedAt);
         var network = data.NetworkSessions
             .Concat(etw?.NetworkSessions ?? [])
@@ -141,6 +142,17 @@ public sealed class AnalysisOrchestrator
                 etwStarted, ended, etw?.NetworkSessionsReceived ?? 0, etw?.NetworkSessionsDropped ?? 0,
                 (etw?.CaptureLimitReason ?? "") + $" network_limit={profile.MaxPersistedNetworkSessions};network_received={(etw?.NetworkSessionsReceived ?? 0)};network_dropped={(etw?.NetworkSessionsDropped ?? 0)}.")
         };
+        var priorCommandNormalization = data.Quality?.Collectors
+            .Where(collector => collector.Collector.Equals("CommandNormalization", StringComparison.OrdinalIgnoreCase))
+            .ToArray() ?? [];
+        if (priorCommandNormalization.Length > 0 || combinedCommandBudget.Exhausted)
+        {
+            long dropped = priorCommandNormalization.Sum(collector => collector.EventsDropped) + combinedCommandBudget.Dropped;
+            long received = Math.Max(CommandNormalizationBudget.MaxFindings,
+                priorCommandNormalization.Sum(collector => collector.EventsReceived));
+            collectors.Add(new CollectorHealth("CommandNormalization", "degraded", runtimeStarted, ended, received, dropped,
+                "command-normalization-limit; runtime and ETW-correlated normalization budgets are combined."));
+        }
         string overall = captureBounded || collectors.Any(c => c.Status == "degraded" || c.Status == "unavailable" && c.Collector != "Hook")
             ? "degraded"
             : "healthy";
