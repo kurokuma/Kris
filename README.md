@@ -179,6 +179,7 @@ dotnet run --project src\MRTW.Cli -- run `
 | `--overwrite` / `--auto-suffix` | 出力先衝突時の挙動 |
 | `--config <path>` | 設定ファイルを指定 |
 | `--log-format json` | CLIログをJSONで出力 |
+| `--summary <path>` | `batch`の検体別結果を原子的にJSON保存 |
 
 ネットワークモード:
 
@@ -208,6 +209,9 @@ dotnet run --project src\MRTW.Cli -- batch `
   --input C:\Samples `
   --recursive `
   --max-samples 10 `
+  --execute off `
+  --privacy-mode on `
+  --summary out\batch-summary.json `
   --out out\cases
 
 # 対象を実行しない自己診断ケース
@@ -215,6 +219,8 @@ dotnet run --project src\MRTW.Cli -- selftest --out out\selftest
 ```
 
 `open` コマンドはケースの存在を検証してパスを表示します。現時点ではGUIを自動起動しません。
+
+`batch` は検体単位で失敗を隔離し、残りのEXE/DLLを継続して処理します。完了時に成功・失敗・スキップ件数と各検体の結果を表示し、`--log-format json` では検体ごとの `analysis_completed`／`analysis_failed` イベントを出力した後、最後に `batch_completed` JSONイベントを出力します。`--summary` は同じ集計構造のJSONを原子的に保存します。1件以上の検体が失敗した場合の終了コードは **10** です。入力ディレクトリやCLI引数自体の誤りは従来どおりバッチ全体のエラーです。Privacy Modeではバッチの標準出力・JSONサマリー内の対象パス、ケース出力先、例外詳細をマスクします。`block`/`isolated` のcontainment失敗は `observe` に降格せず、その検体を失敗として記録します。`batch` では `--cmd` を受け付けません。列挙した検体と実行対象が乖離し、検体単位のcontainmentを保証できなくなるためです。
 
 ## ケース出力
 

@@ -5,6 +5,7 @@ return await CliApp.RunAsync(args);
 
 internal static class CliApp
 {
+    private static readonly System.Text.Json.JsonSerializerOptions CliJsonOptions = new(JsonDefaults.Options) { WriteIndented = false };
     public static Task<int> RunAsync(string[] args)
     {
         try
@@ -108,7 +109,7 @@ internal static class CliApp
         return 0;
     }
 
-    private static int Run(Dictionary<string, string?> options, bool json)
+    private static int Run(Dictionary<string, string?> options, bool json, bool logCompletion = true, Action<RunCompletion>? completed = null)
     {
         var config = new MrtwConfigService().Load(Get(options, "config"));
         var profileDefaults = ResolveProfile(config, Get(options, "profile"));
@@ -165,13 +166,17 @@ internal static class CliApp
 
         var data = new AnalysisCaseRunner().Run(profile, output, exportOptions, Get(options, "case-name"), options.ContainsKey("overwrite"), options.ContainsKey("auto-suffix"));
         string casePath = Path.Combine(output, data.CaseName);
-        Log(json, "analysis_completed", new Dictionary<string, object?>
+        completed?.Invoke(new RunCompletion(data.CaseId, casePath, data.Events.Count, data.Processes.Count));
+        if (logCompletion)
         {
-            ["case_id"] = data.CaseId,
-            ["path"] = casePath,
-            ["events"] = data.Events.Count,
-            ["processes"] = data.Processes.Count
-        }, $"[+] Case created: {casePath}\n[+] Static analysis completed\n[+] Runtime collector started\n[+] Snapshot diff completed\n[+] Analysis completed\n[+] Exported: report.html, case.json, events.jsonl, case.sqlite");
+            Log(json, "analysis_completed", new Dictionary<string, object?>
+            {
+                ["case_id"] = data.CaseId,
+                ["path"] = casePath,
+                ["events"] = data.Events.Count,
+                ["processes"] = data.Processes.Count
+            }, $"[+] Case created: {casePath}\n[+] Static analysis completed\n[+] Runtime collector started\n[+] Snapshot diff completed\n[+] Analysis completed\n[+] Exported: report.html, case.json, events.jsonl, case.sqlite");
+        }
         return 0;
     }
 
@@ -218,15 +223,28 @@ internal static class CliApp
 
     private static int Batch(Dictionary<string, string?> options, bool json)
     {
+        BatchAnalysisPolicy.RejectCommandOverride(options.ContainsKey("cmd"));
         string input = Required(options, "input");
+        if (!Directory.Exists(input))
+        {
+            throw new DirectoryNotFoundException($"Batch input directory was not found: {input}");
+        }
+
         var config = new MrtwConfigService().Load(Get(options, "config"));
         string output = Get(options, "out") ?? config.Workspace;
         int max = int.TryParse(Get(options, "max-samples"), out int m) ? m : int.MaxValue;
+        if (max < 0)
+        {
+            throw new ArgumentException("--max-samples must be zero or greater.");
+        }
+
         bool recursive = options.ContainsKey("recursive");
+        bool privacyMode = GetOnOff(options, "privacy-mode", false);
         var files = Directory.EnumerateFiles(input, "*.*", recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly)
             .Where(f => string.Equals(Path.GetExtension(f), ".exe", StringComparison.OrdinalIgnoreCase) || string.Equals(Path.GetExtension(f), ".dll", StringComparison.OrdinalIgnoreCase))
+            .OrderBy(f => f, StringComparer.OrdinalIgnoreCase)
             .Take(max);
-        int count = 0;
+        var items = new List<BatchAnalysisItem>();
         foreach (string file in files)
         {
             var batchOptions = new Dictionary<string, string?>(options, StringComparer.OrdinalIgnoreCase)
@@ -235,10 +253,143 @@ internal static class CliApp
                 ["out"] = output,
                 ["case-name"] = null
             };
-            count += Run(batchOptions, json) == 0 ? 1 : 0;
+            RunCompletion? completion = null;
+            try
+            {
+                int code = Run(batchOptions, json, logCompletion: false, completed: result => completion = result);
+                BatchAnalysisItem item = code == 0
+                    ? BatchItem(file, "succeeded", code, null, completion?.CaseOutput, privacyMode)
+                    : BatchItem(file, "failed", code, $"Run returned exit code {code}.", completion?.CaseOutput, privacyMode);
+                items.Add(item);
+                if (json && code == 0 && completion is not null)
+                {
+                    Log(true, "analysis_completed", new Dictionary<string, object?>
+                    {
+                        ["case_id"] = completion.CaseId,
+                        ["path"] = item.CaseOutput,
+                        ["target"] = item.Target,
+                        ["events"] = completion.Events,
+                        ["processes"] = completion.Processes
+                    }, string.Empty);
+                }
+                else if (json && code != 0)
+                {
+                    Log(true, "analysis_failed", new Dictionary<string, object?>
+                    {
+                        ["target"] = item.Target,
+                        ["message"] = item.Reason,
+                        ["code"] = item.ExitCode
+                    }, string.Empty);
+                }
+            }
+            catch (Exception ex)
+            {
+                // A containment failure is a failure for this target.  Do not alter its requested mode or retry in observe mode.
+                BatchAnalysisItem item = BatchItem(file, "failed", BatchTargetExceptionCode(ex), ex.Message, completion?.CaseOutput, privacyMode);
+                items.Add(item);
+                if (json)
+                {
+                    Log(true, "analysis_failed", new Dictionary<string, object?>
+                    {
+                        ["target"] = item.Target,
+                        ["message"] = item.Reason,
+                        ["code"] = item.ExitCode
+                    }, string.Empty);
+                }
+            }
         }
-        Console.WriteLine($"[+] Batch completed: {count} sample(s)");
-        return 0;
+
+        var summary = new BatchAnalysisSummary(
+            DateTimeOffset.UtcNow,
+            items.Count(i => i.Status == "succeeded"),
+            items.Count(i => i.Status == "failed"),
+            items.Count(i => i.Status == "skipped"),
+            items);
+        string? summaryPath = Get(options, "summary");
+        if (!string.IsNullOrWhiteSpace(summaryPath))
+        {
+            WriteSummaryAtomically(summaryPath, summary);
+        }
+
+        if (json)
+        {
+            Log(true, "batch_completed", BatchFields(summary), string.Empty);
+        }
+        else
+        {
+            Console.WriteLine($"[+] Batch completed: succeeded={summary.Succeeded}, failed={summary.Failed}, skipped={summary.Skipped}, exit_code={summary.ExitCode}");
+            foreach (BatchAnalysisItem item in summary.Items)
+            {
+                Console.WriteLine($"[{item.Status.ToUpperInvariant()}] {item.Target} (exit={item.ExitCode}){(string.IsNullOrWhiteSpace(item.Reason) ? string.Empty : $": {item.Reason}")}{(string.IsNullOrWhiteSpace(item.CaseOutput) ? string.Empty : $" -> {item.CaseOutput}")}");
+            }
+            if (!string.IsNullOrWhiteSpace(summaryPath))
+            {
+                Console.WriteLine($"[+] Batch summary: {(privacyMode ? "<redacted>" : Path.GetFullPath(summaryPath))}");
+            }
+        }
+
+        return summary.ExitCode;
+    }
+
+    private static BatchAnalysisItem BatchItem(string target, string status, int exitCode, string? reason, string? caseOutput, bool privacyMode)
+    {
+        if (!privacyMode)
+        {
+            return new BatchAnalysisItem(target, status, exitCode, reason, caseOutput);
+        }
+
+        return new BatchAnalysisItem(
+            "<redacted>",
+            status,
+            exitCode,
+            string.IsNullOrWhiteSpace(reason) ? null : "<redacted>",
+            string.IsNullOrWhiteSpace(caseOutput) ? null : "<redacted>");
+    }
+
+    private static int BatchTargetExceptionCode(Exception exception) => exception switch
+    {
+        FileNotFoundException => 2,
+        UnauthorizedAccessException => 8,
+        _ => 3
+    };
+
+    private static Dictionary<string, object?> BatchFields(BatchAnalysisSummary summary) => new()
+    {
+        ["completed_at_utc"] = summary.CompletedAtUtc,
+        ["succeeded"] = summary.Succeeded,
+        ["failed"] = summary.Failed,
+        ["skipped"] = summary.Skipped,
+        ["exit_code"] = summary.ExitCode,
+        ["items"] = summary.Items
+    };
+
+    private static void WriteSummaryAtomically(string summaryPath, BatchAnalysisSummary summary)
+    {
+        string destination = Path.GetFullPath(summaryPath);
+        string? directory = Path.GetDirectoryName(destination);
+        if (string.IsNullOrWhiteSpace(directory))
+        {
+            throw new ArgumentException("--summary must include a file name.");
+        }
+
+        Directory.CreateDirectory(directory);
+        string temporary = Path.Combine(directory, $".{Path.GetFileName(destination)}.{Guid.NewGuid():N}.tmp");
+        try
+        {
+            using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            using (var writer = new StreamWriter(stream, new System.Text.UTF8Encoding(false)))
+            {
+                writer.Write(System.Text.Json.JsonSerializer.Serialize(BatchFields(summary), JsonDefaults.Options));
+                writer.Flush();
+                stream.Flush(true);
+            }
+            File.Move(temporary, destination, true);
+        }
+        catch
+        {
+            try { File.Delete(temporary); } catch { }
+            throw;
+        }
     }
 
     private static int SelfTest(Dictionary<string, string?> options, bool json)
@@ -380,7 +531,7 @@ internal static class CliApp
         {
             fields["level"] = "info";
             fields["event"] = evt;
-            Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(fields, JsonDefaults.Options));
+            Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(fields, CliJsonOptions));
         }
         else
         {
@@ -392,7 +543,7 @@ internal static class CliApp
     {
         if (json)
         {
-            Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(new { level = "error", message, code }, JsonDefaults.Options));
+            Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(new { level = "error", message, code }, CliJsonOptions));
         }
         else
         {
@@ -415,10 +566,12 @@ Usage:
   mrtw run --target <path> --profile full-capture --privacy-mode on
   mrtw export --case <case.sqlite|case dir> --format html,csv,json --out <dir>
   mrtw etw-smoke --duration 3
-  mrtw batch --input <dir> --out <dir>
+  mrtw batch --input <dir> --out <dir> [--summary <path>]  (does not support --cmd)
   mrtw selftest --out <dir>
   mrtw list --workspace <dir>
   mrtw open --case <case.sqlite|case dir>
 """);
     }
+
+    private sealed record RunCompletion(string CaseId, string CaseOutput, int Events, int Processes);
 }

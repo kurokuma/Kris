@@ -40,6 +40,8 @@ var tests = new List<(string Name, Action Body)>
     ,("unbound pre-launch raw ETL is discarded", TestUnboundPrelaunchRawDiscard)
     ,("cancelled pre-launch raw ETL is discarded", TestCanceledPrelaunchRawDiscard)
     ,("pre-launch arm failure completes without raw evidence", TestPrelaunchArmFailure)
+    ,("batch summary uses a stable partial-failure exit code", TestBatchSummary)
+    ,("batch rejects command overrides before target execution", TestBatchCommandOverride)
 };
 
 int failures = 0;
@@ -64,6 +66,24 @@ static void TestNetworkModes()
     Equal("observe", NetworkContainmentService.NormalizeMode("on"));
     Equal("block", NetworkContainmentService.NormalizeMode("off"));
     Equal("isolated", NetworkContainmentService.NormalizeMode("isolate"));
+}
+
+static void TestBatchSummary()
+{
+    var partial = new BatchAnalysisSummary(DateTimeOffset.UtcNow, 1, 1, 0,
+    [
+        new BatchAnalysisItem("ok.dll", "succeeded", 0, null, "case"),
+        new BatchAnalysisItem("bad.exe", "failed", 3, "invalid", null)
+    ]);
+    Equal(10, partial.ExitCode);
+    var success = partial with { Failed = 0 };
+    Equal(0, success.ExitCode);
+}
+
+static void TestBatchCommandOverride()
+{
+    Throws<ArgumentException>(() => BatchAnalysisPolicy.RejectCommandOverride(true));
+    BatchAnalysisPolicy.RejectCommandOverride(false);
 }
 
 static void TestPrelaunchEtwSafety()

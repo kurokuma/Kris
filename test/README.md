@@ -20,6 +20,7 @@ This folder contains benign validation helpers for MRTW.
 - `NativeExportProbe`: a harmless DLL that exports `DllRegisterServer`, `Start`, and `Run` for validating PE export table parsing and rundll32 export selection.
 - `MRTW.RegressionTests`: a dependency-free executable regression suite for P0 orchestration, containment-mode validation, UTC event timestamps, SQLite quality round-trips, and deterministic behavior correlation.
 - `MRTW.ProbeTests`: launches the built SafeRuntimeProbe and asserts only loopback HTTP/TCP, UDP, local-only address mapping and cleanup observation. The native direct runner is skipped unless `MRTW_NATIVE_SAFE_PROBE_PATH` explicitly names a built benign binary.
+- `Run-CliBatchIntegration.ps1`: runs the built CLI against a benign DLL and a deliberately unreadable EXE with execution disabled. It verifies per-target failure isolation, exit code 10, per-target JSON events plus final summary equivalence, Privacy Mode masking, and rejection of `batch --cmd` before a command or target can run.
 
 Use `SafeRuntimeProbe` as a real target for hook/ETW smoke tests. Use `SyntheticBehaviorCase` for UI, filtering, and behavior-correlation validation.
 Use `StaticAnalysisProbe` as a stable target for `mrtw static` and string/classification checks. For this .NET sample, point static analysis at `bin\Release\net9.0\StaticAnalysisProbe.dll`; the generated `.exe` is the .NET apphost and mostly contains host/runtime strings.
@@ -29,6 +30,7 @@ Run the regression suite with:
 ```powershell
 dotnet run --project test\MRTW.RegressionTests -c Release
 dotnet run --project test\MRTW.ProbeTests -c Release
+powershell -ExecutionPolicy Bypass -File test\Run-CliBatchIntegration.ps1
 ```
 
 ## Opt-in Windows integration and GUI smoke tests
