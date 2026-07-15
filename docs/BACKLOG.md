@@ -1,13 +1,13 @@
 # Backlog
 
-> 2026-07-15 update: TASK-011 is complete. Bounded, read-only command normalization covers Base64 PowerShell text and LOLBin chains without invoking a decoder or external process. TASK-013 remains the non-PE first-look triage implementation.
+> 2026-07-16 update: TASK-012 is complete. Bounded, read-only host-security snapshots cover hosts, proxy, Explorer, Defender, Firewall, and Security Center settings without invoking a setter, CLI, PowerShell, or service-control API. Registry enumeration, value-size, and read-time re-size limits are also surfaced as Collection Quality.
 
 ## 概要
 
-- 最終更新日: 2026-07-15
+- 最終更新日: 2026-07-16
 - 調査対象: `README.md`、`docs/`、`src/MRTW.Core/`、`src/MRTW.Collectors.Etw/`、`src/MRTW.Cli/`、`src/MRTW.App/`、`src/MRTW.Native/`、`test/`
 - 主要な懸念: 高頻度イベント時の収集メモリ上限、短命プロセスのETW開始タイミング、Windows永続化面の観測不足、スクリプト／非PE形式の分析不足、Windows実環境での統合試験不足、Privacy Modeとバッチ実行の検証不足
-- 次に着手すべきタスク: TASK-012
+- 次に着手すべきタスク: なし（P1は完了）
 
 このバックログは、現在の実装・文書・テストから確認できた未対応事項だけを記録する。完了済みのP0/P1 GUI停止・ライブ表示・SQLite入力上限の修正は、重複して登録しない。
 
@@ -198,17 +198,18 @@
 
 ### TASK-012: ホスト設定・セキュリティ設定改ざんの観測範囲を追加する
 
-- 状態: 未着手
+- 状態: 完了
 - 規模: M
 - 概要: Run/RunOnce以外のレジストリ値、hostsファイル、WinHTTP/WinINet proxy、Defender除外、Firewall rule等の改ざんは、感染後のC2中継、検知回避、通信妨害を分析する重要な根拠になるが、現在のスナップショット差分では網羅されない。
 - 根拠: `src/MRTW.Core/SnapshotService.cs`は限定されたレジストリ永続化面を収集する。`src/MRTW.Core/BehaviorCorrelator.cs`はWinINet/WinHTTP API観測からProxyを示すが、設定値のbefore/after証拠を取得しない。MITRE ATT&CKの[Modify Registry (T1112)](https://attack.mitre.org/techniques/T1112/)は設定・永続化・防御回避目的のレジストリ改変を、[Hide Artifacts (T1564)](https://attack.mitre.org/techniques/T1564/)は隠し属性・パス除外等の痕跡隠蔽を扱う。
 - 対象: `src/MRTW.Core/SnapshotService.cs`、`src/MRTW.Core/RuntimeCaseCollector.cs`、`src/MRTW.Core/BehaviorCorrelator.cs`、`src/MRTW.Core/Models.cs`、`test/SafeRuntimeProbe/`
 - 実装内容: hosts、proxy設定、ユーザー／マシンの主要なExplorer・Defender・Firewall・Security Center関連設定を、読み取り可能な範囲でbefore/after比較する。変更はキー／値またはファイルdiff、権限状態、収集対象バージョンを添えてタイムライン化する。危険な設定を変更するテストは使わず、事前作成した安全な一時キーとモック可能な抽象化で検証する。
 - 完了条件:
-  - [ ] hosts・proxy・選定した設定面ごとに、変更／未変更／読み取り不能を区別して出力する
-  - [ ] 設定変更のタイムラインには根拠パス・値名・旧値／新値（Privacy Mode適用後）がある
-  - [ ] 収集器自身がFirewall・Defender・hosts設定を変更しないことをテストで確認する
-  - [ ] 関連テストが成功する
+  - [x] hosts・proxy・選定した設定面ごとに、変更／未変更／読み取り不能を区別して出力する
+  - [x] 設定変更のタイムラインには根拠パス・値名・旧値／新値（Privacy Mode適用後）がある
+  - [x] 収集器自身がFirewall・Defender・hosts設定を変更しないことをテストで確認する
+  - [x] レジストリのエントリ・名前・値サイズ上限、および読取り中の再サイズをCollection Qualityへ記録し、部分値を出力しない
+  - [x] 関連テストが成功する
 - 依存関係: なし（隔離VM統合試験は利用者要求によりバックログ対象外）
 - リスク・注意点: セキュリティ製品設定やhostsの実値は機微情報を含む。Privacy Mode、管理者権限、製品差分、OSバージョン差を明示すること。
 

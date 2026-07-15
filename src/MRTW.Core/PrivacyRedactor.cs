@@ -21,12 +21,9 @@ public sealed class PrivacyRedactor
                 CommandLine = RedactText(p.CommandLine),
                 ImagePath = RedactText(p.ImagePath)
             }).ToArray(),
-            Events = data.Events.Select(e => e with
-            {
-                ObjectValue = RedactText(e.ObjectValue),
-                Summary = RedactText(e.Summary),
-                RawJson = RedactText(e.RawJson)
-            }).ToArray(),
+            Events = data.Events.Select(e => e.Source.Equals("HostSecuritySnapshot", StringComparison.OrdinalIgnoreCase)
+                ? e with { ObjectValue = RedactText(e.ObjectValue), Summary = "<HOST_SECURITY_CONFIGURATION_REDACTED>", RawJson = "<HOST_SECURITY_CONFIGURATION_REDACTED>" }
+                : e with { ObjectValue = RedactText(e.ObjectValue), Summary = RedactText(e.Summary), RawJson = RedactText(e.RawJson) }).ToArray(),
             Artifacts = data.Artifacts.Select(a => a with
             {
                 Value = RedactText(a.Value),

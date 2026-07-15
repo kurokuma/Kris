@@ -421,6 +421,7 @@ public sealed class RuntimeCaseCollector
         }
         AddSnapshotEvents(Add, diff, started, ref nextId);
         AddPersistenceEvents(Add, diff, started, ref nextId);
+        AddHostSecurityEvents(Add, diff, started, ref nextId);
         AddNetworkEvents(Add, item => networks.TryAdd(item), diff, seenTcpConnections, started, ref nextId);
         if (callbackFailures > 0)
         {
@@ -459,7 +460,7 @@ public sealed class RuntimeCaseCollector
             artifacts,
             networks.ToArray(),
             notes,
-            Quality: AddCommandNormalizationQuality(RuntimeQuality(events, networks, started, before.PersistenceQuality, after.PersistenceQuality), commandBudget, started),
+            Quality: AddCommandNormalizationQuality(RuntimeQuality(events, networks, started, before.PersistenceQuality, after.PersistenceQuality, before.HostSecurityQuality, after.HostSecurityQuality), commandBudget, started),
             PreservedFiles: preservedFiles) { TrustedEvidenceRoot = EvidencePathPolicy.Root(caseId), NormalizedCommands = normalizedCommands };
     }
 
@@ -1113,6 +1114,20 @@ public sealed class RuntimeCaseCollector
             add(Event(nextId++, DateTimeOffset.UtcNow - started, "snapshot", 0, PersistenceCategory(item.Surface), "Persistence Modified", item.Identity, PersistenceSummary(item), EventSeverity.High, "PersistenceSnapshot"));
         foreach (var item in diff.DeletedPersistenceEntries ?? [])
             add(Event(nextId++, DateTimeOffset.UtcNow - started, "snapshot", 0, PersistenceCategory(item.Surface), "Persistence Deleted", item.Identity, $"{item.Surface} persistence entry removed.", EventSeverity.Medium, "PersistenceSnapshot"));
+    }
+
+    private static void AddHostSecurityEvents(Action<TimelineEvent> add, SnapshotDiff diff, DateTimeOffset started, ref int nextId)
+    {
+        foreach (var item in diff.AddedHostSecurityEntries ?? [])
+            add(Event(nextId++, DateTimeOffset.UtcNow - started, "snapshot", 0, EventCategory.Registry, "Host Security Configuration Created", item.Identity, $"{item.Surface} configuration observed: {item.Value}", EventSeverity.High, "HostSecuritySnapshot"));
+        foreach (var change in diff.ModifiedHostSecurityChanges ?? [])
+        {
+            var payload = new { surface = change.After.Surface, identity = change.After.Identity, old_value = change.Before.Value, new_value = change.After.Value };
+            add(Event(nextId++, DateTimeOffset.UtcNow - started, "snapshot", 0, EventCategory.Registry, "Host Security Configuration Modified", change.After.Identity,
+                $"{change.After.Surface} configuration changed; old={change.Before.Value}; new={change.After.Value}", EventSeverity.High, "HostSecuritySnapshot") with { RawJson = JsonSerializer.Serialize(payload) });
+        }
+        foreach (var item in diff.DeletedHostSecurityEntries ?? [])
+            add(Event(nextId++, DateTimeOffset.UtcNow - started, "snapshot", 0, EventCategory.Registry, "Host Security Configuration Deleted", item.Identity, $"{item.Surface} configuration removed.", EventSeverity.Medium, "HostSecuritySnapshot"));
     }
 
     private static EventCategory PersistenceCategory(string surface) => surface switch

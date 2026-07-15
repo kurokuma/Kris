@@ -224,6 +224,10 @@ public static class BehaviorCorrelator
         {
             AddBehavior(output, persistenceEvents, ref nextId, "Persistence Established", "A read-only snapshot diff or runtime event identified an autostart persistence change.", EventSeverity.High, "T1547", "Boot or Logon Autostart Execution", "Medium");
         }
+
+        var hostSecurity = events.Where(e => e.Action is "Host Security Configuration Created" or "Host Security Configuration Modified").ToArray();
+        if (hostSecurity.Length > 0)
+            AddBehavior(output, hostSecurity, ref nextId, "Host Security Configuration Change", "A read-only before/after snapshot identified a hosts, proxy, Explorer, Defender, Firewall, or Security Center configuration change.", EventSeverity.High, "T1112", "Modify Registry", "Medium");
     }
 
     private static void AddCredentialAccess(List<TimelineEvent> output, IReadOnlyList<TimelineEvent> events, ref int nextId)

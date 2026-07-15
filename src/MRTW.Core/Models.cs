@@ -250,13 +250,25 @@ public sealed record PersistenceSnapshotEntry(
     string ExecutionTarget,
     string Fingerprint);
 
+/// <summary>Read-only, normalized host security/configuration observation. Values are never applied by MRTW.</summary>
+public sealed record HostSecuritySnapshotEntry(
+    string Surface,
+    string Identity,
+    string Value,
+    string Fingerprint);
+
+/// <summary>Append-only before/after pair for a host-security configuration change.</summary>
+public sealed record HostSecuritySnapshotChange(HostSecuritySnapshotEntry Before, HostSecuritySnapshotEntry After);
+
 public sealed record SnapshotData(
     DateTimeOffset CapturedAt,
     IReadOnlyList<FileSnapshotEntry> Files,
     IReadOnlyList<RegistrySnapshotEntry> RegistryValues,
     IReadOnlyList<string> TcpConnections,
     IReadOnlyList<PersistenceSnapshotEntry>? PersistenceEntries = null,
-    IReadOnlyList<CollectorHealth>? PersistenceQuality = null);
+    IReadOnlyList<CollectorHealth>? PersistenceQuality = null,
+    IReadOnlyList<HostSecuritySnapshotEntry>? HostSecurityEntries = null,
+    IReadOnlyList<CollectorHealth>? HostSecurityQuality = null);
 
 /// <summary>Bounded snapshot result used by interactive collection.</summary>
 public sealed record SnapshotCaptureResult(SnapshotData Data, bool Completed, bool Canceled, bool Bounded, string Note);
@@ -271,7 +283,11 @@ public sealed record SnapshotDiff(
     IReadOnlyList<string> NewTcpConnections,
     IReadOnlyList<PersistenceSnapshotEntry>? AddedPersistenceEntries = null,
     IReadOnlyList<PersistenceSnapshotEntry>? ModifiedPersistenceEntries = null,
-    IReadOnlyList<PersistenceSnapshotEntry>? DeletedPersistenceEntries = null);
+    IReadOnlyList<PersistenceSnapshotEntry>? DeletedPersistenceEntries = null,
+    IReadOnlyList<HostSecuritySnapshotEntry>? AddedHostSecurityEntries = null,
+    IReadOnlyList<HostSecuritySnapshotEntry>? ModifiedHostSecurityEntries = null,
+    IReadOnlyList<HostSecuritySnapshotEntry>? DeletedHostSecurityEntries = null,
+    IReadOnlyList<HostSecuritySnapshotChange>? ModifiedHostSecurityChanges = null);
 
 public sealed record ExecutionProfile(
     string TargetPath,

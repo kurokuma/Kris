@@ -49,6 +49,9 @@ var tests = new List<(string Name, Action Body)>
     ,("persistence surface timeout cancels an in-flight read", TestPersistenceSurfaceTimeout)
     ,("persistence surface entry limits retain a bounded result", TestPersistenceSurfaceLimit)
     ,("persistence timeout quality degrades the case", TestPersistenceTimeoutQuality)
+    ,("host security snapshots are read-only bounded and diffable", TestHostSecuritySnapshots)
+    ,("bounded registry reads report caps, large names, and TOCTOU growth safely", TestBoundedRegistryReadQuality)
+    ,("host security old/new values redact across portable exports", TestHostSecurityPrivacyExports)
     ,("WMI binding references normalize before matching", TestWmiBindingNormalization)
     ,("non-PE scripts produce bounded read-only triage", TestNonPeScriptTriage)
     ,("non-PE containers reject unsafe archive entries", TestNonPeZipSafety)
@@ -779,6 +782,90 @@ static void TestPersistenceTimeoutQuality()
     True(!RuntimeCaseCollector.IsDegradedCollectorStatus("available"), "available must not degrade collection quality");
 }
 
+static void TestHostSecuritySnapshots()
+{
+    var provider = new FakeHostSecurityProvider(Enumerable.Range(0, 513).Select(i => new HostSecuritySnapshotEntry("Firewall", "rule-" + i, "enabled", i.ToString())).ToArray());
+    var service = new SnapshotService(provider);
+    string target = Environment.ProcessPath ?? "sample.exe";
+    var profile = new ExecutionProfile(target, "exe", "none", null, "", Path.GetDirectoryName(target) ?? Environment.CurrentDirectory, 1, false, false, false, false, "observe", ExecuteTarget: false);
+    var capture = service.Capture(profile, CancellationToken.None, 1, TimeSpan.FromMilliseconds(1));
+    True(capture.Data.HostSecurityEntries!.Count == 512, "host security cap was not enforced");
+    True(capture.Data.HostSecurityQuality!.Any(q => q.Collector == "Firewall" && q.Status == "degraded" && q.EventsDropped == 1), "host security quality omitted entry limit");
+    True(provider.Calls.All(c => !c.Contains("write", StringComparison.OrdinalIgnoreCase)), "snapshot provider received a mutation request");
+    var before = new SnapshotData(DateTimeOffset.UtcNow, [], [], [], HostSecurityEntries: [new HostSecuritySnapshotEntry("Hosts", "hosts", "old", "1")]);
+    var after = new SnapshotData(DateTimeOffset.UtcNow, [], [], [], HostSecurityEntries: [new HostSecuritySnapshotEntry("Hosts", "hosts", "new", "2")]);
+    var diff = service.Diff(before, after);
+    Equal(1, diff.ModifiedHostSecurityEntries!.Count);
+    Equal("old", diff.ModifiedHostSecurityChanges!.Single().Before.Value);
+    Equal("new", diff.ModifiedHostSecurityChanges!.Single().After.Value);
+    string binary = WindowsHostSecuritySnapshotProvider.NormalizeRegistryValue(new byte[] { 1, 2, 3 });
+    True(binary.StartsWith("binary:length=3;sha256=", StringComparison.Ordinal) && !binary.Contains("System.Byte[]", StringComparison.Ordinal), "binary registry values were not normalized safely");
+    string huge = WindowsHostSecuritySnapshotProvider.NormalizeRegistryValue(new string('x', 5000));
+    True(huge.StartsWith("value-limit:length=5000;sha256=", StringComparison.Ordinal) && huge.Length < 200, "large registry string was retained");
+    string multi = WindowsHostSecuritySnapshotProvider.NormalizeRegistryValue(Enumerable.Repeat(new string('m', 300), 65).ToArray());
+    True(multi.StartsWith("value-limit:multi-count=65", StringComparison.Ordinal) && multi.Length < 200, "large REG_MULTI_SZ was retained");
+    string hugeMulti = WindowsHostSecuritySnapshotProvider.NormalizeRegistryValue(new[] { new string('a', 100_000), new string('b', 100_000) });
+    True(hugeMulti.StartsWith("value-limit:multi-count=2;chars=200000;sha256=", StringComparison.Ordinal) && hugeMulti.Length < 200, "huge REG_MULTI_SZ was concatenated or retained");
+    string surrogateMulti = WindowsHostSecuritySnapshotProvider.NormalizeRegistryValue(new[] { new string('x', 1023) + "\U0001F600" + new string('y', 10_000) });
+    True(surrogateMulti.StartsWith("value-limit:multi-count=1", StringComparison.Ordinal) && surrogateMulti.Length < 200, "surrogate-spanning REG_MULTI_SZ was not bounded safely");
+    var events = BehaviorCorrelator.Correlate([new TimelineEvent(1, TimeSpan.Zero, "snapshot", 0, EventCategory.Registry, "Host Security Configuration Modified", "C:\\Users\\alice\\x", "changed", EventSeverity.High, "HostSecuritySnapshot", "")]);
+    True(events.Any(e => e.Action == "Host Security Configuration Change"), "host-security behavior missing");
+    var privacy = new PrivacyRedactor().Redact(new CaseData("h", "h", "sample", "C:\\Users\\alice\\sample.exe", "hash", DateTimeOffset.UtcNow, TimeSpan.Zero, null, [], [new TimelineEvent(1, TimeSpan.Zero, "snapshot", 0, EventCategory.Registry, "Host Security Configuration Modified", "C:\\Users\\alice\\x", "old=C:\\Users\\alice;new=secret", EventSeverity.High, "HostSecuritySnapshot", "{\"old_value\":\"C:\\\\Users\\\\alice\",\"new_value\":\"secret\"}")], [], [], ""));
+    True(!JsonSerializer.Serialize(privacy).Contains("alice", StringComparison.OrdinalIgnoreCase), "privacy did not redact host-security values");
+    var slow = new SnapshotService(new BlockingHostSecurityProvider());
+    var clock = Stopwatch.StartNew(); var bounded = slow.Capture(profile, CancellationToken.None, 1, TimeSpan.FromMilliseconds(1)); clock.Stop();
+    True(clock.Elapsed < TimeSpan.FromSeconds(3), "host-security timeout waited for a late provider result");
+    True(bounded.Data.HostSecurityQuality!.Any(q => q.Collector == "Firewall" && q.Status == "timeout"), "blocking provider timeout was not recorded");
+}
+
+static void TestBoundedRegistryReadQuality()
+{
+    // These markers model native RegEnum* ERROR_MORE_DATA results without creating any
+    // host registry keys. A hostile 20K name must become a fixed, bounded marker.
+    Equal("<value-name-limit-512>", WindowsHostSecuritySnapshotProvider.RegistryNameLimitMarker("value", 512));
+    Equal("<subkey-name-limit-2048>", WindowsHostSecuritySnapshotProvider.RegistryNameLimitMarker("subkey", 2048));
+    Throws<ArgumentOutOfRangeException>(() => WindowsHostSecuritySnapshotProvider.RegistryNameLimitMarker("unknown", 0));
+
+    bool oversized = WindowsHostSecuritySnapshotProvider.TryNormalizeBoundedRegistryRead(65_537, 1, 0, 0, [], out string oversizedValue);
+    True(oversized && oversizedValue.StartsWith("value-limit:length=65537", StringComparison.Ordinal), "large registry value was not bounded before allocation");
+
+    byte[] initialBuffer = Encoding.Unicode.GetBytes("secret");
+    bool resized = WindowsHostSecuritySnapshotProvider.TryNormalizeBoundedRegistryRead((uint)initialBuffer.Length, 1, 234, 4096, initialBuffer, out string resizedValue);
+    True(resized && resizedValue.StartsWith("value-size-unavailable;reason=resize-detected;length=4096", StringComparison.Ordinal), "TOCTOU registry resize was not recorded as unavailable");
+    True(!resizedValue.Contains("secret", StringComparison.Ordinal), "TOCTOU registry resize retained a partial value");
+
+    var fixture = Enumerable.Range(0, 513)
+        .Select(i => new HostSecuritySnapshotEntry("Firewall", "rule-" + i, "enabled", i.ToString()))
+        .Append(new HostSecuritySnapshotEntry("Firewall", "bounded-value-name", "value-name-limit;sha256=unavailable", "n"))
+        .Append(new HostSecuritySnapshotEntry("Firewall", "bounded-subkey-name", "subkey-name-limit;sha256=unavailable", "s"))
+        .Append(new HostSecuritySnapshotEntry("Firewall", "resized", resizedValue, "r"))
+        .ToArray();
+    CollectorHealth health = SnapshotService.SummarizeHostSecuritySurfaceForTest("Firewall", fixture);
+    Equal("degraded", health.Status);
+    True(health.EventsDropped >= 4, "registry bounds were not represented as collection loss");
+    True(health.Message.Contains("entry-limit", StringComparison.Ordinal), "entry cap quality missing");
+    True(health.Message.Contains("value-name-limit;values=1", StringComparison.Ordinal), "value-name cap quality missing");
+    True(health.Message.Contains("subkey-name-limit;values=1", StringComparison.Ordinal), "subkey-name cap quality missing");
+    True(health.Message.Contains("value-size-unavailable;values=1", StringComparison.Ordinal), "value-size unavailable quality missing");
+}
+
+static void TestHostSecurityPrivacyExports()
+{
+    string root = Path.Combine(Path.GetTempPath(), "mrtw-host-security-privacy-" + Guid.NewGuid().ToString("N"));
+    const string secret = "HOST-SECURITY-OLD-NEW-SECRET";
+    try
+    {
+        var now = DateTimeOffset.UtcNow;
+        var evt = new TimelineEvent(1, TimeSpan.Zero, "snapshot", 0, EventCategory.Registry, "Host Security Configuration Modified", "HKCU\\Software\\ProxyEnable", $"WinINet configuration changed; old={secret}; new={secret}", EventSeverity.High, "HostSecuritySnapshot", $"{{\"surface\":\"WinINet\",\"old_value\":\"{secret}\",\"new_value\":\"{secret}\"}}", CapturedAtUtc: now);
+        var data = new CaseData("host-security", "host-security", "sample", "C:\\sample.exe", "hash", now, TimeSpan.Zero, null, [], [evt], [], [], "");
+        new CaseExportService().WriteCaseBundle(data, root, new ExportOptions("all", PrivacyMode: true, Compress: true));
+        AssertNoSecrets(Directory.EnumerateFiles(root, "*", SearchOption.TopDirectoryOnly).Where(p => !p.EndsWith(".zip", StringComparison.OrdinalIgnoreCase)), secret, "unused-host", "10.0.0.1");
+        string extract = Path.Combine(root, "zip"); ZipFile.ExtractToDirectory(Path.Combine(root, "case_export.zip"), extract);
+        AssertNoSecrets(Directory.EnumerateFiles(extract, "*", SearchOption.AllDirectories), secret, "unused-host", "10.0.0.1");
+    }
+    finally { SqliteConnection.ClearAllPools(); if (Directory.Exists(root)) Directory.Delete(root, true); }
+}
+
 static void TestWmiBindingNormalization()
 {
     Equal("__eventfilter.name=\"mrtw\"", SnapshotService.NormalizeWmiReference("\\\\.\\root\\subscription:__EventFilter.Name=\"MRTW\""));
@@ -1248,4 +1335,21 @@ static void Throws<T>(Action action) where T : Exception
     try { action(); }
     catch (T) { return; }
     throw new InvalidOperationException($"Expected {typeof(T).Name}.");
+}
+
+sealed class FakeHostSecurityProvider : IHostSecuritySnapshotProvider
+{
+    private readonly IReadOnlyList<HostSecuritySnapshotEntry> _entries;
+    public List<string> Calls { get; } = [];
+    public FakeHostSecurityProvider(IReadOnlyList<HostSecuritySnapshotEntry> entries) => _entries = entries;
+    public IReadOnlyList<HostSecuritySnapshotEntry> Capture(string surface, CancellationToken cancellationToken) { Calls.Add(surface); cancellationToken.ThrowIfCancellationRequested(); return _entries.Where(e => e.Surface == surface).ToArray(); }
+}
+
+sealed class BlockingHostSecurityProvider : IHostSecuritySnapshotProvider
+{
+    public IReadOnlyList<HostSecuritySnapshotEntry> Capture(string surface, CancellationToken cancellationToken)
+    {
+        if (surface == "Firewall") Thread.Sleep(TimeSpan.FromSeconds(5));
+        return [];
+    }
 }

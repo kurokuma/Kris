@@ -10,6 +10,10 @@ public sealed class SnapshotService
 {
     private const int InteractiveFileLimit = 2_000;
     private static readonly TimeSpan InteractiveTimeLimit = TimeSpan.FromSeconds(8);
+    private readonly IHostSecuritySnapshotProvider _hostSecurityProvider;
+
+    public SnapshotService(IHostSecuritySnapshotProvider? hostSecurityProvider = null)
+        => _hostSecurityProvider = hostSecurityProvider ?? new WindowsHostSecuritySnapshotProvider();
 
     public SnapshotData Capture(ExecutionProfile profile)
         => Capture(profile, CancellationToken.None).Data;
@@ -27,6 +31,7 @@ public sealed class SnapshotService
         }
 
         var persistence = CapturePersistence(cancellationToken);
+        var hostSecurity = CaptureHostSecurity(cancellationToken);
         var data = new SnapshotData(
             DateTimeOffset.UtcNow,
             files
@@ -37,7 +42,9 @@ public sealed class SnapshotService
             CaptureRegistry(state),
             CaptureTcpConnections(),
             persistence.Entries,
-            persistence.Quality);
+            persistence.Quality,
+            hostSecurity.Entries,
+            hostSecurity.Quality);
         bool canceled = cancellationToken.IsCancellationRequested;
         bool bounded = !canceled && (state.ItemLimitReached || stopwatch.Elapsed >= state.TimeLimit);
         string note = canceled ? "Snapshot canceled by user." : bounded ? $"Snapshot bounded after {state.VisitedFiles} files or {state.TimeLimit.TotalSeconds:0}s." : "Snapshot completed.";
@@ -70,8 +77,14 @@ public sealed class SnapshotService
         var modifiedPersistence = PersistenceEntriesOrEmpty(after).Where(v => beforePersistence.TryGetValue(PersistenceId(v), out var old) && !string.Equals(old.Fingerprint, v.Fingerprint, StringComparison.Ordinal)).ToArray();
         var deletedPersistence = PersistenceEntriesOrEmpty(before).Where(v => !afterPersistence.ContainsKey(PersistenceId(v))).ToArray();
 
+        var beforeHost = HostSecurityEntriesOrEmpty(before).ToDictionary(HostSecurityId, StringComparer.OrdinalIgnoreCase);
+        var afterHost = HostSecurityEntriesOrEmpty(after).ToDictionary(HostSecurityId, StringComparer.OrdinalIgnoreCase);
+        var addedHost = HostSecurityEntriesOrEmpty(after).Where(v => !beforeHost.ContainsKey(HostSecurityId(v))).ToArray();
+        var modifiedHost = HostSecurityEntriesOrEmpty(after).Where(v => beforeHost.TryGetValue(HostSecurityId(v), out var old) && !string.Equals(old.Fingerprint, v.Fingerprint, StringComparison.Ordinal)).ToArray();
+        var hostChanges = modifiedHost.Select(v => new HostSecuritySnapshotChange(beforeHost[HostSecurityId(v)], v)).ToArray();
+        var deletedHost = HostSecurityEntriesOrEmpty(before).Where(v => !afterHost.ContainsKey(HostSecurityId(v))).ToArray();
         return new SnapshotDiff(addedFiles, modifiedFiles, deletedFiles, addedReg, modifiedReg, deletedReg, newTcp,
-            addedPersistence, modifiedPersistence, deletedPersistence);
+            addedPersistence, modifiedPersistence, deletedPersistence, addedHost, modifiedHost, deletedHost, hostChanges);
     }
 
     public IReadOnlyList<PreservedFile> PreserveChangedFiles(SnapshotDiff diff, string caseId, string generation = "after", CancellationToken cancellationToken = default)
@@ -262,10 +275,10 @@ public sealed class SnapshotService
                 return;
             }
 
-            foreach (string name in key.GetValueNames())
+            foreach (string name in WindowsHostSecuritySnapshotProvider.EnumerateValueNames(key, 257))
             {
                 if (state.ShouldStop) return;
-                values.Add(new RegistrySnapshotEntry(displayKey, name, Convert.ToString(key.GetValue(name, null, RegistryValueOptions.DoNotExpandEnvironmentNames), System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty));
+                if (WindowsHostSecuritySnapshotProvider.TryReadBoundedValue(key, name, out string value)) values.Add(new RegistrySnapshotEntry(displayKey, name, value));
             }
         }
         catch
@@ -285,8 +298,8 @@ public sealed class SnapshotService
                 if (state.ShouldStop || values.Count >= 20_000) return;
                 using var key = root.OpenSubKey(path, false); if (key is null) return;
                 string display = $"{displayRoot}\\{path}";
-                foreach (string name in key.GetValueNames().Take(256)) { if (state.ShouldStop) return; values.Add(new RegistrySnapshotEntry(display, name, Convert.ToString(key.GetValue(name, null, RegistryValueOptions.DoNotExpandEnvironmentNames), System.Globalization.CultureInfo.InvariantCulture) ?? "")); }
-                if (remaining > 0) foreach (string child in key.GetSubKeyNames().Take(2048)) Walk(path + "\\" + child, remaining - 1);
+                foreach (string name in WindowsHostSecuritySnapshotProvider.EnumerateValueNames(key, 257)) { if (state.ShouldStop) return; if (WindowsHostSecuritySnapshotProvider.TryReadBoundedValue(key, name, out string value)) values.Add(new RegistrySnapshotEntry(display, name, value)); }
+                if (remaining > 0) foreach (string child in WindowsHostSecuritySnapshotProvider.EnumerateSubKeyNames(key, 2049)) Walk(path + "\\" + child, remaining - 1);
             }
             Walk(subKey, depth);
         }
@@ -313,6 +326,60 @@ public sealed class SnapshotService
     private static string RegistryKeyId(RegistrySnapshotEntry value) => $"{value.KeyPath}\\{value.Name}";
     private static string PersistenceId(PersistenceSnapshotEntry value) => $"{value.Surface}|{value.Identity}";
     private static IReadOnlyList<PersistenceSnapshotEntry> PersistenceEntriesOrEmpty(SnapshotData data) => data.PersistenceEntries ?? [];
+    private static string HostSecurityId(HostSecuritySnapshotEntry value) => $"{value.Surface}|{value.Identity}";
+    private static IReadOnlyList<HostSecuritySnapshotEntry> HostSecurityEntriesOrEmpty(SnapshotData data) => data.HostSecurityEntries ?? [];
+
+    private (IReadOnlyList<HostSecuritySnapshotEntry> Entries, IReadOnlyList<CollectorHealth> Quality) CaptureHostSecurity(CancellationToken cancellationToken)
+    {
+        string[] surfaces = ["Hosts", "WinINet", "WinHTTP", "Explorer", "Defender", "Firewall", "SecurityCenter"];
+        var entries = new List<HostSecuritySnapshotEntry>(); var quality = new List<CollectorHealth>();
+        foreach (string surface in surfaces) CaptureHostSecuritySurface(surface, entries, quality, cancellationToken);
+        return (entries.OrderBy(HostSecurityId, StringComparer.OrdinalIgnoreCase).ToArray(), quality);
+    }
+
+    private void CaptureHostSecuritySurface(string surface, List<HostSecuritySnapshotEntry> entries, List<CollectorHealth> quality, CancellationToken cancellationToken)
+    {
+        DateTimeOffset started = DateTimeOffset.UtcNow;
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken); linked.CancelAfter(TimeSpan.FromSeconds(2));
+        try
+        {
+            var capture = Task.Run(() => _hostSecurityProvider.Capture(surface, linked.Token), CancellationToken.None);
+            int winner = Task.WaitAny([capture, Task.Delay(TimeSpan.FromSeconds(2))]);
+            if (winner != 0 || cancellationToken.IsCancellationRequested) { linked.Cancel(); quality.Add(new(surface, cancellationToken.IsCancellationRequested ? "canceled" : "timeout", started, DateTimeOffset.UtcNow, 0, 0, "No partial host-security snapshot retained.")); return; }
+            var result = capture.GetAwaiter().GetResult();
+            if (linked.IsCancellationRequested) { quality.Add(new(surface, "timeout", started, DateTimeOffset.UtcNow, 0, 0, "No partial host-security snapshot retained.")); return; }
+            int keep = Math.Min(512, result.Count); entries.AddRange(result.Take(keep));
+            quality.Add(SummarizeHostSecuritySurface(surface, result, started, DateTimeOffset.UtcNow));
+        }
+        catch (PlatformNotSupportedException ex) { quality.Add(new(surface, "unavailable", started, DateTimeOffset.UtcNow, 0, 0, ex.Message)); }
+        catch (UnauthorizedAccessException ex) { quality.Add(new(surface, "access-denied", started, DateTimeOffset.UtcNow, 0, 0, ex.Message)); }
+        catch (OperationCanceledException) { quality.Add(new(surface, cancellationToken.IsCancellationRequested ? "canceled" : "timeout", started, DateTimeOffset.UtcNow, 0, 0, "No partial host-security snapshot retained.")); }
+        catch (Exception ex) { quality.Add(new(surface, "unavailable", started, DateTimeOffset.UtcNow, 0, 0, ex.GetType().Name)); }
+    }
+
+    internal static CollectorHealth SummarizeHostSecuritySurfaceForTest(string surface, IReadOnlyList<HostSecuritySnapshotEntry> result)
+        => SummarizeHostSecuritySurface(surface, result, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow);
+
+    private static CollectorHealth SummarizeHostSecuritySurface(string surface, IReadOnlyList<HostSecuritySnapshotEntry> result, DateTimeOffset started, DateTimeOffset completed)
+    {
+        const int limit = 512;
+        int kept = Math.Min(limit, result.Count);
+        int valueLimited = result.Count(e => e.Value.StartsWith("value-limit:", StringComparison.Ordinal));
+        int sizeUnavailable = result.Count(e => e.Value.StartsWith("value-size-unavailable", StringComparison.Ordinal));
+        int valueNameLimited = result.Count(e => e.Value.StartsWith("value-name-limit", StringComparison.Ordinal));
+        int subkeyNameLimited = result.Count(e => e.Value.StartsWith("subkey-name-limit", StringComparison.Ordinal));
+        bool degraded = result.Count > limit || valueLimited > 0 || sizeUnavailable > 0 || valueNameLimited > 0 || subkeyNameLimited > 0;
+        string message = string.Join(";", new[]
+        {
+            result.Count > limit ? "entry-limit" : "",
+            valueLimited > 0 ? $"value-limit;values={valueLimited};bytes=bounded" : "",
+            sizeUnavailable > 0 ? $"value-size-unavailable;values={sizeUnavailable}" : "",
+            valueNameLimited > 0 ? $"value-name-limit;values={valueNameLimited}" : "",
+            subkeyNameLimited > 0 ? $"subkey-name-limit;values={subkeyNameLimited}" : ""
+        }.Where(x => x.Length > 0));
+        long dropped = Math.Max(0, result.Count - kept) + valueLimited + sizeUnavailable + valueNameLimited + subkeyNameLimited;
+        return new CollectorHealth(surface, degraded ? "degraded" : "healthy", started, completed, result.Count, dropped, message);
+    }
 
     private static (IReadOnlyList<PersistenceSnapshotEntry> Entries, IReadOnlyList<CollectorHealth> Quality) CapturePersistence(CancellationToken cancellationToken)
     {
@@ -398,12 +465,12 @@ public sealed class SnapshotService
         var output = new List<PersistenceSnapshotEntry>();
         using var root = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services", false);
         if (root is null) return output;
-        foreach (string name in root.GetSubKeyNames().OrderBy(x => x, StringComparer.OrdinalIgnoreCase).Take(limit + 1))
+        foreach (string name in WindowsHostSecuritySnapshotProvider.EnumerateSubKeyNames(root, limit + 1))
         {
             cancellationToken.ThrowIfCancellationRequested();
             using var key = root.OpenSubKey(name, false); if (key is null) continue;
-            string image = Convert.ToString(key.GetValue("ImagePath", null, RegistryValueOptions.DoNotExpandEnvironmentNames)) ?? "";
-            string start = Convert.ToString(key.GetValue("Start")) ?? "";
+            string image = WindowsHostSecuritySnapshotProvider.TryReadBoundedValue(key, "ImagePath", out string imageValue) ? imageValue : "value-size-unavailable";
+            string start = WindowsHostSecuritySnapshotProvider.TryReadBoundedValue(key, "Start", out string startValue) ? startValue : "value-size-unavailable";
             output.Add(Persistence("WindowsService", name, name, image, $"{image}|start={start}"));
         }
         return output;

@@ -2,6 +2,8 @@
 
 This folder contains benign validation helpers for MRTW.
 
+`MRTW.RegressionTests` includes host-security snapshot tests with an injectable read-only provider. They verify host/proxy/Defender/Firewall-style diffs, the 512-entry limit, value/subkey-name limits, value-size and read-time resize handling, collection quality, and no mutation request; no test changes a real host setting.
+
 ## Safety model
 
 - No process injection.
