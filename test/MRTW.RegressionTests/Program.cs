@@ -78,6 +78,7 @@ var tests = new List<(string Name, Action Body)>
     ,("runtime normalized commands report the 257th finding as dropped", TestRuntimeNormalizedCommandFindingLimit)
     ,("final ETW correlation preserves and combines command-normalization quality", TestFinalizeCaseCommandNormalizationQuality)
     ,("existing behavior evidence JSON is not rewritten during correlation", TestExistingBehaviorRawJsonPreserved)
+    ,("ETW script and surface quality options are bounded and correlated without duplicate findings", TestEtwScriptOptionsAndCorrelation)
 };
 
 int failures = 0;
@@ -318,6 +319,7 @@ static void TestOrchestratorQuality()
     CaseData data = new AnalysisOrchestrator().Collect(profile, null);
     True(data.Quality is not null, "quality missing");
     Equal("skipped", data.Quality!.Collectors.Single(c => c.Collector == "ETW").Status);
+    Equal("skipped", data.Quality.Collectors.Single(c => c.Collector == "ETWScript").Status);
     True(data.Events.All(e => e.CapturedAtUtc.HasValue), "UTC capture time missing");
 }
 
@@ -479,6 +481,64 @@ static void TestBehaviorCorrelation()
     var correlated = BehaviorCorrelator.Correlate(events);
     Equal(1, correlated.Count(e => e.Action == "Process Injection Detected"));
     Equal(correlated.Count, correlated.Select(e => e.Id).Distinct().Count());
+}
+
+static void TestEtwScriptOptionsAndCorrelation()
+{
+    Throws<ArgumentOutOfRangeException>(() => new TraceEventEtwCollector().Collect(new EtwCollectorOptions(null, null, MaxScriptContentEvents: 0)));
+    Throws<ArgumentOutOfRangeException>(() => new TraceEventEtwCollector().Collect(new EtwCollectorOptions(null, null, MaxScriptContentCharacters: 255)));
+    var script = new TimelineEvent(1, TimeSpan.Zero, "powershell.exe", 7, EventCategory.Api, "PowerShell ScriptBlock", "ScriptBlock", "PowerShell ScriptBlock observed by ETW.", EventSeverity.Medium, "ETW", "{\"content\":\"[Ref].Assembly.GetType('System.Management.Automation.AmsiUtils')\"}");
+    var registry = new TimelineEvent(2, TimeSpan.FromMilliseconds(1), "powershell.exe", 7, EventCategory.Registry, "SetValue", "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", "Registry event observed by kernel ETW.", EventSeverity.Low, "ETW", "{}");
+    var correlated = BehaviorCorrelator.Correlate([script, registry]);
+    Equal(1, correlated.Count(e => e.Action == "AMSI/ETW Tamper Signal"));
+    Equal(1, correlated.Count(e => e.Action == "Persistence Established"));
+
+    var snapshotRegistry = new TimelineEvent(3, TimeSpan.FromSeconds(2), "snapshot", 0, EventCategory.Registry, "Persistence Created", "HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", "Snapshot persistence change", EventSeverity.High, "Snapshot", "{}");
+    var etwRegistry = new TimelineEvent(4, TimeSpan.FromSeconds(3), "sample.exe", 7, EventCategory.Registry, "SetValue", "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", "Registry event observed by kernel ETW.", EventSeverity.Low, "ETW", "{}");
+    var merged = BehaviorCorrelator.Correlate([snapshotRegistry, etwRegistry]);
+    var persistence = merged.Single(e => e.Action == "Persistence Established");
+    Equal(1, merged.Count(e => e.Action == "Persistence Established"));
+    using (var evidence = JsonDocument.Parse(persistence.RawJson))
+        Equal(2, evidence.RootElement.GetProperty("evidence_event_ids").GetArrayLength());
+
+    var hookRegistry = new TimelineEvent(5, TimeSpan.FromSeconds(4), "sample.exe", 7, EventCategory.Registry, "RegSetValueExW", "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", "Hook registry change", EventSeverity.High, "Hook", "{}");
+    var targetEtwRegistry = new TimelineEvent(6, TimeSpan.FromSeconds(5), "sample.exe", 7, EventCategory.Registry, "SetValue", "HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", "Registry event observed by kernel ETW.", EventSeverity.Low, "ETW", "{}");
+    var samePidMerged = BehaviorCorrelator.Correlate([hookRegistry, targetEtwRegistry]);
+    var samePidPersistence = samePidMerged.Single(e => e.Action == "Persistence Established");
+    Equal(1, samePidMerged.Count(e => e.Action == "Persistence Established"));
+    using (var evidence = JsonDocument.Parse(samePidPersistence.RawJson))
+        Equal(2, evidence.RootElement.GetProperty("evidence_event_ids").GetArrayLength());
+
+    DateTimeOffset started = DateTimeOffset.UtcNow;
+    string sample = Environment.ProcessPath ?? typeof(AnalysisOrchestrator).Assembly.Location;
+    var profile = new ExecutionProfile(sample, "exe", "none", null, $"\"{sample}\"", Path.GetDirectoryName(sample)!, 1, true, false, false, false, "observe");
+    var data = new CaseData("etw-quality", "etw-quality", "sample.exe", sample, "hash", started, TimeSpan.Zero, null, [], [], [], [], "");
+    var etw = new EtwCollectionResult(true, true, null, [], [], TargetBound: true,
+        ScriptContentEventsReceived: 2, ScriptContentEventsDropped: 1, ScriptContentCharactersRetained: 40,
+        ScriptCaptureReason: "global-event-limit; script content was not persisted.",
+        AmsiProviderReason: "AMSI provider unavailable: fixture", RegistryEventsReceived: 4, RegistryEventsDropped: 1,
+        RegistryCaptureReason: "global-event-limit; registry event was not persisted.", FileEventsReceived: 0);
+    using var containment = NetworkContainmentService.Apply(profile);
+    var finalized = AnalysisOrchestrator.FinalizeCase(data, etw, profile, containment, started, started, started.AddSeconds(1));
+    Equal("degraded", finalized.Quality!.Collectors.Single(c => c.Collector == "ETWScript").Status);
+    Equal("unavailable", finalized.Quality.Collectors.Single(c => c.Collector == "ETWAmsi").Status);
+    Equal("healthy", finalized.Quality.Collectors.Single(c => c.Collector == "ETWPowerShell").Status);
+    Equal(4L, finalized.Quality.Collectors.Single(c => c.Collector == "ETWRegistry").EventsReceived);
+    Equal("degraded", finalized.Quality.Collectors.Single(c => c.Collector == "ETWRegistry").Status);
+    Equal("healthy", finalized.Quality.Collectors.Single(c => c.Collector == "ETWFile").Status);
+
+    var unavailable = new EtwCollectionResult(false, false, "Access denied enabling kernel ETW.", [], []);
+    var unavailableCase = AnalysisOrchestrator.FinalizeCase(data, unavailable, profile, containment, started, started, started.AddSeconds(1));
+    foreach (string collector in new[] { "ETWScript", "ETWRegistry", "ETWFile" })
+    {
+        var health = unavailableCase.Quality!.Collectors.Single(c => c.Collector == collector);
+        Equal("unavailable", health.Status);
+        True(health.Message.Contains("Access denied", StringComparison.OrdinalIgnoreCase), $"{collector} did not retain ETW start failure reason");
+    }
+
+    var sensitiveScript = script with { RawJson = "{\"content\":\"C:\\\\Users\\\\alice\\\\secret.ps1\"}" };
+    var redacted = new PrivacyRedactor().Redact(data with { Events = [sensitiveScript] });
+    True(!redacted.Events.Single().RawJson.Contains("alice", StringComparison.OrdinalIgnoreCase), "ETW ScriptBlock content was not privacy-redacted");
 }
 
 static void TestOversizedSqliteText()

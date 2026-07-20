@@ -57,6 +57,8 @@ public sealed class TraceEventEtwCollector
         EtwCaptureControl control)
     {
         CaptureLimits.Validate(options.MaxPersistedEvents, options.MaxPersistedNetworkSessions, options.MaxRawTraceBytes);
+        if (options.MaxScriptContentEvents is < 1 or > 10_000) throw new ArgumentOutOfRangeException(nameof(options.MaxScriptContentEvents));
+        if (options.MaxScriptContentCharacters is < 256 or > 4 * 1024 * 1024) throw new ArgumentOutOfRangeException(nameof(options.MaxScriptContentCharacters));
         string? validatedTracePath = ValidateRawTracePath(options.RawTracePath);
         if (!OperatingSystem.IsWindows())
         {
@@ -73,6 +75,11 @@ public sealed class TraceEventEtwCollector
         string sessionName = "MRTW-" + Guid.NewGuid().ToString("N");
         int rawLimitReached = 0;
         string captureLimitReason = "";
+        long scriptContentReceived = 0, scriptContentDropped = 0, scriptContentCharacters = 0;
+        string scriptCaptureReason = "";
+        string amsiProviderReason = "", powerShellProviderReason = "";
+        long registryEventsReceived = 0, registryEventsDropped = 0, fileEventsReceived = 0, fileEventsDropped = 0;
+        string registryCaptureReason = "", fileCaptureReason = "";
 
         try
         {
@@ -84,13 +91,15 @@ public sealed class TraceEventEtwCollector
             control.SetStop(() => session.Stop());
 
             bool CanCapture() => Volatile.Read(ref rawLimitReached) == 0;
-            void CaptureEvent(TimelineEvent item)
+            bool CaptureEvent(TimelineEvent item)
             {
-                if (!CanCapture()) return;
+                if (!CanCapture()) return false;
                 if (events.TryAdd(item))
                 {
                     try { onEvent?.Invoke(item); } catch { /* live callbacks must not stop ETW */ }
+                    return true;
                 }
+                return false;
             }
             void CaptureNetworkSession(NetworkSession item)
             {
@@ -122,6 +131,8 @@ public sealed class TraceEventEtwCollector
             {
                 keywords |= KernelTraceEventParser.Keywords.ImageLoad;
             }
+            if (options.RegistryEvents) keywords |= KernelTraceEventParser.Keywords.Registry;
+            if (options.FileEvents) keywords |= KernelTraceEventParser.Keywords.FileIOInit;
 
             if (keywords != KernelTraceEventParser.Keywords.None)
             {
@@ -131,6 +142,13 @@ public sealed class TraceEventEtwCollector
             if (options.DnsEvents)
             {
                 session.EnableProvider("Microsoft-Windows-DNS-Client");
+            }
+            if (options.ScriptEvents)
+            {
+                try { session.EnableProvider("Microsoft-Antimalware-Scan-Interface"); }
+                catch (Exception ex) { amsiProviderReason = "AMSI provider unavailable: " + ex.Message; }
+                try { session.EnableProvider("Microsoft-Windows-PowerShell"); }
+                catch (Exception ex) { powerShellProviderReason = "PowerShell provider unavailable: " + ex.Message; }
             }
 
             control.SetReady();
@@ -242,41 +260,72 @@ public sealed class TraceEventEtwCollector
                 CaptureNetworkSession( new NetworkSession(process, "", "", data.saddr.ToString(), data.sport, "UDP", DateTimeOffset.UtcNow - startedAt, 0, data.size, "", "", Coverage: "kernel ETW UDP metadata; payload/TLS/JA3 unsupported"));
             };
 
-            if (options.DnsEvents)
+            if (options.DnsEvents || options.ScriptEvents || options.RegistryEvents || options.FileEvents)
             {
                 session.Source.Dynamic.All += data =>
                 {
-                    if (!data.ProviderName.Equals("Microsoft-Windows-DNS-Client", StringComparison.OrdinalIgnoreCase))
+                    if (options.DnsEvents && data.ProviderName.Equals("Microsoft-Windows-DNS-Client", StringComparison.OrdinalIgnoreCase))
                     {
+                        int pid = data.ProcessID;
+                        if (!trackedPids.Matches(control.TargetPid, pid)) return;
+                        string query = TryPayload(data, "QueryName") ?? TryPayload(data, "Name") ?? data.EventName;
+                        string answers = TryPayload(data, "QueryResults") ?? TryPayload(data, "Address") ?? "";
+                        string status = TryPayload(data, "Status") ?? TryPayload(data, "Result") ?? "";
+                        CaptureEvent(Event(Interlocked.Increment(ref nextId), DateTimeOffset.Now - startedAt, KnownProcessName(processNames, pid, null, null), pid, EventCategory.Dns, "DNS Query", query, $"DNS event observed by ETW; status={status}; answers={answers}", EventSeverity.Medium, "ETW", data.PayloadString(0)));
+                        if (!string.IsNullOrWhiteSpace(query)) CaptureNetworkSession(new NetworkSession(KnownProcessName(processNames, pid, null, null), query, answers, "", 53, "DNS", DateTimeOffset.UtcNow - startedAt, 0, 0, "", "", status, answers, "DNS client ETW metadata"));
+                        return;
+                    }
+                    int dynamicPid = data.ProcessID;
+                    if (!trackedPids.Matches(control.TargetPid, dynamicPid)) return;
+                    bool amsi = options.ScriptEvents && data.ProviderName.Equals("Microsoft-Antimalware-Scan-Interface", StringComparison.OrdinalIgnoreCase);
+                    bool scriptBlock = options.ScriptEvents && data.ProviderName.Equals("Microsoft-Windows-PowerShell", StringComparison.OrdinalIgnoreCase) && (int)data.ID == 4104;
+                    if (amsi || scriptBlock)
+                    {
+                        string content = TryPayload(data, "ScriptBlockText") ?? TryPayload(data, "Content") ?? TryPayload(data, "ScanContent") ?? "";
+                        int remaining = Math.Max(0, options.MaxScriptContentCharacters - (int)Math.Min(int.MaxValue, Interlocked.Read(ref scriptContentCharacters)));
+                        if (Interlocked.Read(ref scriptContentReceived) >= options.MaxScriptContentEvents || content.Length > remaining)
+                        {
+                            Interlocked.Increment(ref scriptContentDropped);
+                            scriptCaptureReason = $"script-content-limit; events={options.MaxScriptContentEvents}; characters={options.MaxScriptContentCharacters}";
+                            return;
+                        }
+                        bool retained = CaptureEvent(Event(Interlocked.Increment(ref nextId), DateTimeOffset.UtcNow - startedAt, KnownProcessName(processNames, dynamicPid, null, null), dynamicPid,
+                            EventCategory.Api, amsi ? "AMSI Scan" : "PowerShell ScriptBlock", amsi ? data.EventName : "ScriptBlock",
+                            amsi ? "AMSI scan observed by ETW." : "PowerShell ScriptBlock observed by ETW.", EventSeverity.Medium, "ETW",
+                            new { provider = data.ProviderName, event_id = data.ID, content }));
+                        if (retained)
+                        {
+                            Interlocked.Increment(ref scriptContentReceived);
+                            Interlocked.Add(ref scriptContentCharacters, content.Length);
+                        }
+                        else
+                        {
+                            Interlocked.Increment(ref scriptContentDropped);
+                            scriptCaptureReason = "global-event-limit; script content was not persisted.";
+                        }
                         return;
                     }
 
-                    int pid = data.ProcessID;
-                    if (!trackedPids.Matches(control.TargetPid, pid))
+                    bool registry = options.RegistryEvents && data.ProviderName.Contains("Kernel-Registry", StringComparison.OrdinalIgnoreCase);
+                    bool file = options.FileEvents && data.ProviderName.Contains("Kernel-File", StringComparison.OrdinalIgnoreCase);
+                    if (!registry && !file) return;
+                    string target = TryPayload(data, "KeyName") ?? TryPayload(data, "FileName") ?? TryPayload(data, "FilePath") ?? data.EventName;
+                    if (registry) Interlocked.Increment(ref registryEventsReceived); else Interlocked.Increment(ref fileEventsReceived);
+                    bool surfaceRetained = CaptureEvent(Event(Interlocked.Increment(ref nextId), DateTimeOffset.UtcNow - startedAt, KnownProcessName(processNames, dynamicPid, null, null), dynamicPid,
+                        registry ? EventCategory.Registry : EventCategory.File, data.EventName, target,
+                        $"{(registry ? "Registry" : "File")} event observed by kernel ETW.", EventSeverity.Low, "ETW", data));
+                    if (!surfaceRetained)
                     {
-                        return;
-                    }
-
-                    string query = TryPayload(data, "QueryName") ?? TryPayload(data, "Name") ?? data.EventName;
-                    string answers = TryPayload(data, "QueryResults") ?? TryPayload(data, "Address") ?? "";
-                    string status = TryPayload(data, "Status") ?? TryPayload(data, "Result") ?? "";
-                    CaptureEvent( Event(
-                        Interlocked.Increment(ref nextId),
-                        DateTimeOffset.Now - startedAt,
-                        KnownProcessName(processNames, pid, null, null),
-                        pid,
-                        EventCategory.Dns,
-                        "DNS Query",
-                        query,
-                        $"DNS event observed by ETW; status={status}; answers={answers}",
-                        EventSeverity.Medium,
-                        "ETW",
-                        data.PayloadString(0)));
-                    if (!string.IsNullOrWhiteSpace(query))
-                    {
-                        CaptureNetworkSession( new NetworkSession(
-                            KnownProcessName(processNames, pid, null, null), query, answers, "", 53, "DNS",
-                            DateTimeOffset.UtcNow - startedAt, 0, 0, "", "", status, answers, "DNS client ETW metadata"));
+                        if (registry)
+                        {
+                            Interlocked.Increment(ref registryEventsDropped);
+                            registryCaptureReason = "global-event-limit; registry event was not persisted.";
+                        }
+                        else
+                        {
+                            Interlocked.Increment(ref fileEventsDropped);
+                            fileCaptureReason = "global-event-limit; file event was not persisted.";
+                        }
                     }
                 };
             }
@@ -314,7 +363,9 @@ public sealed class TraceEventEtwCollector
             }
             string? retainedRawTrace = rawLimitReached == 0 && !discardUnboundRaw ? tracePath : null;
             return new EtwCollectionResult(true, true, null, events.ToArray().OrderBy(e => e.Time).ToArray(), sessions.ToArray(), retainedRawTrace,
-                events.Received, events.Dropped, sessions.Received, sessions.Dropped, rawBytes, options.MaxRawTraceBytes, captureLimitReason, control.TargetPid.HasValue);
+                events.Received, events.Dropped, sessions.Received, sessions.Dropped, rawBytes, options.MaxRawTraceBytes, captureLimitReason, control.TargetPid.HasValue,
+                scriptContentReceived, scriptContentDropped, scriptContentCharacters, scriptCaptureReason, amsiProviderReason, powerShellProviderReason,
+                registryEventsReceived, registryEventsDropped, registryCaptureReason, fileEventsReceived, fileEventsDropped, fileCaptureReason);
         }
         catch (Exception ex)
         {
@@ -326,7 +377,9 @@ public sealed class TraceEventEtwCollector
                 captureLimitReason += " Target PID was never bound; pre-bind raw ETL was discarded. " + TryDeleteBoundedRawTrace(validatedTracePath);
             string? retainedRawTrace = rawLimitReached == 0 && !discardUnboundRaw ? validatedTracePath : null;
             return new EtwCollectionResult(false, false, ex.Message, events.ToArray().OrderBy(e => e.Time).ToArray(), sessions.ToArray(), retainedRawTrace,
-                events.Received, events.Dropped, sessions.Received, sessions.Dropped, rawBytes, options.MaxRawTraceBytes, captureLimitReason, control.TargetPid.HasValue);
+                events.Received, events.Dropped, sessions.Received, sessions.Dropped, rawBytes, options.MaxRawTraceBytes, captureLimitReason, control.TargetPid.HasValue,
+                scriptContentReceived, scriptContentDropped, scriptContentCharacters, scriptCaptureReason, amsiProviderReason, powerShellProviderReason,
+                registryEventsReceived, registryEventsDropped, registryCaptureReason, fileEventsReceived, fileEventsDropped, fileCaptureReason);
         }
     }
 

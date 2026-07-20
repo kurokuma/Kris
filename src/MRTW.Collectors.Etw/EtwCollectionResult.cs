@@ -16,4 +16,16 @@ public sealed record EtwCollectionResult(
     long RawTraceBytes = 0,
     long RawTraceByteLimit = 0,
     string CaptureLimitReason = "",
-    bool TargetBound = false);
+    bool TargetBound = false,
+    long ScriptContentEventsReceived = 0,
+    long ScriptContentEventsDropped = 0,
+    long ScriptContentCharactersRetained = 0,
+    string ScriptCaptureReason = "",
+    string AmsiProviderReason = "",
+    string PowerShellProviderReason = "",
+    long RegistryEventsReceived = 0,
+    long RegistryEventsDropped = 0,
+    string RegistryCaptureReason = "",
+    long FileEventsReceived = 0,
+    long FileEventsDropped = 0,
+    string FileCaptureReason = "");

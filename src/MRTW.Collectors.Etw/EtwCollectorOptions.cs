@@ -14,4 +14,9 @@ public sealed record EtwCollectorOptions(
     string? RawTracePath = null,
     int MaxPersistedEvents = CaptureLimits.DefaultEvents,
     int MaxPersistedNetworkSessions = CaptureLimits.DefaultNetworkSessions,
-    long MaxRawTraceBytes = CaptureLimits.DefaultRawTraceBytes);
+    long MaxRawTraceBytes = CaptureLimits.DefaultRawTraceBytes,
+    bool ScriptEvents = true,
+    bool RegistryEvents = true,
+    bool FileEvents = true,
+    int MaxScriptContentEvents = 128,
+    int MaxScriptContentCharacters = 131072);
