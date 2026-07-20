@@ -247,8 +247,9 @@ dotnet run --project src\MRTW.Cli -- selftest --out out\selftest
 | `timeline.csv` | タイムライン |
 | `artifacts.csv` | 抽出Artifact |
 | `processes.csv` | プロセス情報 |
+| `process_tree.mmd` / `process_tree.dot` | Process GUIDを優先した、上限付き・オフラインのプロセスツリーと主要イベント連鎖（Mermaid / Graphviz DOT）。プロセスラベルは名前、PID、最大Severity、イベントラベルはID、カテゴリ、Severityのみで、コマンドライン、パス、イベント本文は含みません。 |
 | `network.csv` | ネットワークセッション |
-| `report.html` | 自己完結型HTMLレポート |
+| `report.html` | 自己完結型HTMLレポート。プロセスツリーの安全にエスケープされたMermaidソースを内包し、CDNや実行時レンダラーには依存しません。 |
 | `case.sqlite` | GUI/CLIから再読込できるSQLiteケース |
 | `case_export.zip` | 圧縮されたケース一式 |
 | `manifest.json` | 出力ファイル一覧とSHA-256 |

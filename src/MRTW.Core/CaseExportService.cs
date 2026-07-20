@@ -32,8 +32,11 @@ public sealed class CaseExportService
         {
             data = new PrivacyRedactor().Redact(data);
         }
+        var processTree = ProcessTreeGraphBuilder.Build(data.Processes, data.Events);
 
         File.WriteAllText(Path.Combine(caseDirectory, "tool_version.txt"), "MRTW 1.0.0-preview" + Environment.NewLine, Encoding.UTF8);
+        File.WriteAllText(Path.Combine(caseDirectory, "process_tree.mmd"), processTree.Mermaid, Encoding.UTF8);
+        File.WriteAllText(Path.Combine(caseDirectory, "process_tree.dot"), processTree.Dot, Encoding.UTF8);
 
         if (options.IncludeRaw && !options.PrivacyMode && data.RawEvidence is { Count: > 0 })
         {
@@ -102,7 +105,7 @@ public sealed class CaseExportService
 
         if (requested.Contains("html") || requested.Contains("all"))
         {
-            File.WriteAllText(Path.Combine(caseDirectory, "report.html"), BuildHtml(data), Encoding.UTF8);
+            File.WriteAllText(Path.Combine(caseDirectory, "report.html"), BuildHtml(data, processTree), Encoding.UTF8);
         }
 
         if (requested.Contains("sqlite") || requested.Contains("all"))
@@ -212,7 +215,7 @@ public sealed class CaseExportService
         return "\"" + text.Replace("\"", "\"\"") + "\"";
     }
 
-    private static string BuildHtml(CaseData data)
+    private static string BuildHtml(CaseData data, ProcessTreeGraph processTree)
     {
         string rows = string.Join(Environment.NewLine, data.Events.Select(e =>
             $"<tr><td>{e.Time:hh\\:mm\\:ss\\.fff}</td><td>{H(e.Process)}</td><td>{e.Category}</td><td>{H(e.Action)}</td><td>{H(e.ObjectValue)}</td><td>{H(e.Summary)}</td><td>{H(e.TechniqueId)}</td><td class='{e.Severity.ToString().ToLowerInvariant()}'>{e.Severity}</td></tr>"));
@@ -259,6 +262,10 @@ th,td{padding:9px 10px;border-bottom:1px solid #1f3044;text-align:left}th{backgr
 <table><thead><tr><th>Collector</th><th>Status</th><th>Events</th><th>Dropped</th><th>Message</th></tr></thead><tbody>{{qualityRows}}</tbody></table>
 {{triage}}
 {{commands}}
+<h2>Process Tree</h2>
+<p>Offline Mermaid source only; no CDN or client-side renderer is included. Labels contain process name, PID, and highest observed severity only.</p>
+<details><summary>Mermaid source ({{processTree.NodeCount}} nodes, {{processTree.EdgeCount}} edges)</summary><pre class="mermaid-source"><code>{{H(processTree.Mermaid)}}</code></pre></details>
+{{(processTree.Notes.Count == 0 ? "" : "<p>Graph notes: " + H(string.Join(" ", processTree.Notes)) + "</p>")}}
 <h2>Analyst Notes</h2><p>{{H(data.AnalystNotes)}}</p>
 </main>
 </body>
