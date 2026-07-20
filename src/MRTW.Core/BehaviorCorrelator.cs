@@ -39,6 +39,7 @@ public static class BehaviorCorrelator
             AddStealerBehavior(output, group.ToArray(), ref nextId);
             AddLolbinExecution(output, group.ToArray(), ref nextId);
             AddEncodedCommand(output, group.ToArray(), ref nextId, commandBudget);
+            AddEtwScriptAndRegistrySignals(output, group.ToArray(), ref nextId);
             AddAmsiEtwTamper(output, group.ToArray(), ref nextId);
             AddIpcActivity(output, group.ToArray(), ref nextId);
             AddComWmiActivity(output, group.ToArray(), ref nextId);
@@ -48,6 +49,8 @@ public static class BehaviorCorrelator
             AddSystemEnvironmentProfiling(output, group.ToArray(), ref nextId);
             AddConfiguredRules(output, group.ToArray(), ref nextId, ruleBudget, configuredRules);
         }
+
+        MergeRegistryPersistenceFindings(output);
 
         var ordered = output.OrderBy(e => e.Time).ToArray();
         var idMap = ordered
@@ -327,6 +330,95 @@ public static class BehaviorCorrelator
         }
     }
 
+    private static void AddEtwScriptAndRegistrySignals(List<TimelineEvent> output, IReadOnlyList<TimelineEvent> events, ref int nextId)
+    {
+        var scriptBlocks = events.Where(e => e.Action == "PowerShell ScriptBlock" && e.Source.Equals("ETW", StringComparison.OrdinalIgnoreCase)).ToArray();
+        var decoded = scriptBlocks.Where(e => ContainsAny(e.RawJson + " " + e.Summary, "frombase64string", "-encodedcommand", "invoke-expression", "iex ")).ToArray();
+        if (decoded.Length > 0)
+            AddBehavior(output, decoded, ref nextId, "PowerShell Script Content", "PowerShell ScriptBlock ETW captured script content with encoded or dynamically evaluated command indicators.", EventSeverity.Medium, "T1059.001", "PowerShell", "Medium");
+
+        var amsiTamper = scriptBlocks.Where(e => ContainsAny(e.RawJson, "amsiutils", "amsiinitfailed", "amsiscanbuffer", "etweventwrite")).ToArray();
+        if (amsiTamper.Length > 0)
+            AddBehavior(output, amsiTamper, ref nextId, "AMSI/ETW Tamper Signal", "PowerShell ScriptBlock ETW captured an AMSI or ETW tamper indicator.", EventSeverity.High, "T1562.001", "Disable or Modify Tools", "Medium");
+
+        var registryPersistence = events.Where(e => e.Category == EventCategory.Registry && e.Source.Equals("ETW", StringComparison.OrdinalIgnoreCase) &&
+            ContainsAny(e.ObjectValue + " " + e.RawJson, "\\run", "\\runonce", "\\services", "\\winlogon", "appinit_dlls", "image file execution options", "active setup")).ToArray();
+        if (registryPersistence.Length > 0)
+            AddBehavior(output, registryPersistence, ref nextId, "Persistence Established", "Runtime kernel Registry ETW observed a persistence-related registry modification.", EventSeverity.High, "T1547", "Boot or Logon Autostart Execution", "Medium");
+    }
+
+    private static void MergeRegistryPersistenceFindings(List<TimelineEvent> output)
+    {
+        var evidenceById = output.Where(e => e.Category != EventCategory.Behavior).ToDictionary(e => e.Id);
+        var findings = output.Where(e => e.Category == EventCategory.Behavior && e.Action == "Persistence Established").ToArray();
+        foreach (var etwFinding in findings)
+        {
+            if (!output.Any(f => f.Id == etwFinding.Id)) continue;
+            var etwEvidence = EvidenceFor(etwFinding, evidenceById);
+            var etwIdentities = etwEvidence.Where(e => e.Source.Equals("ETW", StringComparison.OrdinalIgnoreCase))
+                .Select(RegistryIdentity).Where(identity => identity is not null).Cast<string>().ToHashSet(StringComparer.Ordinal);
+            if (etwIdentities.Count == 0) continue;
+            foreach (var otherFinding in findings)
+            {
+                if (otherFinding.Id == etwFinding.Id || !output.Any(f => f.Id == otherFinding.Id)) continue;
+                if (otherFinding.Pid != 0 && otherFinding.Pid != etwFinding.Pid) continue;
+                if (Math.Abs((otherFinding.Time - etwFinding.Time).TotalMinutes) > 5) continue;
+                var otherEvidence = EvidenceFor(otherFinding, evidenceById);
+                bool supportedSource = otherFinding.Pid == 0 || otherEvidence.Any(e =>
+                    e.Source.Equals("Hook", StringComparison.OrdinalIgnoreCase) || e.Source.Equals("Runtime", StringComparison.OrdinalIgnoreCase));
+                if (!supportedSource || !otherEvidence.Select(RegistryIdentity).Any(identity => identity is not null && etwIdentities.Contains(identity))) continue;
+
+                var currentEtwFinding = output.First(f => f.Id == etwFinding.Id);
+                var allEvidence = EvidenceFor(currentEtwFinding, evidenceById).Concat(otherEvidence)
+                    .GroupBy(e => e.Id).Select(g => g.First()).OrderBy(e => e.Time).ToArray();
+            string raw = JsonSerializer.Serialize(new
+            {
+                source = "Behavior",
+                action = "Persistence Established",
+                technique_id = "T1547",
+                technique_name = "Boot or Logon Autostart Execution",
+                confidence = "Medium",
+                evidence_event_ids = allEvidence.Select(e => e.Id).Take(40).ToArray(),
+                evidence_actions = allEvidence.Select(e => e.Action).Distinct().Take(20).ToArray()
+            }, JsonDefaults.Options);
+                int index = output.FindIndex(f => f.Id == etwFinding.Id);
+                output[index] = currentEtwFinding with { Time = allEvidence.Max(e => e.Time).Add(TimeSpan.FromMilliseconds(1)), RawJson = raw };
+                output.RemoveAll(f => f.Id == otherFinding.Id);
+            }
+        }
+    }
+
+    private static IReadOnlyList<TimelineEvent> EvidenceFor(TimelineEvent finding, IReadOnlyDictionary<int, TimelineEvent> evidenceById)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(finding.RawJson);
+            if (!document.RootElement.TryGetProperty("evidence_event_ids", out var ids) || ids.ValueKind != JsonValueKind.Array) return [];
+            return ids.EnumerateArray().Where(id => id.TryGetInt32(out _)).Select(id => id.GetInt32())
+                .Where(evidenceById.ContainsKey).Select(id => evidenceById[id]).ToArray();
+        }
+        catch { return []; }
+    }
+
+    private static IReadOnlyList<int> ReadEvidenceIds(string rawJson)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(rawJson);
+            return document.RootElement.TryGetProperty("evidence_event_ids", out var ids) && ids.ValueKind == JsonValueKind.Array
+                ? ids.EnumerateArray().Where(id => id.TryGetInt32(out _)).Select(id => id.GetInt32()).ToArray() : [];
+        }
+        catch { return []; }
+    }
+
+    private static string? RegistryIdentity(TimelineEvent timelineEvent)
+    {
+        if (timelineEvent.Category != EventCategory.Registry && !timelineEvent.Action.StartsWith("Persistence", StringComparison.OrdinalIgnoreCase)) return null;
+        string value = timelineEvent.ObjectValue.Replace("HKEY_CURRENT_USER", "HKCU", StringComparison.OrdinalIgnoreCase)
+            .Replace("HKEY_LOCAL_MACHINE", "HKLM", StringComparison.OrdinalIgnoreCase).Replace('/', '\\').Trim();
+        return string.IsNullOrWhiteSpace(value) ? null : value.ToUpperInvariant();
+    }
+
     private static void AddAmsiEtwTamper(List<TimelineEvent> output, IReadOnlyList<TimelineEvent> events, ref int nextId)
     {
         var tamperEvents = events.Where(e => e.Action is "AmsiScanBuffer" or "EtwEventWrite" or "VirtualProtect").ToArray();
@@ -424,8 +516,25 @@ public static class BehaviorCorrelator
         }
 
         int pid = evidence.First().Pid;
-        if (output.Any(e => e.Category == EventCategory.Behavior && e.Pid == pid && e.Action == action))
+        var existing = output.FirstOrDefault(e => e.Category == EventCategory.Behavior && e.Pid == pid && e.Action == action);
+        if (existing is not null)
         {
+            if (action == "Persistence Established")
+            {
+                int index = output.IndexOf(existing);
+                int[] evidenceIds = ReadEvidenceIds(existing.RawJson).Concat(evidence.Select(e => e.Id)).Distinct().Take(40).ToArray();
+                string mergedRaw = JsonSerializer.Serialize(new
+                {
+                    source = "Behavior",
+                    action,
+                    technique_id = techniqueId,
+                    technique_name = techniqueName,
+                    confidence,
+                    evidence_event_ids = evidenceIds,
+                    evidence_actions = evidence.Select(e => e.Action).Distinct().Take(20).ToArray()
+                }, JsonDefaults.Options);
+                output[index] = existing with { Time = TimeSpan.FromTicks(Math.Max(existing.Time.Ticks, evidence.Max(e => e.Time).Ticks) + TimeSpan.TicksPerMillisecond), RawJson = mergedRaw };
+            }
             return;
         }
 

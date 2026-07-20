@@ -15,7 +15,7 @@
 
 - 対象プロセスの起動、終了、タイムアウト、プロセスツリー制御
 - GUI/CLI共通の収集オーケストレーター
-- ETW（TraceEvent）による対象プロセスと子孫プロセスのProcess・ImageLoad・TCP・DNSイベント収集
+- ETW（TraceEvent）による対象プロセスと子孫プロセスのProcess・ImageLoad・TCP・DNS・AMSI・PowerShell ScriptBlock・Registry・File I/Oイベント収集（ScriptBlock/AMSI本文は独立した件数・文字数上限付き）
 - ETWは対象の起動前にarmしてReady barrierを確認し、Runtimeが取得したroot PIDへbindしてからroot/子孫PIDだけを構造化保持。PID bind前のETW由来イベント、ネットワーク、ライブcallbackは保存・表示しない
 - 実行前後のファイル、レジストリ、TCP接続スナップショット差分
 - x64 Native Hookによるファイル、レジストリ、プロセス、ネットワーク、認証情報、回避・探索系APIなどの観測
@@ -23,6 +23,8 @@
 - Hookアダプタ単位の初期化結果、Pipe受信数、Parse/接続失敗の自己診断
 - UTC取得時刻による収集イベントの正規化、Process GUID付与、重要度分類、Behavior相関
 - Runtime / Hook / ETWごとの収集状態、受信数、欠落数、上限、打切り理由を含むCollection Quality
+- AMSI and PowerShell providers are enabled independently. Their availability, ScriptBlock/AMSI content limits, and Registry/File capture counts or drops are reported as separate Collection Quality surfaces; an available surface with no target-process-tree observations is not reported as unavailable.
+- If an ETW session or kernel provider cannot start (for example, access denied), every requested Script, Registry, and File surface is explicitly `unavailable` with the start-failure reason rather than reported as no observations.
 - 永続イベントはRuntime/ETWとも既定50,000件、ネットワークセッションは10,000件の先着保持上限。後続分は破棄数と理由を品質情報へ記録し、Runtimeは上限後も停止・スナップショット処理を継続
 - raw ETLは既定512 MiBで上限に達すると、rawと構造化ETW収集をともに停止し、未完了のraw ETLをケースのraw evidenceとして採用しない。raw出力先は`%TEMP%\MRTW\case-*\raw_evidence`直下だけを受理し、既存ディレクトリを検証してから段階的に作成・再検証するためreparse pointを経由しない。サイズ監視は250msポーリングのため厳密なバイト境界ではなく、超過検出後は信頼済みケースscratch配下のETLだけをbest-effortで削除する
 - 注意: pre-launch arm中のraw kernel ETLはOS全体を一時的に観測し得る。MRTWはPID bind前のETW由来構造化データを保持せず、PIDがbindされないまま停止・失敗・取消となったraw ETLは証拠として返さず、信頼済みscratch配下だけを削除する。PID bind後からETWの収集時間を開始する。ETWの準備に失敗してもRuntime収集は継続し、Collection Qualityへ理由とraw cleanup結果を記録する

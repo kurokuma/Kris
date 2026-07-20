@@ -46,7 +46,8 @@ public sealed class AnalysisOrchestrator
                 armedEtw = new TraceEventEtwCollector().Arm(
                     new EtwCollectorOptions(null, duration, FollowDescendants: true, CaseStartedAtUtc: context.StartedAtUtc,
                         RawTracePath: profile.PrivacyMode ? null : Path.Combine(Path.GetTempPath(), "MRTW", context.CaseId, "raw_evidence", "network-process.etl"),
-                        MaxPersistedEvents: profile.MaxPersistedEvents, MaxPersistedNetworkSessions: profile.MaxPersistedNetworkSessions),
+                        MaxPersistedEvents: profile.MaxPersistedEvents, MaxPersistedNetworkSessions: profile.MaxPersistedNetworkSessions,
+                        ScriptEvents: true, RegistryEvents: true, FileEvents: true),
                     cancellationToken,
                     item => { if (liveEventKeys.TryAdd(EventKey(item), 0)) onEvent?.Invoke(item); },
                     onNetworkSession);
@@ -121,11 +122,19 @@ public sealed class AnalysisOrchestrator
         bool hookObserved = combined.Any(e => e.Source.Equals("Hook", StringComparison.OrdinalIgnoreCase));
         string hookStatus = !hookRequested ? "disabled" : !profile.ExecuteTarget ? "skipped" : hookFailed ? "degraded" : hookObserved ? "healthy" : "unavailable";
         string etwStatus = !profile.EnableEtw ? "disabled" : !profile.ExecuteTarget ? "skipped" : etw is null ? "unavailable" : !etw.TargetBound ? "degraded" : etw.Started && etw.Completed ? "healthy" : "degraded";
+        bool etwStartFailed = profile.EnableEtw && profile.ExecuteTarget && (etw is null || !etw.Started);
+        string requestedSurfaceStatus = etwStartFailed ? "unavailable" : etwStatus;
+        string SurfaceStatus(long dropped, string reason) => etwStartFailed ? "unavailable" : dropped > 0 || !string.IsNullOrWhiteSpace(reason) ? "degraded" : requestedSurfaceStatus;
+        string ProviderStatus(string reason) => etwStartFailed || !string.IsNullOrWhiteSpace(reason) ? "unavailable" : requestedSurfaceStatus;
+        string SurfaceReason(string reason) => !string.IsNullOrWhiteSpace(reason) ? reason : etwStartFailed ? (etw?.ErrorMessage ?? "ETW session did not start.") : "";
+        string scriptStatus = (etw?.ScriptContentEventsDropped ?? 0) > 0 ? "degraded" :
+            etwStartFailed || !string.IsNullOrWhiteSpace(etw?.AmsiProviderReason) && !string.IsNullOrWhiteSpace(etw?.PowerShellProviderReason) ? "unavailable" : requestedSurfaceStatus;
         bool runtimeFailed = combined.Any(e => e.Action is "Execution Failed" or "Live Callback Failures");
         CollectorHealth? runtimeCapture = data.Quality?.Collectors.FirstOrDefault(c => c.Collector == "Runtime");
         CollectorHealth? runtimeNetworkCapture = data.Quality?.Collectors.FirstOrDefault(c => c.Collector == "RuntimeNetwork");
         bool captureBounded = (runtimeCapture?.EventsDropped ?? 0) > 0 || (runtimeNetworkCapture?.EventsDropped ?? 0) > 0 ||
-            (etw?.EventsDropped ?? 0) > 0 || (etw?.NetworkSessionsDropped ?? 0) > 0 || !string.IsNullOrWhiteSpace(etw?.CaptureLimitReason);
+            (etw?.EventsDropped ?? 0) > 0 || (etw?.NetworkSessionsDropped ?? 0) > 0 || (etw?.ScriptContentEventsDropped ?? 0) > 0 ||
+            (etw?.RegistryEventsDropped ?? 0) > 0 || (etw?.FileEventsDropped ?? 0) > 0 || !string.IsNullOrWhiteSpace(etw?.CaptureLimitReason);
         var collectors = new List<CollectorHealth>
         {
             new("Runtime", runtimeFailed || (runtimeCapture?.EventsDropped ?? 0) > 0 ? "degraded" : "healthy", runtimeStarted, ended,
@@ -141,6 +150,18 @@ public sealed class AnalysisOrchestrator
             ,new("ETWNetwork", (etw?.NetworkSessionsDropped ?? 0) > 0 || !string.IsNullOrWhiteSpace(etw?.CaptureLimitReason) ? "degraded" : etwStatus,
                 etwStarted, ended, etw?.NetworkSessionsReceived ?? 0, etw?.NetworkSessionsDropped ?? 0,
                 (etw?.CaptureLimitReason ?? "") + $" network_limit={profile.MaxPersistedNetworkSessions};network_received={(etw?.NetworkSessionsReceived ?? 0)};network_dropped={(etw?.NetworkSessionsDropped ?? 0)}.")
+            ,new("ETWScript", scriptStatus,
+                etwStarted, ended, etw?.ScriptContentEventsReceived ?? 0, etw?.ScriptContentEventsDropped ?? 0,
+                SurfaceReason(etw?.ScriptCaptureReason ?? "") + " " + (etw?.AmsiProviderReason ?? "") + " " + (etw?.PowerShellProviderReason ?? "") +
+                $" script_content_retained_characters={(etw?.ScriptContentCharactersRetained ?? 0)}. No observations is distinct from an unavailable provider.")
+            ,new("ETWAmsi", ProviderStatus(etw?.AmsiProviderReason ?? ""), etwStarted, ended, 0, 0,
+                SurfaceReason(etw?.AmsiProviderReason ?? "") + " No target-process-tree observations is not an unavailable provider.")
+            ,new("ETWPowerShell", ProviderStatus(etw?.PowerShellProviderReason ?? ""), etwStarted, ended, 0, 0,
+                SurfaceReason(etw?.PowerShellProviderReason ?? "") + " No target-process-tree observations is not an unavailable provider.")
+            ,new("ETWRegistry", SurfaceStatus(etw?.RegistryEventsDropped ?? 0, etw?.RegistryCaptureReason ?? ""), etwStarted, ended,
+                etw?.RegistryEventsReceived ?? 0, etw?.RegistryEventsDropped ?? 0, SurfaceReason(etw?.RegistryCaptureReason ?? ""))
+            ,new("ETWFile", SurfaceStatus(etw?.FileEventsDropped ?? 0, etw?.FileCaptureReason ?? ""), etwStarted, ended,
+                etw?.FileEventsReceived ?? 0, etw?.FileEventsDropped ?? 0, SurfaceReason(etw?.FileCaptureReason ?? ""))
         };
         var priorCommandNormalization = data.Quality?.Collectors
             .Where(collector => collector.Collector.Equals("CommandNormalization", StringComparison.OrdinalIgnoreCase))
