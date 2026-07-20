@@ -79,6 +79,7 @@ var tests = new List<(string Name, Action Body)>
     ,("final ETW correlation preserves and combines command-normalization quality", TestFinalizeCaseCommandNormalizationQuality)
     ,("existing behavior evidence JSON is not rewritten during correlation", TestExistingBehaviorRawJsonPreserved)
     ,("ETW script and surface quality options are bounded and correlated without duplicate findings", TestEtwScriptOptionsAndCorrelation)
+    ,("process tree graph export is deterministic bounded and private", TestProcessTreeGraphExport)
 };
 
 int failures = 0;
@@ -1272,6 +1273,73 @@ static void TestCsvFormulaNeutralization()
         new CaseExportService().WriteCaseBundle(data, root, new ExportOptions("csv", Compress: false));
         string csv = File.ReadAllText(Path.Combine(root, "artifacts.csv")); True(csv.Contains("'+cmd", StringComparison.Ordinal) && csv.Contains("'@p", StringComparison.Ordinal), "CSV formula marker was not neutralized");
         True(File.ReadAllText(Path.Combine(root, "normalized_commands.csv")).Contains("'=formula", StringComparison.Ordinal), "normalized CSV formula marker was not neutralized");
+    }
+    finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
+}
+
+static void TestProcessTreeGraphExport()
+{
+    var now = DateTimeOffset.Parse("2026-01-01T00:00:00Z");
+    var processes = new List<ProcessNode>
+    {
+        new("root\"] --> injected", 1, 2, "guid-root", "C:\\Users\\secret\\root.exe --secret", "C:\\Users\\secret\\root.exe", now, null, 0, 0, 0, 0),
+        new("child", 2, 1, "guid-child", "C:\\Users\\secret\\child.exe", "C:\\Users\\secret\\child.exe", now, null, 0, 0, 0, 0),
+        new("reused-a", 9, null, "", "secret", "secret", now, null, 0, 0, 0, 0),
+        new("reused-b", 9, null, "", "secret", "secret", now, null, 0, 0, 0, 0),
+        new("ambiguous", 10, 9, "guid-ambiguous", "secret", "secret", now.AddSeconds(1), null, 0, 0, 0, 0)
+    };
+    processes.AddRange(Enumerable.Range(11, ProcessTreeGraphBuilder.MaxNodes + 20).Select(pid => new ProcessNode("bounded", pid, null, "guid-" + pid, "secret", "secret", now.AddSeconds(pid), null, 0, 0, 0, 0)));
+    var events = new[] { new TimelineEvent(1, TimeSpan.Zero, "root", 1, EventCategory.Process, "start", "secret", "secret", EventSeverity.High, "test", "{}", ProcessGuid: "guid-root") };
+    var graph = ProcessTreeGraphBuilder.Build(processes, events);
+    var reverse = ProcessTreeGraphBuilder.Build(processes.AsEnumerable().Reverse().ToArray(), events);
+    var empty = ProcessTreeGraphBuilder.Build([], []);
+    Equal(graph.Mermaid, reverse.Mermaid);
+    Equal(ProcessTreeGraphBuilder.MaxNodes, graph.NodeCount);
+    Equal(0, empty.NodeCount); Equal(0, empty.EdgeCount);
+    True(graph.Notes.Any(n => n.Contains("Truncated", StringComparison.Ordinal)), "node truncation was not noted");
+    True(graph.Notes.Any(n => n.Contains("Ambiguous", StringComparison.Ordinal)), "PID reuse ambiguity was not noted");
+    True(graph.Notes.Any(n => n.Contains("Cycle", StringComparison.Ordinal)), "cycle was not noted");
+    True(!graph.Mermaid.Contains("injected", StringComparison.Ordinal) || graph.Mermaid.Contains("&#93;", StringComparison.Ordinal), "Mermaid label was not escaped");
+    True(!graph.Mermaid.Contains("--secret", StringComparison.Ordinal) && !graph.Dot.Contains("--secret", StringComparison.Ordinal), "graph leaked command line");
+
+    var duplicateGuid = new[]
+    {
+        new ProcessNode("one", 21, null, "duplicate-guid", "", "", now, null, 0, 0, 0, 0),
+        new ProcessNode("two", 22, null, "duplicate-guid", "", "", now, null, 0, 0, 0, 0)
+    };
+    var duplicateGraph = ProcessTreeGraphBuilder.Build(duplicateGuid, []);
+    Equal(2, duplicateGraph.NodeCount);
+    True(duplicateGraph.Notes.Any(n => n.Contains("Duplicate process GUID", StringComparison.Ordinal)), "duplicate ProcessGuid was not annotated");
+
+    var guidless = new[]
+    {
+        new ProcessNode("parent", 30, null, "parent-guid", "", "", now, null, 0, 0, 0, 0),
+        new ProcessNode("same", 31, 30, "", "one", "", now.AddSeconds(1), null, 0, 0, 0, 0),
+        new ProcessNode("same", 31, null, "", "two", "", now.AddSeconds(1), null, 0, 0, 0, 0)
+    };
+    Equal(ProcessTreeGraphBuilder.Build(guidless, []).Mermaid, ProcessTreeGraphBuilder.Build(guidless.Reverse().ToArray(), []).Mermaid);
+
+    var chainProcesses = new[] { new ProcessNode("chain", 40, null, "chain-guid", "secret command", "secret path", now, null, 0, 0, 0, 0) };
+    var chainEvents = new[]
+    {
+        new TimelineEvent(41, TimeSpan.FromSeconds(1), "chain", 40, EventCategory.Process, "secret action", "secret object", "secret summary", EventSeverity.High, "test", "{}", ProcessGuid: "chain-guid"),
+        new TimelineEvent(42, TimeSpan.FromSeconds(2), "chain", 40, EventCategory.Behavior, "secret action", "secret object", "secret summary", EventSeverity.Medium, "test", "{}", ProcessGuid: "chain-guid")
+    };
+    var chainGraph = ProcessTreeGraphBuilder.Build(chainProcesses, chainEvents);
+    Equal(2, chainGraph.EventNodeCount);
+    True(chainGraph.Mermaid.Contains("Event 41: Process / High", StringComparison.Ordinal) && chainGraph.Dot.Contains("Event 42: Behavior / Medium", StringComparison.Ordinal), "major event chain nodes were not exported");
+    True(!chainGraph.Mermaid.Contains("secret action", StringComparison.Ordinal) && !chainGraph.Dot.Contains("secret object", StringComparison.Ordinal), "event graph leaked sensitive event text");
+
+    string root = Path.Combine(Path.GetTempPath(), "mrtw-process-tree-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        var data = new CaseData("tree", "tree", "sample", "C:\\Users\\secret\\sample.exe", "hash", now, TimeSpan.Zero, null, processes, events, [], [], "");
+        new CaseExportService().WriteCaseBundle(data, root, new ExportOptions("html", PrivacyMode: true, Compress: false));
+        string mermaid = File.ReadAllText(Path.Combine(root, "process_tree.mmd"));
+        string dot = File.ReadAllText(Path.Combine(root, "process_tree.dot"));
+        string html = File.ReadAllText(Path.Combine(root, "report.html"));
+        True(html.Contains("Mermaid source", StringComparison.Ordinal) && !html.Contains("<script", StringComparison.OrdinalIgnoreCase), "report did not embed offline graph source");
+        True(!mermaid.Contains("--secret", StringComparison.Ordinal) && !dot.Contains("--secret", StringComparison.Ordinal) && !html.Contains("--secret", StringComparison.Ordinal), "privacy export leaked command line into graph");
     }
     finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
 }
