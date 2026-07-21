@@ -141,6 +141,7 @@ public sealed class CaseService
         var rawEvidenceMetadata = ReadJsonTable<RawEvidenceFile[]>(connection, "raw_evidence") ?? [];
         var preservedFiles = ReadJsonTable<PreservedFile[]>(connection, "preserved_files") ?? [];
         var normalizedCommands = ReadNormalizedCommands(connection);
+        var iocLedger = ReadIocLedger(connection);
 
         var result = new CaseData(
             caseId,
@@ -158,14 +159,15 @@ public sealed class CaseService
             analystNotes,
             quality,
             rawEvidenceMetadata.Select(r => r.StoredPath).ToArray(),
-            preservedFiles) { TrustedEvidenceRoot = Path.GetDirectoryName(Path.GetFullPath(sqlitePath))!, RawEvidence = rawEvidenceMetadata, NormalizedCommands = normalizedCommands };
+            preservedFiles)
+        { TrustedEvidenceRoot = Path.GetDirectoryName(Path.GetFullPath(sqlitePath))!, RawEvidence = rawEvidenceMetadata, NormalizedCommands = normalizedCommands, IocLedger = iocLedger };
         Validate(result);
         return result;
     }
 
     private static void Validate(CaseData data)
     {
-        if (data.Events.Count > 1_000_000 || data.Processes.Count > 100_000 || data.Artifacts.Count > 250_000 || data.NetworkSessions.Count > 250_000 ||
+        if (data.Events.Count > 1_000_000 || data.Processes.Count > 100_000 || data.Artifacts.Count > 250_000 || data.NetworkSessions.Count > 250_000 || data.IocLedger.Count > IocLedgerBuilder.MaximumEntries ||
             (data.RawEvidenceFiles?.Count ?? 0) > 32 || (data.PreservedFiles?.Count ?? 0) > 128)
             throw new InvalidDataException("Case collection count limit exceeded.");
     }
@@ -194,6 +196,24 @@ public sealed class CaseService
             string json = Text(reader, 0, 64 * 1024);
             try { var item = JsonSerializer.Deserialize<NormalizedCommand>(json, InputJsonOptions); if (item is not null) values.Add(item); }
             catch (JsonException) { throw new InvalidDataException("Invalid normalized command JSON."); }
+        }
+        return values;
+    }
+
+    private static IReadOnlyList<IocLedgerEntry> ReadIocLedger(SqliteConnection connection)
+    {
+        if (!HasTable(connection, "ioc_ledger")) return [];
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT json, length(json) AS __len0 FROM ioc_ledger LIMIT $limit";
+        command.Parameters.AddWithValue("$limit", IocLedgerBuilder.MaximumEntries + 1);
+        using var reader = command.ExecuteReader();
+        var values = new List<IocLedgerEntry>();
+        while (reader.Read())
+        {
+            if (values.Count >= IocLedgerBuilder.MaximumEntries) throw new InvalidDataException("IOC ledger row limit exceeded.");
+            string json = Text(reader, 0, 16 * 1024);
+            try { var item = JsonSerializer.Deserialize<IocLedgerEntry>(json, InputJsonOptions); if (item is not null) values.Add(item); }
+            catch (JsonException) { throw new InvalidDataException("Invalid IOC ledger JSON."); }
         }
         return values;
     }
@@ -371,20 +391,47 @@ public sealed class CaseService
     private static string EventTextColumn(int index, bool hasProcessGuid, bool hasCapturedAtUtc) =>
         (hasProcessGuid, hasCapturedAtUtc, index) switch
         {
-            (_, _, 1) => "time", (_, _, 2) => "process",
+            (_, _, 1) => "time",
+            (_, _, 2) => "process",
             (true, _, 4) => "process_guid",
             (_, _, var i) => (i - (hasProcessGuid ? 1 : 0)) switch
             {
-                4 => "category", 5 => "action", 6 => "object_value", 7 => "summary", 8 => "technique_id", 9 => "technique_name", 10 => "confidence", 11 => "severity", 12 => "source", 13 => "raw_json", 14 => "captured_at_utc", _ => throw new InvalidOperationException("Unexpected event text column.")
+                4 => "category",
+                5 => "action",
+                6 => "object_value",
+                7 => "summary",
+                8 => "technique_id",
+                9 => "technique_name",
+                10 => "confidence",
+                11 => "severity",
+                12 => "source",
+                13 => "raw_json",
+                14 => "captured_at_utc",
+                _ => throw new InvalidOperationException("Unexpected event text column.")
             }
         };
 
     private static string NetworkTextColumn(int index, bool v3, bool http) => index switch
     {
-        0 => "process", 1 => "domain", 2 => "resolved_ip", 3 => "remote_ip", 5 => "protocol", 6 => "first_seen", 9 => "user_agent", 10 => "sni",
-        11 when v3 => "dns_status", 12 when v3 => "dns_answers", 13 when v3 => "coverage",
-        11 when !v3 && http => "http_method", 12 when !v3 && http => "http_host", 13 when !v3 && http => "http_uri", 14 when !v3 && http => "http_headers",
-        14 when v3 && http => "http_method", 15 when v3 && http => "http_host", 16 when v3 && http => "http_uri", 17 when v3 && http => "http_headers",
+        0 => "process",
+        1 => "domain",
+        2 => "resolved_ip",
+        3 => "remote_ip",
+        5 => "protocol",
+        6 => "first_seen",
+        9 => "user_agent",
+        10 => "sni",
+        11 when v3 => "dns_status",
+        12 when v3 => "dns_answers",
+        13 when v3 => "coverage",
+        11 when !v3 && http => "http_method",
+        12 when !v3 && http => "http_host",
+        13 when !v3 && http => "http_uri",
+        14 when !v3 && http => "http_headers",
+        14 when v3 && http => "http_method",
+        15 when v3 && http => "http_host",
+        16 when v3 && http => "http_uri",
+        17 when v3 && http => "http_headers",
         _ => throw new InvalidOperationException("Unexpected network text column.")
     };
 

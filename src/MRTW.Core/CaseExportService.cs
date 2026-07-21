@@ -101,6 +101,7 @@ public sealed class CaseExportService
             File.WriteAllText(Path.Combine(caseDirectory, "processes.csv"), ToCsv(data.Processes), Encoding.UTF8);
             File.WriteAllText(Path.Combine(caseDirectory, "network.csv"), ToCsv(data.NetworkSessions), Encoding.UTF8);
             File.WriteAllText(Path.Combine(caseDirectory, "normalized_commands.csv"), ToCsv(data.NormalizedCommands), Encoding.UTF8);
+            File.WriteAllText(Path.Combine(caseDirectory, "ioc_ledger.csv"), ToCsv(data.IocLedger), Encoding.UTF8);
         }
 
         if (requested.Contains("html") || requested.Contains("all"))
@@ -206,6 +207,12 @@ public sealed class CaseExportService
         foreach (var c in commands) sb.AppendLine(string.Join(',', Csv(c.Original), Csv(c.Normalized), Csv(c.Decoder), Csv(c.Status), Csv(c.FailureReason), Csv(c.LolBin), Csv(c.ProcessGuid), c.Pid, Csv(c.Time), Csv(string.Join(';', c.EvidenceEventIds ?? []))));
         return sb.ToString();
     }
+    private static string ToCsv(IEnumerable<IocLedgerEntry> entries)
+    {
+        var sb = new StringBuilder("type,normalized_value,original_values,first_seen,last_seen,sources,process_guids,evidence_event_ids,normalization_rule\r\n");
+        foreach (var e in entries) sb.AppendLine(string.Join(',', Csv(e.Type), Csv(e.NormalizedValue), Csv(string.Join(';', e.OriginalValues)), e.FirstSeen.ToString("O"), e.LastSeen.ToString("O"), Csv(string.Join(';', e.Sources)), Csv(string.Join(';', e.ProcessGuids)), Csv(string.Join(';', e.EvidenceEventIds)), Csv(e.NormalizationRule)));
+        return sb.ToString();
+    }
 
     private static string Csv(object? value)
     {
@@ -225,6 +232,7 @@ public sealed class CaseExportService
             .Select(c => $"<tr><td>{H(c.Collector)}</td><td>{H(c.Status)}</td><td>{c.EventsReceived}</td><td>{c.EventsDropped}</td><td>{H(c.Message)}</td></tr>"));
         string triage = BuildNonPeTriageHtml(data.StaticAnalysis?.NonPeTriage);
         string commands = "<h2>Normalized Command Chains</h2><table><thead><tr><th>Status</th><th>LOLBin</th><th>Original</th><th>Normalized</th><th>Evidence</th></tr></thead><tbody>" + string.Join(string.Empty, data.NormalizedCommands.Select(c => $"<tr><td>{H(c.Status)}</td><td>{H(c.LolBin)}</td><td>{H(c.Original)}</td><td>{H(c.Normalized)}</td><td>{H(string.Join(',', c.EvidenceEventIds ?? []))}</td></tr>")) + "</tbody></table>";
+        string iocs = "<h2>IOC Ledger</h2><table><thead><tr><th>Type</th><th>Value</th><th>Original</th><th>Sources</th><th>Processes</th><th>Evidence</th><th>First / Last</th></tr></thead><tbody>" + string.Join(string.Empty, data.IocLedger.Select(i => $"<tr><td>{H(i.Type)}</td><td>{H(i.NormalizedValue)}</td><td>{H(string.Join(", ", i.OriginalValues))}</td><td>{H(string.Join(", ", i.Sources))}</td><td>{H(string.Join(", ", i.ProcessGuids))}</td><td>{H(string.Join(", ", i.EvidenceEventIds))}</td><td>{i.FirstSeen:O}<br>{i.LastSeen:O}</td></tr>")) + "</tbody></table>";
 
         return $$"""
 <!doctype html>
@@ -262,6 +270,7 @@ th,td{padding:9px 10px;border-bottom:1px solid #1f3044;text-align:left}th{backgr
 <table><thead><tr><th>Collector</th><th>Status</th><th>Events</th><th>Dropped</th><th>Message</th></tr></thead><tbody>{{qualityRows}}</tbody></table>
 {{triage}}
 {{commands}}
+{{iocs}}
 <h2>Process Tree</h2>
 <p>Offline Mermaid source only; no CDN or client-side renderer is included. Labels contain process name, PID, and highest observed severity only.</p>
 <details><summary>Mermaid source ({{processTree.NodeCount}} nodes, {{processTree.EdgeCount}} edges)</summary><pre class="mermaid-source"><code>{{H(processTree.Mermaid)}}</code></pre></details>
@@ -307,6 +316,7 @@ CREATE TABLE case_quality(json TEXT);
 CREATE TABLE raw_evidence(json TEXT);
 CREATE TABLE preserved_files(json TEXT);
 CREATE TABLE normalized_commands(json TEXT);
+CREATE TABLE ioc_ledger(json TEXT);
 CREATE INDEX ix_events_time ON events(time);
 CREATE INDEX ix_events_process ON events(process);
 CREATE INDEX ix_events_category ON events(category);
@@ -337,6 +347,7 @@ CREATE INDEX ix_events_category ON events(category);
             Execute(connection, transaction, "INSERT INTO raw_evidence VALUES($json)", ("$json", JsonSerializer.Serialize(data.RawEvidence, JsonDefaults.Options)));
             Execute(connection, transaction, "INSERT INTO preserved_files VALUES($json)", ("$json", JsonSerializer.Serialize(data.PreservedFiles ?? [], JsonDefaults.Options)));
             foreach (var item in data.NormalizedCommands) Execute(connection, transaction, "INSERT INTO normalized_commands VALUES($json)", ("$json", JsonSerializer.Serialize(item, JsonDefaults.Options)));
+            foreach (var item in data.IocLedger) Execute(connection, transaction, "INSERT INTO ioc_ledger VALUES($json)", ("$json", JsonSerializer.Serialize(item, JsonDefaults.Options)));
 
             foreach (var p in data.Processes)
             {

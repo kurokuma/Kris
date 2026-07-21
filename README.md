@@ -47,6 +47,7 @@ Native Hookバイナリが存在しない場合、対応外の対象の場合、
 - Behaviorイベントと根拠イベントの関連表示
 - `case.json` / `case.sqlite` の読み込みと最近のケース一覧
 - HTML / CSV / JSON / JSONL / SQLite / ZIPエクスポート、Privacy Mode
+- mutex、named pipe、service、scheduled task、imphash、PDB pathを原値・正規化値・source・process/evidence来歴・first/last seenとともに保持する、上限付きのoffline IOC Ledger（来歴上限はCollection Qualityに明示）
 - GUI、HTMLレポート、JSON、SQLiteでのCollection Quality表示・保存
 
 GUIとCLIは同じ `AnalysisOrchestrator` を使用します。CLIの `--etw on` も通常のケース収集へ統合され、GUIだけにETWイベントが存在する差異はありません。

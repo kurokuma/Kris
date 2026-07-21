@@ -35,14 +35,27 @@ public sealed class PrivacyRedactor
                 RemoteIp = RedactText(n.RemoteIp)
             }).ToArray(),
             AnalystNotes = RedactText(data.AnalystNotes)
-            ,NormalizedCommands = data.NormalizedCommands.Select(c => c with
+            ,
+            NormalizedCommands = data.NormalizedCommands.Select(c => c with
             {
-                Original = RedactText(c.Original), Normalized = RedactText(c.Normalized),
-                FailureReason = RedactText(c.FailureReason), LolBin = RedactText(c.LolBin), ProcessGuid = RedactText(c.ProcessGuid)
+                Original = RedactText(c.Original),
+                Normalized = RedactText(c.Normalized),
+                FailureReason = RedactText(c.FailureReason),
+                LolBin = RedactText(c.LolBin),
+                ProcessGuid = RedactText(c.ProcessGuid)
             }).ToArray()
-            ,RawEvidenceFiles = Array.Empty<string>(),
+            ,
+            IocLedger = data.IocLedger.Select(i => i with
+            {
+                NormalizedValue = RedactText(i.NormalizedValue),
+                OriginalValues = i.OriginalValues.Select(RedactText).ToArray(),
+                ProcessGuids = i.ProcessGuids.Select(RedactText).ToArray()
+            }).ToArray()
+            ,
+            RawEvidenceFiles = Array.Empty<string>(),
             PreservedFiles = Array.Empty<PreservedFile>()
-            ,RawEvidence = Array.Empty<RawEvidenceFile>()
+            ,
+            RawEvidence = Array.Empty<RawEvidenceFile>()
         };
     }
 

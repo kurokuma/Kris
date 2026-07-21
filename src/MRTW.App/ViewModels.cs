@@ -409,6 +409,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
             SampleName = Path.GetFileName(path),
             SamplePath = path,
             StaticAnalysis = StaticAnalysis,
+            IocLedger = IocLedgerBuilder.Build(StaticAnalysis, [], DateTimeOffset.UtcNow, out _),
             NormalizedCommands = StaticAnalysis.NonPeTriage?.CommandCandidates
                 .SelectMany(candidate => CommandNormalizationService.Normalize(candidate))
                 .ToArray() ?? Array.Empty<NormalizedCommand>()

@@ -80,6 +80,9 @@ var tests = new List<(string Name, Action Body)>
     ,("existing behavior evidence JSON is not rewritten during correlation", TestExistingBehaviorRawJsonPreserved)
     ,("ETW script and surface quality options are bounded and correlated without duplicate findings", TestEtwScriptOptionsAndCorrelation)
     ,("process tree graph export is deterministic bounded and private", TestProcessTreeGraphExport)
+    ,("host IOC ledger is bounded, private, and portable", TestHostIocLedger)
+    ,("static runner exports IOC ledger without network service false positives", TestStaticIocLedger)
+    ,("final IOC ledger quality uses final-event drop count once", TestFinalizeIocLedgerQuality)
 };
 
 int failures = 0;
@@ -1143,7 +1146,11 @@ static void TestCliStaticPrivacyJsonLog()
         True(File.Exists(cli), "CLI binary was not built for the integration check");
         using var process = Process.Start(new ProcessStartInfo
         {
-            FileName = "dotnet", UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true,
+            FileName = "dotnet",
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true,
             ArgumentList = { cli, "static", "--target", source, "--out", root, "--format", "json", "--privacy-mode", "on", "--log-format", "json" }
         }) ?? throw new InvalidOperationException("Could not start CLI privacy integration check.");
         string stdout = process.StandardOutput.ReadToEnd(); string stderr = process.StandardError.ReadToEnd(); process.WaitForExit();
@@ -1445,6 +1452,74 @@ static void TestExistingBehaviorRawJsonPreserved()
     var correlated = BehaviorCorrelator.Correlate([importedBehavior, raw]);
     Equal(legacyRaw, correlated.Single(item => item.Action == "Imported Finding").RawJson);
     True(correlated.Any(item => item.Action == "Encoded Command Decoded"), "new behavior was not produced for the control event");
+}
+
+static void TestHostIocLedger()
+{
+    var started = DateTimeOffset.Parse("2026-01-01T00:00:00Z");
+    var analysis = new StaticAnalysisResult("x.exe", @"C:\Users\alice\x.exe", 1, "", "", "", "PE", "x64", null, "", [], [], [], [], false, false, 0,
+        PdbPath: @"C:\Users\alice\build\x.pdb", Imphash: "AABBCCDDEEFF00112233445566778899");
+    var events = new[]
+    {
+        new TimelineEvent(1, TimeSpan.FromSeconds(1), "x.exe", 10, EventCategory.Api, "CreateMutex", "display only", "", EventSeverity.Low, "Hook", "{\"mutex_name\":\"Global\\\\Alpha\",\"pipe_name\":\"\\\\.\\\\pipe\\\\Sample\"}", ProcessGuid: "guid-1", CapturedAtUtc: started.AddSeconds(1)),
+        new TimelineEvent(2, TimeSpan.FromSeconds(2), "snapshot", 0, EventCategory.Service, "Service Added", "MyService", "", EventSeverity.High, "Snapshot", "{}", CapturedAtUtc: started.AddSeconds(2)),
+        new TimelineEvent(3, TimeSpan.FromSeconds(3), "snapshot", 0, EventCategory.Task, "Task Added", "\\Vendor/Task", "", EventSeverity.High, "Snapshot", "{}", CapturedAtUtc: started.AddSeconds(3))
+        ,new TimelineEvent(4, TimeSpan.FromSeconds(4), "x.exe", 10, EventCategory.Network, "getaddrinfo", "", "", EventSeverity.Low, "Hook", "{\"service_name\":\"https\"}", ProcessGuid: "guid-1", CapturedAtUtc: started.AddSeconds(4))
+    };
+    var ledger = IocLedgerBuilder.Build(analysis, events, started, out var dropped);
+    Equal(0L, dropped); Equal(6, ledger.Count);
+    var mutex = ledger.Single(i => i.Type == "mutex"); Equal("global\\Alpha", mutex.NormalizedValue); Equal("guid-1", mutex.ProcessGuids.Single()); Equal(1, mutex.EvidenceEventIds.Single());
+    var service = ledger.Single(i => i.Type == "service"); Equal("myservice", service.NormalizedValue); Equal(0, service.ProcessGuids.Count);
+    var provenanceEvents = Enumerable.Range(1, 257).Select(id => new TimelineEvent(id, TimeSpan.FromSeconds(id), "x.exe", id, EventCategory.Api, "CreateMutex", "", "", EventSeverity.Low, "Hook", "{\"mutex_name\":\"Global\\\\Overflow\"}", ProcessGuid: "guid-" + id)).ToArray();
+    var provenanceLedger = IocLedgerBuilder.Build(null, provenanceEvents, started, out var provenanceDropped);
+    Equal(256, provenanceLedger.Single().EvidenceEventIds.Count); True(provenanceDropped > 0, "IOC provenance cap was not reported");
+    string root = Path.Combine(Path.GetTempPath(), "mrtw-ioc-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        var data = new CaseData("ioc", "ioc", "x.exe", analysis.FullPath, "hash", started, TimeSpan.Zero, analysis, [], events, [], [], "") { IocLedger = ledger };
+        new CaseExportService().WriteCaseBundle(data, root, new ExportOptions("all", PrivacyMode: true, Compress: true));
+        var json = File.ReadAllText(Path.Combine(root, "case.json"));
+        True(!json.Contains("alice", StringComparison.OrdinalIgnoreCase), "privacy IOC ledger leaked user path");
+        True(File.Exists(Path.Combine(root, "ioc_ledger.csv")), "IOC CSV missing");
+        var loaded = new CaseService().Load(Path.Combine(root, "case.sqlite"));
+        Equal(ledger.Count, loaded.IocLedger.Count);
+        var old = new CaseData("old", "old", "x", "x", "h", started, TimeSpan.Zero, null, [], [], [], [], "");
+        string oldRoot = Path.Combine(root, "old"); new CaseExportService().WriteCaseBundle(old, oldRoot, new ExportOptions("sqlite", Compress: false));
+        Equal(0, new CaseService().Load(Path.Combine(oldRoot, "case.sqlite")).IocLedger.Count);
+    }
+    finally { SqliteConnection.ClearAllPools(); if (Directory.Exists(root)) Directory.Delete(root, true); }
+}
+
+static void TestStaticIocLedger()
+{
+    string root = Path.Combine(Path.GetTempPath(), "mrtw-static-ioc-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        string target = typeof(StaticAnalysisService).Assembly.Location;
+        new CaseRunner().Static(target, root, "json,csv,html,sqlite,zip", "static-ioc", false);
+        string directory = Path.Combine(root, "static-ioc");
+        True(File.Exists(Path.Combine(directory, "ioc_ledger.csv")), "static IOC CSV missing");
+        True(File.ReadAllText(Path.Combine(directory, "case.json")).Contains("ioc_ledger", StringComparison.Ordinal), "static JSON IOC ledger missing");
+        True(new CaseService().Load(Path.Combine(directory, "case.sqlite")).IocLedger.Any(i => i.Type == "imphash"), "static SQLite IOC ledger missing imphash");
+        True(File.Exists(Path.Combine(directory, "case_export.zip")), "static IOC ZIP missing");
+    }
+    finally { SqliteConnection.ClearAllPools(); if (Directory.Exists(root)) Directory.Delete(root, true); }
+}
+
+static void TestFinalizeIocLedgerQuality()
+{
+    var started = DateTimeOffset.UtcNow;
+    var events = Enumerable.Range(1, 257).Select(id => new TimelineEvent(id, TimeSpan.FromMilliseconds(id), "x.exe", id, EventCategory.Api,
+        "CreateMutex", "", "", EventSeverity.Low, "Hook", "{\"mutex_name\":\"Global\\\\FinalCap\"}", ProcessGuid: "guid-one",
+        CapturedAtUtc: started.AddMilliseconds(id))).ToArray();
+    var runtimeQuality = new CaseQuality("degraded", [new CollectorHealth("IocLedger", "degraded", started, started, 1, 1, "ioc-ledger-entry-or-provenance-limit")], "observe", true);
+    var data = new CaseData("ioc-final", "ioc-final", "x.exe", "x.exe", "hash", started, TimeSpan.Zero, null, [], events, [], [], "", runtimeQuality);
+    var profile = new ExecutionProfile("x.exe", "exe", "none", null, "", Environment.CurrentDirectory, 1, false, false, false, false, "observe", ExecuteTarget: false);
+    using var containment = NetworkContainmentService.Apply(profile);
+    var finalized = AnalysisOrchestrator.FinalizeCase(data, null, profile, containment, started, started, started.AddSeconds(1));
+    var health = finalized.Quality!.Collectors.Single(c => c.Collector == "IocLedger");
+    Equal(1L, health.EventsDropped);
+    Equal(256, finalized.IocLedger.Single().EvidenceEventIds.Count);
 }
 
 static void True(bool condition, string message)

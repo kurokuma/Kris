@@ -57,7 +57,8 @@ public sealed class RuntimeCaseCollector
         {
             var canceled = Event(nextId++, TimeSpan.Zero, Path.GetFileName(profile.TargetPath), 0, EventCategory.Api, "Collection Canceled Before Launch", profile.TargetPath, beforeCapture.Note, EventSeverity.Low, "Runtime");
             return new CaseData(caseId, $"{Path.GetFileNameWithoutExtension(profile.TargetPath)}_canceled", Path.GetFileName(profile.TargetPath), profile.TargetPath,
-                staticAnalysis?.Sha256 ?? "unknown", started, DateTimeOffset.UtcNow - started, staticAnalysis, [], [canceled], [], [], "Collection was stopped before the target was launched.") { TrustedEvidenceRoot = EvidencePathPolicy.Root(caseId) };
+                staticAnalysis?.Sha256 ?? "unknown", started, DateTimeOffset.UtcNow - started, staticAnalysis, [], [canceled], [], [], "Collection was stopped before the target was launched.")
+            { TrustedEvidenceRoot = EvidencePathPolicy.Root(caseId) };
         }
         var prestaged = profile.SnapshotBefore
             ? _snapshot.PreserveChangedFiles(new SnapshotDiff(before.Files.Where(f => f.IsExecutable || (f.AlternateStreams?.Count ?? 0) > 0).Take(64).ToArray(), [], [], [], [], [], []), caseId, "before", cancellationToken)
@@ -438,6 +439,7 @@ public sealed class RuntimeCaseCollector
         correlatedEvents = AttachProcessGuids(correlatedEvents, processes, caseId, started);
         var normalizedCommands = NormalizeCapturedCommands(correlatedEvents, commandBudget);
         var artifacts = BuildArtifacts(correlatedEvents, processes, started);
+        var iocLedger = IocLedgerBuilder.Build(staticAnalysis, correlatedEvents, started, out long iocDropped);
         string sampleName = Path.GetFileName(profile.TargetPath);
         string sha = staticAnalysis?.Sha256 ?? "unknown";
         string notes = eventsWithProcessGuids.Any(e => e.Action == "Execution Failed")
@@ -460,8 +462,9 @@ public sealed class RuntimeCaseCollector
             artifacts,
             networks.ToArray(),
             notes,
-            Quality: AddCommandNormalizationQuality(RuntimeQuality(events, networks, started, before.PersistenceQuality, after.PersistenceQuality, before.HostSecurityQuality, after.HostSecurityQuality), commandBudget, started),
-            PreservedFiles: preservedFiles) { TrustedEvidenceRoot = EvidencePathPolicy.Root(caseId), NormalizedCommands = normalizedCommands };
+            Quality: AddIocLedgerQuality(AddCommandNormalizationQuality(RuntimeQuality(events, networks, started, before.PersistenceQuality, after.PersistenceQuality, before.HostSecurityQuality, after.HostSecurityQuality), commandBudget, started), iocDropped, started),
+            PreservedFiles: preservedFiles)
+        { TrustedEvidenceRoot = EvidencePathPolicy.Root(caseId), NormalizedCommands = normalizedCommands, IocLedger = iocLedger };
     }
 
     // Do not add a downstream Take(MaxFindings) here. TryAddFinding must see the
@@ -480,6 +483,12 @@ public sealed class RuntimeCaseCollector
     {
         if (!budget.Exhausted) return quality;
         return quality with { OverallStatus = "degraded", Collectors = quality.Collectors.Concat([new CollectorHealth("CommandNormalization", "degraded", started, DateTimeOffset.UtcNow, CommandNormalizationBudget.MaxFindings, budget.Dropped, "command-normalization-limit")]).ToArray() };
+    }
+
+    private static CaseQuality AddIocLedgerQuality(CaseQuality quality, long dropped, DateTimeOffset started)
+    {
+        if (dropped == 0) return quality;
+        return quality with { OverallStatus = "degraded", Collectors = quality.Collectors.Concat([new CollectorHealth("IocLedger", "degraded", started, DateTimeOffset.UtcNow, IocLedgerBuilder.MaximumEntries, dropped, "ioc-ledger-entry-limit")]).ToArray() };
     }
 
     internal static bool IsPidBindingEvent(TimelineEvent timelineEvent) =>
@@ -1124,7 +1133,8 @@ public sealed class RuntimeCaseCollector
         {
             var payload = new { surface = change.After.Surface, identity = change.After.Identity, old_value = change.Before.Value, new_value = change.After.Value };
             add(Event(nextId++, DateTimeOffset.UtcNow - started, "snapshot", 0, EventCategory.Registry, "Host Security Configuration Modified", change.After.Identity,
-                $"{change.After.Surface} configuration changed; old={change.Before.Value}; new={change.After.Value}", EventSeverity.High, "HostSecuritySnapshot") with { RawJson = JsonSerializer.Serialize(payload) });
+                $"{change.After.Surface} configuration changed; old={change.Before.Value}; new={change.After.Value}", EventSeverity.High, "HostSecuritySnapshot") with
+            { RawJson = JsonSerializer.Serialize(payload) });
         }
         foreach (var item in diff.DeletedHostSecurityEntries ?? [])
             add(Event(nextId++, DateTimeOffset.UtcNow - started, "snapshot", 0, EventCategory.Registry, "Host Security Configuration Deleted", item.Identity, $"{item.Surface} configuration removed.", EventSeverity.Medium, "HostSecuritySnapshot"));

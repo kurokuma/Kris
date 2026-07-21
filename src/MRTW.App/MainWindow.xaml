@@ -336,6 +336,20 @@
                                     </DataGrid.Columns>
                                 </DataGrid>
                             </TabItem>
+                            <TabItem Header="IOC Ledger">
+                                <DataGrid AutomationProperties.AutomationId="IocLedgerGrid" ItemsSource="{Binding CurrentCase.IocLedger}" ClipboardCopyMode="IncludeHeader" SelectionUnit="CellOrRowHeader" SelectionMode="Extended">
+                                    <DataGrid.Columns>
+                                        <DataGridTextColumn Header="Type" Binding="{Binding Type}" Width="105" />
+                                        <DataGridTextColumn Header="Value" Binding="{Binding NormalizedValue}" Width="*" />
+                                        <DataGridTextColumn Header="Original" Binding="{Binding OriginalValues}" Width="180" />
+                                        <DataGridTextColumn Header="Sources" Binding="{Binding Sources}" Width="120" />
+                                        <DataGridTextColumn Header="Process GUIDs" Binding="{Binding ProcessGuids}" Width="160" />
+                                        <DataGridTextColumn Header="Evidence IDs" Binding="{Binding EvidenceEventIds}" Width="110" />
+                                        <DataGridTextColumn Header="First Seen" Binding="{Binding FirstSeen}" Width="165" />
+                                        <DataGridTextColumn Header="Last Seen" Binding="{Binding LastSeen}" Width="165" />
+                                    </DataGrid.Columns>
+                                </DataGrid>
+                            </TabItem>
                             <TabItem Header="Network">
                                 <DataGrid ItemsSource="{Binding NetworkArtifacts}">
                                     <DataGrid.Columns>

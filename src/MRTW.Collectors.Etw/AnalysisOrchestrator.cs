@@ -107,6 +107,7 @@ public sealed class AnalysisOrchestrator
         var combinedCommandBudget = new CommandNormalizationBudget();
         combined = BehaviorCorrelator.Correlate(combined, combinedCommandBudget).ToArray();
         var artifacts = BuildArtifacts(combined, processes, data.StartedAt);
+        var iocLedger = IocLedgerBuilder.Build(data.StaticAnalysis, combined, data.StartedAt, out long iocDropped);
         var network = data.NetworkSessions
             .Concat(etw?.NetworkSessions ?? [])
             .GroupBy(n => $"{n.Process}|{n.RemoteIp}|{n.Port}|{n.FirstSeen.TotalMilliseconds:F0}", StringComparer.OrdinalIgnoreCase)
@@ -174,6 +175,11 @@ public sealed class AnalysisOrchestrator
             collectors.Add(new CollectorHealth("CommandNormalization", "degraded", runtimeStarted, ended, received, dropped,
                 "command-normalization-limit; runtime and ETW-correlated normalization budgets are combined."));
         }
+        if (iocDropped > 0)
+        {
+            collectors.Add(new CollectorHealth("IocLedger", "degraded", runtimeStarted, ended, iocLedger.Count, iocDropped,
+                "ioc-ledger-entry-or-provenance-limit; final runtime and ETW events were rebuilt."));
+        }
         string overall = captureBounded || collectors.Any(c => c.Status == "degraded" || c.Status == "unavailable" && c.Collector != "Hook")
             ? "degraded"
             : "healthy";
@@ -189,6 +195,7 @@ public sealed class AnalysisOrchestrator
             Quality = new CaseQuality(overall, collectors, containment.Message, true),
             RawEvidenceFiles = etw?.RawTracePath is string raw && File.Exists(raw) ? [raw] : data.RawEvidenceFiles,
             RawEvidence = BuildRawEvidence(etw)
+            ,IocLedger = iocLedger
         };
     }
 

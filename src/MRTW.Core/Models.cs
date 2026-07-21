@@ -169,6 +169,18 @@ public sealed record NormalizedCommand(
     TimeSpan? Time = null,
     IReadOnlyList<int>? EvidenceEventIds = null);
 
+/// <summary>Offline, provenance-preserving indicator ledger entry. Values are never enriched or resolved.</summary>
+public sealed record IocLedgerEntry(
+    string Type,
+    string NormalizedValue,
+    IReadOnlyList<string> OriginalValues,
+    DateTimeOffset FirstSeen,
+    DateTimeOffset LastSeen,
+    IReadOnlyList<string> Sources,
+    IReadOnlyList<string> ProcessGuids,
+    IReadOnlyList<int> EvidenceEventIds,
+    string NormalizationRule = "ioc-host-v1");
+
 public sealed record CaseData(
     string CaseId,
     string CaseName,
@@ -192,6 +204,8 @@ public sealed record CaseData(
     public IReadOnlyList<RawEvidenceFile> RawEvidence { get; init; } = [];
     // Appended for JSON/SQLite backward compatibility with existing case bundles.
     public IReadOnlyList<NormalizedCommand> NormalizedCommands { get; init; } = [];
+    // Appended so older JSON and SQLite bundles load without a schema migration.
+    public IReadOnlyList<IocLedgerEntry> IocLedger { get; init; } = [];
     [JsonIgnore]
     public int HighCount => Events.Count(e => e.Severity is EventSeverity.Critical or EventSeverity.High);
 

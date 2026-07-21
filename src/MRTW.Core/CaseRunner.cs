@@ -66,10 +66,15 @@ public sealed class CaseRunner
                 .Concat(portableResult.NonPeTriage.ContainerEntries.Select(x => $"entry,{Csv(x)}"))
                 .Concat(portableResult.NonPeTriage.SafetyWarnings.Select(x => $"warning,{Csv(x)}"))));
         }
+        var started = DateTimeOffset.UtcNow;
+        var staticCase = new CaseData("static-" + Guid.NewGuid().ToString("N"), Path.GetFileName(directory), Path.GetFileName(targetPath), targetPath,
+            result.Sha256, started, TimeSpan.Zero, result, [], [], [], [], "Static analysis only; no target execution or external enrichment occurred.")
+        {
+            IocLedger = IocLedgerBuilder.Build(result, [], started, out _)
+        };
+        _export.WriteCaseBundle(staticCase, directory, new ExportOptions(formats, PrivacyMode: privacyMode));
         if (formats.Contains("html", StringComparison.OrdinalIgnoreCase) || formats.Contains("all", StringComparison.OrdinalIgnoreCase))
         {
-            var data = DemoCaseFactory.Create(targetPath, portableResult, 0);
-            new CaseExportService().WriteCaseBundle(data, directory, new ExportOptions(formats, PrivacyMode: privacyMode));
             File.Move(Path.Combine(directory, "report.html"), Path.Combine(directory, "static_report.html"), true);
         }
         return result;
